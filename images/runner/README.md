@@ -6,7 +6,8 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 
 ## Contents
 
-- `ubuntu:24.04`, pinned by digest. Built and tested for `linux/arm64`; `linux/amd64` also builds.
+- `ubuntu:24.04`, pinned by its multi-arch index digest. Built and tested for `linux/arm64`; the
+  Containerfile also selects the `linux/amd64` runner tarball and hash, but that build is untested.
 - [actions/runner](https://github.com/actions/runner) 2.338.0 in `/home/runner/actions-runner`. The
   tarball is checked against its published SHA-256, and `bin/installdependencies.sh` runs at build time.
 - Docker Engine 29.9.0 from Docker's apt repository: `docker-ce`, `docker-ce-cli`, `docker-ce-rootless-extras`,
