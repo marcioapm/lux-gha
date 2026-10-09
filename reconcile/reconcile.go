@@ -462,18 +462,21 @@ type provisionable struct {
 	gen   int
 }
 
-// provision classifies every unserved job before creating any Run, so the
-// cap check for each creation counts every adopted Run and every unresolved
-// submission of the pass, whatever their repo, route or job order.
+// provision classifies every unserved job, then every managed registration
+// of a job outside that set, before creating any Run. The cap check for each
+// creation thus counts every adopted Run and every unresolved submission,
+// whether or not its job is still queued and within maxJobsPerPass.
 func (p *pass) provision() error {
 	cfg := p.r.cfg
 	var todo []provisionable
+	classified := map[string]bool{}
 	for _, v := range p.repos {
 		for _, jobID := range sortedKeys(v.demand) {
 			route := v.demand[jobID]
 			if p.liveByJob[jobKey(v, jobID)] {
 				continue
 			}
+			classified[jobKey(v, jobID)] = true
 			run, gen, err := p.classifyJob(v, jobID, route)
 			if err != nil {
 				return err
@@ -484,6 +487,9 @@ func (p *pass) provision() error {
 				todo = append(todo, provisionable{v, jobID, route, gen})
 			}
 		}
+	}
+	if err := p.classifyRegistrations(classified); err != nil {
+		return err
 	}
 	for _, j := range todo {
 		if len(p.live)+p.unresolved >= cfg.MaxRunners ||
@@ -566,6 +572,88 @@ func (p *pass) classifyJob(v *repoView, jobID int64, route *config.Route) (*luxc
 		return nil, -1, nil
 	}
 	return nil, gen, nil
+}
+
+// classifyRegistrations accounts for managed runners of jobs not classified
+// this pass (cancelled, picked elsewhere, or beyond maxJobsPerPass) whose
+// name no live Run carries. With one history read per job, a gen with a live
+// Run is adopted, a gen without any Run holds a cap slot (its submission may
+// still commit), and a gen whose Run ended is left to orphan cleanup.
+func (p *pass) classifyRegistrations(classified map[string]bool) error {
+	r := p.r
+	liveRunner := map[string]bool{}
+	for _, run := range p.live {
+		liveRunner[run.Labels[LabelRunner]] = true
+	}
+	for _, v := range p.repos {
+		prefix := r.runnerPrefix(v.id)
+		gens := map[int64][]int{}
+		for name := range v.runners {
+			job, gen, ok := strings.Cut(strings.TrimPrefix(name, prefix), "-")
+			jobID, jerr := strconv.ParseInt(job, 10, 64)
+			n, gerr := strconv.Atoi(gen)
+			if !ok || jerr != nil || gerr != nil || name != prefix+job+"-"+gen ||
+				classified[jobKey(v, jobID)] || liveRunner[name] {
+				continue
+			}
+			gens[jobID] = append(gens[jobID], n)
+		}
+		for _, jobID := range sortedKeys(gens) {
+			if err := p.classifyJobRegistrations(v, jobID, gens[jobID]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *pass) classifyJobRegistrations(v *repoView, jobID int64, gens []int) error {
+	r := p.r
+	log := r.log.With("repository", v.full, "job", jobID)
+	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(jobID, 10)
+	jobPrefix := r.runnerPrefix(v.id) + job + "-"
+	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
+	history, err := r.lux.List(p.ctx, owned)
+	if err != nil {
+		log.Error("listing the job's Runs failed", "error", err)
+		p.setError(ErrLux)
+		return errAbort
+	}
+	slices.Sort(gens)
+	for _, n := range gens {
+		var live *luxclient.Run
+		hasRun := false
+		for _, run := range history {
+			if run.Labels[LabelGen] != strconv.Itoa(n) {
+				continue
+			}
+			hasRun = true
+			if slices.Contains(LiveStates, run.State) {
+				live = &run
+				break
+			}
+		}
+		name := jobPrefix + strconv.Itoa(n)
+		switch {
+		case live != nil:
+			if !carries(*live, owned, n, jobPrefix) {
+				return p.mismatch(log, *live)
+			}
+			log.Info("adopting a live Run for a runner whose job is not demand", "run", live.ID, "gen", n)
+			p.addLive(v, jobID, *live)
+		case !hasRun:
+			log.Info("runner registered without a Run; holding a cap slot for it", "runner", name)
+			p.unresolved++
+			var labels []string
+			for _, l := range v.runners[name].Labels {
+				labels = append(labels, l.Name)
+			}
+			if route, err := r.cfg.MatchRoute(labels); err == nil {
+				p.unresolvedRoute[route.Name]++
+			}
+		}
+	}
+	return nil
 }
 
 // createRun registers j's runner and submits its Run. It returns the Run

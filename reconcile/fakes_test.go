@@ -352,6 +352,16 @@ func (f *fakeGitHub) pick(runner string, jobID int64) error {
 	return nil
 }
 
+// pickElsewhere assigns a queued job to a busy runner outside this bridge.
+func (f *fakeGitHub) pickElsewhere(repo string, jobID, runnerID int64, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.repos[repo]
+	r.runners[runnerID] = &githubapp.Runner{ID: runnerID, Name: name, Status: "online", Busy: true}
+	j := r.jobs[jobID]
+	j.status, j.runner, j.runnerID = "in_progress", name, runnerID
+}
+
 // complete finishes a job; a JIT runner that ran it deregisters.
 func (f *fakeGitHub) complete(jobID int64, conclusion string) {
 	f.mu.Lock()

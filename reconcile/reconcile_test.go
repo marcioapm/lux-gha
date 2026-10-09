@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -938,32 +939,74 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 	}
 	j7, j8, j9 := job{widgets, 7, runner("7", 0)}, job{widgets, 8, runner("8", 0)}, job{widgets, 9, runner("9", 0)}
 	gadgets9 := job{"acme/gadgets", 9, "lux-gha-t1-1002-9-0"}
-	// The unresolved job's Create fails in the first pass; the fresh job is
-	// queued after it. In the second pass the Lux Lists are the supply read
-	// and one history read per job, in repo then job order. lateCommit 2
-	// commits the Run at the second history read; 3 at the third pass's
-	// supply read, after the second pass provisioned whatever it would.
-	for _, tc := range []struct {
+	truncate := func(maxRunners string) []func(string) string {
+		return []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": `+maxRunners+`, "reconcile": {"maxJobsPerPass": 1}`)}
+	}
+	// What happens to the unresolved job's trigger while its submission is
+	// in flight; "truncated" leaves it queued but sorts it after the fresh
+	// job beyond maxJobsPerPass 1.
+	const (
+		queued    = "queued"
+		cancelled = "cancelled"
+		picked    = "picked elsewhere"
+		truncated = "truncated"
+	)
+	type testCase struct {
 		name              string
 		edits             []func(string) string
 		labels            []string
 		restart           bool
 		unresolved, fresh job
 		lateCommit        int
-	}{
-		{"global cap", globalCap, lux3, false, j7, j8, 2},
-		{"global cap across a restart", globalCap, lux3, true, j7, j8, 2},
-		{"route cap", nil, big, false, j7, j8, 2},
-		{"route cap across a restart", nil, big, true, j7, j8, 2},
-		{"global cap, unresolved job sorts last", globalCap, lux3, false, j9, j8, 3},
-		{"global cap, unresolved job sorts last, across a restart", globalCap, lux3, true, j9, j8, 3},
-		{"route cap, unresolved job sorts last", nil, big, false, j9, j8, 3},
-		{"route cap, unresolved job sorts last, across a restart", nil, big, true, j9, j8, 3},
-		{"global cap, unresolved job in the second repository", []func(string) string{twoRepos(1)}, lux3, false, gadgets9, j8, 3},
-		{"global cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(1)}, lux3, true, gadgets9, j8, 3},
-		{"route cap, unresolved job in the second repository", []func(string) string{twoRepos(10)}, big, false, gadgets9, j8, 3},
-		{"route cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(10)}, big, true, gadgets9, j8, 3},
-	} {
+		trigger           string
+	}
+	// The unresolved job's Create fails in the first pass; the fresh job is
+	// queued after it. In the second pass the Lux Lists are the supply read
+	// and one history read per job, in repo then job order. lateCommit 2
+	// commits the Run at the second history read; 3 at the third pass's
+	// supply read, after the second pass provisioned whatever it would.
+	cases := []testCase{
+		{"global cap", globalCap, lux3, false, j7, j8, 2, queued},
+		{"global cap across a restart", globalCap, lux3, true, j7, j8, 2, queued},
+		{"route cap", nil, big, false, j7, j8, 2, queued},
+		{"route cap across a restart", nil, big, true, j7, j8, 2, queued},
+		{"global cap, unresolved job sorts last", globalCap, lux3, false, j9, j8, 3, queued},
+		{"global cap, unresolved job sorts last, across a restart", globalCap, lux3, true, j9, j8, 3, queued},
+		{"route cap, unresolved job sorts last", nil, big, false, j9, j8, 3, queued},
+		{"route cap, unresolved job sorts last, across a restart", nil, big, true, j9, j8, 3, queued},
+		{"global cap, unresolved job in the second repository", []func(string) string{twoRepos(1)}, lux3, false, gadgets9, j8, 3, queued},
+		{"global cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(1)}, lux3, true, gadgets9, j8, 3, queued},
+		{"route cap, unresolved job in the second repository", []func(string) string{twoRepos(10)}, big, false, gadgets9, j8, 3, queued},
+		{"route cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(10)}, big, true, gadgets9, j8, 3, queued},
+	}
+	// For a trigger outside demand, lateCommit 1 commits the Run at the
+	// fresh job's history read, 2 at the unresolved registration's history
+	// read, and 3 at the third pass's supply read.
+	for _, trigger := range []string{cancelled, picked, truncated} {
+		for _, c := range []struct {
+			name   string
+			edits  []func(string) string
+			labels []string
+		}{
+			{"global cap", globalCap, lux3},
+			{"route cap", nil, big},
+		} {
+			edits, u := c.edits, j7
+			if trigger == truncated {
+				edits, u = truncate(map[bool]string{true: "1", false: "10"}[c.name == "global cap"]), j9
+			}
+			for _, restart := range []bool{false, true} {
+				for _, late := range []int{1, 2, 3} {
+					name := fmt.Sprintf("%s, trigger %s, commit at list %d", c.name, trigger, late)
+					if restart {
+						name += ", across a restart"
+					}
+					cases = append(cases, testCase{name, edits, c.labels, restart, u, j8, late, trigger})
+				}
+			}
+		}
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, tc.edits...)
 			e.gh.addRepo("acme/gadgets", 1002)
@@ -973,6 +1016,12 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 			e.lux.lateCommit = tc.lateCommit
 			if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
 				t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+			}
+			switch tc.trigger {
+			case cancelled:
+				e.gh.complete(u.id, "cancelled")
+			case picked:
+				e.gh.pickElsewhere(u.repo, u.id, 9000, "other-runner")
 			}
 			e.gh.queueIn(f.repo, f.id*10, f.id, "queued", tc.labels...)
 			if tc.restart {
@@ -988,12 +1037,18 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 			if len(e.lux.liveForJob(uJob)) != 1 || len(e.lux.liveForJob(fJob)) != 0 || e.lux.createCount() != 1 {
 				t.Fatalf("unresolved=%d fresh=%d creates=%d", len(e.lux.liveForJob(uJob)), len(e.lux.liveForJob(fJob)), e.lux.createCount())
 			}
-			// The unresolved job's runner serves it and its Run ends, freeing the slot.
 			id := e.runID(uJob)
-			if err := e.gh.pick(u.runner, u.id); err != nil {
-				t.Fatal(err)
+			if tc.trigger == queued || tc.trigger == truncated {
+				// The unresolved job's runner serves it and its Run ends, freeing the slot.
+				if err := e.gh.pick(u.runner, u.id); err != nil {
+					t.Fatal(err)
+				}
+				e.gh.complete(u.id, "success")
+			} else {
+				// The runner is lost before taking a job; its ended Run frees the
+				// slot and the registration is only an orphan awaiting cleanup.
+				e.gh.setOnline(u.runner, false)
 			}
-			e.gh.complete(u.id, "success")
 			e.lux.end(id, "exited")
 			e.pass()
 			if len(e.lux.live()) != 1 || len(e.lux.liveForJob(fJob)) != 1 || e.lux.createCount() != 2 {
