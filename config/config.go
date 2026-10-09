@@ -18,12 +18,31 @@ import (
 )
 
 type Config struct {
-	Listen       string   `json:"listen"`
-	GitHub       GitHub   `json:"github"`
-	Lux          Lux      `json:"lux"`
-	Repositories []string `json:"repositories"`
-	Routes       []Route  `json:"routes"`
+	Listen string `json:"listen"`
+	// Instance names this bridge in Run labels and runner names.
+	Instance     string    `json:"instance"`
+	MaxRunners   int       `json:"maxRunners"`
+	Reconcile    Reconcile `json:"reconcile"`
+	GitHub       GitHub    `json:"github"`
+	Lux          Lux       `json:"lux"`
+	Repositories []string  `json:"repositories"`
+	Routes       []Route   `json:"routes"`
 }
+
+// Reconcile tunes the reconciler; zero fields take the defaults below.
+type Reconcile struct {
+	Interval       Duration `json:"interval"`
+	IdleGrace      Duration `json:"idleGrace"`
+	MaxJobsPerPass int      `json:"maxJobsPerPass"`
+	MaxGensPerJob  int      `json:"maxGensPerJob"`
+}
+
+const (
+	DefaultInterval       = 60 * time.Second
+	DefaultIdleGrace      = 2 * time.Minute
+	DefaultMaxJobsPerPass = 200
+	DefaultMaxGensPerJob  = 5
+)
 
 type GitHub struct {
 	// AppID is the JWT issuer: the App's client ID (preferred by GitHub) or numeric app ID.
@@ -55,7 +74,13 @@ type Route struct {
 	Timeout          Duration `json:"timeout"`
 	EgressHosts      []string `json:"egressHosts"`
 	NestedContainers bool     `json:"nestedContainers"`
+	// MaxRunners caps this route's live Runs; zero leaves only the global cap.
+	MaxRunners int `json:"maxRunners"`
+	// Command overrides DefaultCommand, the runner image's entrypoint.
+	Command []string `json:"command"`
 }
+
+var DefaultCommand = []string{"/usr/local/bin/lux-gha-runner"}
 
 type Duration struct{ time.Duration }
 
@@ -85,9 +110,12 @@ func (Secrets) GoString() string { return "config.Secrets{redacted}" }
 const maxConfigBytes = 1 << 20
 
 var (
-	repoPattern  = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$`)
-	namePattern  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	labelPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+	repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$`)
+	// Runner names are lux-gha-<instance>-<repo id>-<job id>-<gen>; 20
+	// characters keeps them well inside GitHub's runner name limit.
+	instancePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$`)
+	namePattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	labelPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 )
 
 func Load(path string) (*Config, error) {
@@ -121,6 +149,28 @@ func (c *Config) validate() error {
 
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		add("listen: %q is not host:port", c.Listen)
+	}
+	if !instancePattern.MatchString(c.Instance) {
+		add("instance %q must match %s", c.Instance, instancePattern)
+	}
+	if c.MaxRunners <= 0 {
+		add("maxRunners must be positive")
+	}
+	rc := &c.Reconcile
+	if rc.Interval.Duration < 0 || rc.IdleGrace.Duration < 0 || rc.MaxJobsPerPass < 0 || rc.MaxGensPerJob < 0 {
+		add("reconcile: values must not be negative")
+	}
+	if rc.Interval.Duration == 0 {
+		rc.Interval.Duration = DefaultInterval
+	}
+	if rc.IdleGrace.Duration == 0 {
+		rc.IdleGrace.Duration = DefaultIdleGrace
+	}
+	if rc.MaxJobsPerPass == 0 {
+		rc.MaxJobsPerPass = DefaultMaxJobsPerPass
+	}
+	if rc.MaxGensPerJob == 0 {
+		rc.MaxGensPerJob = DefaultMaxGensPerJob
 	}
 	g := c.GitHub
 	if strings.TrimSpace(g.AppID) == "" {
@@ -197,6 +247,14 @@ func (c *Config) validate() error {
 		}
 		if r.Timeout.Duration <= 0 {
 			add("route %q: timeout must be positive", r.Name)
+		}
+		if r.MaxRunners < 0 {
+			add("route %q: maxRunners must not be negative", r.Name)
+		}
+		if len(r.Command) == 0 {
+			r.Command = slices.Clone(DefaultCommand)
+		} else if r.Command[0] == "" {
+			add("route %q: command[0] must not be empty", r.Name)
 		}
 		for _, h := range r.EgressHosts {
 			if h == "" || strings.ContainsAny(h, " /:") {

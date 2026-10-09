@@ -65,7 +65,7 @@ func writeConfig(t *testing.T, luxURL string) string {
 		}
 	}
 	cfg := map[string]any{
-		"listen": "127.0.0.1:0",
+		"listen": "127.0.0.1:0", "instance": "test", "maxRunners": 4,
 		"github": map[string]any{
 			"appID": "Iv1.test", "installationID": 42, "runnerGroupID": 1,
 			"apiURL":         "http://127.0.0.1:1",
