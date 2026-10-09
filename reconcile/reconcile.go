@@ -76,7 +76,9 @@ type Options struct {
 	// Host is the GitHub API host, the first part of each Idempotency-Key.
 	Host string
 	Now  func() time.Time
-	Log  *slog.Logger
+	// After replaces time.After for the gap between passes.
+	After func(time.Duration) <-chan time.Time
+	Log   *slog.Logger
 }
 
 // Status is the last pass's outcome, served on GET /status. It holds counts
@@ -101,16 +103,20 @@ const (
 	ErrGitHub         = "github"
 	ErrLux            = "lux"
 	ErrNeverNotEchoed = "lux_resume_policy_not_echoed"
+	ErrRunMismatch    = "lux_run_mismatch"
 )
 
 type Reconciler struct {
-	cfg  *config.Config
-	gh   GitHub
-	lux  Lux
-	host string
-	now  func() time.Time
-	log  *slog.Logger
-	wake chan struct{}
+	cfg   *config.Config
+	gh    GitHub
+	lux   Lux
+	host  string
+	now   func() time.Time
+	after func(time.Duration) <-chan time.Time
+	log   *slog.Logger
+	wake  chan struct{}
+	// passHook, set only by tests, observes Run entering and leaving a pass.
+	passHook func(enter bool)
 
 	// Touched only by the pass goroutine.
 	repoIDs          map[string]int64
@@ -130,11 +136,14 @@ func New(o Options) (*Reconciler, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.After == nil {
+		o.After = time.After
+	}
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
 	return &Reconciler{
-		cfg: o.Config, gh: o.GitHub, lux: o.Lux, host: o.Host, now: o.Now, log: o.Log,
+		cfg: o.Config, gh: o.GitHub, lux: o.Lux, host: o.Host, now: o.Now, after: o.After, log: o.Log,
 		wake:         make(chan struct{}, 1),
 		repoIDs:      map[string]int64{},
 		surplusSince: map[string]time.Time{},
@@ -152,18 +161,43 @@ func (r *Reconciler) Wake() {
 }
 
 // Run passes once immediately, then on every tick or wake until ctx ends. It
-// is the only caller of Pass, which keeps passes serialized.
+// is the only caller of Pass, which keeps passes serialized. A wake starts a
+// pass no sooner than minGap after the previous pass started, which bounds
+// the GitHub requests a stream of webhook deliveries can cause.
 func (r *Reconciler) Run(ctx context.Context) {
-	t := time.NewTicker(r.cfg.Reconcile.Interval.Duration)
+	interval := r.cfg.Reconcile.Interval.Duration
+	minGap := max(5*time.Second, interval/12)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
+		start := r.now()
+		// A wake that arrived before this pass starts is served by it.
+		select {
+		case <-r.wake:
+		default:
+		}
+		r.observe(true)
 		r.Pass(ctx)
+		r.observe(false)
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		case <-r.wake:
+			if wait := start.Add(minGap).Sub(r.now()); wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-r.after(wait):
+				}
+			}
 		}
+	}
+}
+
+func (r *Reconciler) observe(enter bool) {
+	if r.passHook != nil {
+		r.passHook(enter)
 	}
 }
 
@@ -286,7 +320,7 @@ func (p *pass) readGitHub() error {
 		if err != nil {
 			// A partial view could hide registered runners; act on none of it.
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
-			p.fail(err)
+			p.setError(ErrGitHub)
 			continue
 		}
 		p.repos = append(p.repos, v)
@@ -422,69 +456,87 @@ func (p *pass) provision() error {
 			if len(p.live) >= cfg.MaxRunners || (route.MaxRunners > 0 && p.liveRoute[route.Name] >= route.MaxRunners) {
 				continue
 			}
-			ok, err := p.provisionJob(v, jobID, route)
+			run, created, err := p.provisionJob(v, jobID, route)
 			if err != nil {
 				return err
 			}
-			if ok {
+			if run != nil {
+				// Later steps of this pass see the Run like ones listed at the start.
+				p.live = append(p.live, *run)
 				p.liveByJob[key] = true
-				p.liveRoute[route.Name]++
-				p.st.Live[route.Name]++
-				p.st.Provisioned++
+				p.liveRoute[run.Labels[LabelRoute]]++
+				p.st.Live[run.Labels[LabelRoute]]++
+				if created {
+					p.st.Provisioned++
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// provisionJob registers one JIT runner and submits its Run. It reports
-// whether a Run now exists; a non-nil error aborts the pass.
-func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool, error) {
+// provisionJob returns the live Run that now serves the job, if any, and
+// whether this call created it; a non-nil error aborts the pass.
+func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*luxclient.Run, bool, error) {
 	r := p.r
 	log := r.log.With("repository", v.full, "job", jobID, "route", route.Name)
 	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(jobID, 10)
-	previous, err := r.lux.List(p.ctx, map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job})
+	jobPrefix := r.runnerPrefix(v.id) + job + "-"
+	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
+	previous, err := r.lux.List(p.ctx, owned)
 	if err != nil {
 		log.Error("listing the job's Runs failed", "error", err)
 		p.setError(ErrLux)
-		return false, errAbort
+		return nil, false, errAbort
 	}
-	// Every earlier Run used its gen, and so did a runner registered without
-	// a Run (Lux create failed): neither its name nor its key is reused.
 	gen := 0
+	hasRun := map[int]bool{}
 	for _, run := range previous {
-		if n, err := strconv.Atoi(run.Labels[LabelGen]); err == nil && n >= gen {
-			gen = n + 1
+		n, err := strconv.Atoi(run.Labels[LabelGen])
+		if err != nil {
+			continue
+		}
+		hasRun[n] = true
+		gen = max(gen, n+1)
+		if slices.Contains(LiveStates, run.State) {
+			// A submission whose outcome was unknown committed after the supply read.
+			if !carries(run, owned, n, jobPrefix) {
+				return nil, false, p.mismatch(log, run)
+			}
+			log.Info("adopting a live Run for the job", "run", run.ID, "gen", n)
+			return &run, false, nil
 		}
 	}
-	jobPrefix := r.runnerPrefix(v.id) + job + "-"
+	// A registered runner whose gen has no Run is a submission with an
+	// unknown outcome: it may still be in flight. Its gen is not passed until
+	// orphan cleanup deletes the runner, so at most one Run serves the job.
 	for name := range v.runners {
-		if n, err := strconv.Atoi(strings.TrimPrefix(name, jobPrefix)); err == nil && strings.HasPrefix(name, jobPrefix) && n >= gen {
-			gen = n + 1
+		n, err := strconv.Atoi(strings.TrimPrefix(name, jobPrefix))
+		if err == nil && strings.HasPrefix(name, jobPrefix) && !hasRun[n] {
+			log.Info("runner registered without a Run; waiting for its Run or its cleanup", "runner", name)
+			return nil, false, nil
 		}
 	}
 	if gen >= r.cfg.Reconcile.MaxGensPerJob {
 		log.Warn("job reached the runner generation cap; not provisioning", "gens", gen)
-		return false, nil
+		return nil, false, nil
 	}
 	name := jobPrefix + strconv.Itoa(gen)
 	jit, err := r.gh.GenerateRepoJITConfig(p.ctx, v.ref, githubapp.JITConfigRequest{Name: name, RunnerGroupID: r.cfg.GitHub.RunnerGroupID, Labels: route.Labels})
 	if p.rateLimited(err) {
-		return false, errAbort
+		return nil, false, errAbort
 	}
 	var apiErr *githubapp.APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
 		// A runner with this name exists: a JIT from a pass that ended before Create.
 		log.Warn("runner name already registered; deleting it", "runner", name)
-		return false, p.deleteRunnerByName(v, name)
+		return nil, false, p.deleteRunnerByName(v, name)
 	}
 	if err != nil {
 		log.Error("JIT config failed", "error", err)
 		p.setError(ErrGitHub)
-		return false, nil
+		return nil, false, nil
 	}
-	// Later steps of this pass see the new runner and its Run (appended to
-	// p.live) like ones listed at the start.
 	v.runners[name] = jit.Runner
 	spec := luxclient.RunSpec{
 		Name: fmt.Sprintf("gha %s job %d", v.full, jobID),
@@ -504,7 +556,11 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool
 	for _, h := range route.EgressHosts {
 		spec.Egress = append(spec.Egress, luxclient.EgressRule{Host: h})
 	}
-	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%d", r.host, repoID, job, gen), spec)
+	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%s/%d", r.host, r.cfg.Instance, repoID, job, gen), spec)
+	if run != nil && !carries(*run, owned, gen, jobPrefix) {
+		// A replayed key answered with a Run this submission did not describe.
+		return nil, false, p.mismatch(log, *run)
+	}
 	if errors.Is(err, luxclient.ErrResumePolicyNotEchoed) {
 		log.Error("Lux did not echo resumePolicy never: terminating the Run and stopping provisioning", "run", run.ID)
 		if _, terr := r.lux.Terminate(p.ctx, run.ID); terr != nil {
@@ -513,22 +569,41 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool
 			p.st.Terminated++
 		}
 		p.setError(ErrNeverNotEchoed)
-		return false, errAbort
+		return nil, false, errAbort
 	}
 	if err != nil {
-		// The registered runner is cleaned up as an orphan; the job gets the next gen.
+		// The outcome is unknown: the Run may still appear. Until it does or
+		// orphan cleanup deletes the runner, this job is not provisioned again.
 		log.Error("Lux create failed; stopping provisioning", "error", err)
 		p.setError(ErrLux)
-		return false, errAbort
+		return nil, false, errAbort
 	}
 	if !slices.Contains(LiveStates, run.State) {
 		// A replayed key answers with the earlier Run, which has ended.
 		log.Warn("Lux returned an ended Run for a new runner", "run", run.ID, "state", run.State)
-		return false, nil
+		return nil, false, nil
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
-	p.live = append(p.live, *run)
-	return true, nil
+	return run, true, nil
+}
+
+// carries reports whether run has the ownership labels and the gen and
+// runner name a submission for gen would have given it.
+func carries(run luxclient.Run, owned map[string]string, gen int, jobPrefix string) bool {
+	for k, v := range owned {
+		if run.Labels[k] != v {
+			return false
+		}
+	}
+	return run.Labels[LabelGen] == strconv.Itoa(gen) && run.Labels[LabelRunner] == jobPrefix+strconv.Itoa(gen)
+}
+
+// mismatch handles a Run that is not the one this instance would own: it is
+// neither counted nor terminated, and provisioning stops for the pass.
+func (p *pass) mismatch(log *slog.Logger, run luxclient.Run) error {
+	log.Error("Lux returned a Run with unexpected labels; leaving it alone and stopping provisioning", "run", run.ID, "labels", run.Labels)
+	p.setError(ErrRunMismatch)
+	return errAbort
 }
 
 func (p *pass) deleteRunnerByName(v *repoView, name string) error {
@@ -557,8 +632,10 @@ func (p *pass) deleteRunnerByName(v *repoView, name string) error {
 
 // removeSurplus deletes idle runners beyond their repo and route's queued
 // demand once their trigger job has not been queued for idleGrace. The runner
-// is deleted first: GitHub refuses to delete a busy runner (422), and a Run is
-// terminated only after its runner is gone, so a busy runner's Run never is.
+// is deleted first and a Run is terminated only after that succeeded, so a
+// Run whose runner holds a job never is: GitHub answers DELETE on a runner
+// assigned to a job with 422 "Runner ... is still running a job", as
+// actions-runner-controller relies on (runner_graceful_stop.go).
 func (p *pass) removeSurplus() error {
 	r := p.r
 	now := r.now()
@@ -618,7 +695,8 @@ func (p *pass) removeSurplus() error {
 				return errAbort
 			}
 			if err != nil {
-				// GitHub answers 422 for a runner that took a job meanwhile.
+				// 422 for a runner that took a job meanwhile; any other error
+				// leaves the runner and its Run alone too.
 				r.log.Info("surplus runner not deleted; keeping its Run", "runner", c.runner.Name, "error", err)
 				continue
 			}
@@ -641,7 +719,7 @@ func (p *pass) removeSurplus() error {
 
 // cleanUp terminates live Runs whose runner has left GitHub (it ran its one
 // job and deregistered) and deletes offline managed runners without a live
-// Run (lost before pickup, or a Lux create that failed).
+// Run (lost before pickup, or a submission whose outcome stayed unknown).
 func (p *pass) cleanUp() error {
 	r := p.r
 	now := r.now()

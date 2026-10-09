@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,17 +29,35 @@ type fakeJob struct {
 	conclusion string
 	labels     []string
 	runner     string
+	runnerID   int64
 }
+
+// fakeRepo is one repository's Actions state.
+type fakeRepo struct {
+	id      int64
+	jobs    map[int64]*fakeJob
+	runners map[int64]*githubapp.Runner
+	// unlisted runners exist but are missing from unfiltered listings, as a
+	// lagging listing would leave them.
+	unlisted map[string]bool
+}
+
+// Fake GitHub operations, for fail.
+const (
+	opRuns    = "runs"
+	opJobs    = "jobs"
+	opRunners = "runners"
+	opJIT     = "jit"
+	opDelete  = "delete"
+)
 
 // fakeGitHub models one installation's repositories: workflow jobs with
 // labels and status, and self-hosted runners whose busy/online state the
-// test drives. Runs are derived from their jobs.
+// test drives. Workflow runs are derived from their jobs.
 type fakeGitHub struct {
 	mu        sync.Mutex
 	clock     *fakeClock
-	repoIDs   map[string]int64
-	jobs      map[int64]*fakeJob // all in repo "acme/widgets"
-	runners   map[int64]*githubapp.Runner
+	repos     map[string]*fakeRepo // by owner/name
 	nextID    int64
 	jit       []githubapp.JITConfigRequest
 	jitSecret map[string]string // runner name -> issued JIT config
@@ -46,49 +65,60 @@ type fakeGitHub struct {
 	calls     int
 	// rateLimitUntil answers every call 429 until this time.
 	rateLimitUntil time.Time
-	// unlisted runners exist but are missing from unfiltered listings, as a
-	// lagging or truncated listing would leave them.
-	unlisted map[string]bool
-	// block, when set, makes ListWorkflowRuns wait for a receive.
-	block chan struct{}
+	// fail, when set, may fail an operation on a repository and page (0 for
+	// unpaged operations) after the rate-limit gate.
+	fail func(op, repo string, page int) error
 	// perPage bounds page sizes to exercise paging.
 	perPage int
-	// failRunners answers runner listings 500.
-	failRunners bool
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
 }
 
+const widgets = "acme/widgets"
+
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
-	return &fakeGitHub{clock: clock, repoIDs: map[string]int64{"acme/widgets": 1001}, jobs: map[int64]*fakeJob{},
-		runners: map[int64]*githubapp.Runner{}, nextID: 500, jitSecret: map[string]string{}, unlisted: map[string]bool{}, perPage: 2}
+	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2}
+	f.addRepo(widgets, 1001)
+	return f
 }
 
-func (f *fakeGitHub) gate() error {
+func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
+	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, unlisted: map[string]bool{}}
+	f.repos[full] = r
+	return r
+}
+
+func (f *fakeGitHub) gate(op string, repo githubapp.Repository, page int) (*fakeRepo, error) {
 	f.calls++
 	if f.clock.Now().Before(f.rateLimitUntil) {
-		return &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: f.rateLimitUntil}
+		return nil, &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: f.rateLimitUntil}
 	}
-	return nil
+	full := repo.Owner + "/" + repo.Name
+	if f.fail != nil {
+		if err := f.fail(op, full, page); err != nil {
+			return nil, err
+		}
+	}
+	r, ok := f.repos[full]
+	if !ok {
+		return nil, &githubapp.APIError{StatusCode: 404}
+	}
+	return r, nil
 }
 
 func (f *fakeGitHub) GetRepository(_ context.Context, repo githubapp.Repository) (githubapp.RepositoryInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate("repo", repo, 0)
+	if err != nil {
 		return githubapp.RepositoryInfo{}, err
 	}
-	full := repo.Owner + "/" + repo.Name
-	id, ok := f.repoIDs[full]
-	if !ok {
-		return githubapp.RepositoryInfo{}, &githubapp.APIError{StatusCode: 404}
-	}
-	return githubapp.RepositoryInfo{ID: id, FullName: full}, nil
+	return githubapp.RepositoryInfo{ID: r.id, FullName: repo.Owner + "/" + repo.Name}, nil
 }
 
-func (f *fakeGitHub) runStatus(runID int64) string {
+func (r *fakeRepo) runStatus(runID int64) string {
 	var queued, active, done int
-	for _, j := range f.jobs {
+	for _, j := range r.jobs {
 		if j.runID != runID {
 			continue
 		}
@@ -122,17 +152,15 @@ func page[T any](items []T, opts githubapp.PageOptions, perPage int) ([]T, bool)
 }
 
 func (f *fakeGitHub) ListWorkflowRuns(_ context.Context, repo githubapp.Repository, opts githubapp.WorkflowRunListOptions) (githubapp.WorkflowRunPage, error) {
-	if f.block != nil {
-		<-f.block
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate(opRuns, repo, opts.Page)
+	if err != nil {
 		return githubapp.WorkflowRunPage{}, err
 	}
 	var ids []int64
-	for _, j := range f.jobs {
-		if !slices.Contains(ids, j.runID) && f.runStatus(j.runID) == opts.Status {
+	for _, j := range r.jobs {
+		if !slices.Contains(ids, j.runID) && r.runStatus(j.runID) == opts.Status {
 			ids = append(ids, j.runID)
 		}
 	}
@@ -146,39 +174,49 @@ func (f *fakeGitHub) ListWorkflowRuns(_ context.Context, repo githubapp.Reposito
 	return githubapp.WorkflowRunPage{TotalCount: len(runs), Runs: items, HasNext: next}, nil
 }
 
-func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, _ githubapp.Repository, runID int64, opts githubapp.WorkflowJobListOptions) (githubapp.WorkflowJobPage, error) {
+func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repository, runID int64, opts githubapp.WorkflowJobListOptions) (githubapp.WorkflowJobPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate(opJobs, repo, opts.Page)
+	if err != nil {
 		return githubapp.WorkflowJobPage{}, err
 	}
 	if opts.Filter != "latest" {
 		return githubapp.WorkflowJobPage{}, errors.New("fake: reconciler must ask for the latest attempt")
 	}
 	var jobs []githubapp.WorkflowJob
-	for _, id := range sortedKeys(f.jobs) {
-		j := f.jobs[id]
-		if j.runID == runID {
-			jobs = append(jobs, githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels})
+	for _, id := range sortedKeys(r.jobs) {
+		j := r.jobs[id]
+		if j.runID != runID {
+			continue
 		}
+		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels}
+		if j.conclusion != "" {
+			c := j.conclusion
+			out.Conclusion = &c
+		}
+		// Assignment stays on the job after the JIT runner deregisters.
+		if j.runner != "" {
+			name, rid := j.runner, j.runnerID
+			out.RunnerName, out.RunnerID = &name, &rid
+		}
+		jobs = append(jobs, out)
 	}
 	items, next := page(jobs, opts.PageOptions, f.perPage)
 	return githubapp.WorkflowJobPage{TotalCount: len(jobs), Jobs: items, HasNext: next}, nil
 }
 
-func (f *fakeGitHub) ListRepoRunners(_ context.Context, _ githubapp.Repository, opts githubapp.RunnerListOptions) (githubapp.RunnerPage, error) {
+func (f *fakeGitHub) ListRepoRunners(_ context.Context, repo githubapp.Repository, opts githubapp.RunnerListOptions) (githubapp.RunnerPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate(opRunners, repo, opts.Page)
+	if err != nil {
 		return githubapp.RunnerPage{}, err
 	}
-	if f.failRunners {
-		return githubapp.RunnerPage{}, &githubapp.APIError{StatusCode: 500}
-	}
 	var all []githubapp.Runner
-	for _, id := range sortedKeys(f.runners) {
-		rn := *f.runners[id]
-		if opts.Name != "" && rn.Name != opts.Name || opts.Name == "" && f.unlisted[rn.Name] {
+	for _, id := range sortedKeys(r.runners) {
+		rn := *r.runners[id]
+		if opts.Name != "" && rn.Name != opts.Name || opts.Name == "" && r.unlisted[rn.Name] {
 			continue
 		}
 		all = append(all, rn)
@@ -187,13 +225,14 @@ func (f *fakeGitHub) ListRepoRunners(_ context.Context, _ githubapp.Repository, 
 	return githubapp.RunnerPage{TotalCount: len(all), Runners: items, HasNext: next}, nil
 }
 
-func (f *fakeGitHub) GenerateRepoJITConfig(_ context.Context, _ githubapp.Repository, req githubapp.JITConfigRequest) (githubapp.JITConfig, error) {
+func (f *fakeGitHub) GenerateRepoJITConfig(_ context.Context, repo githubapp.Repository, req githubapp.JITConfigRequest) (githubapp.JITConfig, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate(opJIT, repo, 0)
+	if err != nil {
 		return githubapp.JITConfig{}, err
 	}
-	for _, rn := range f.runners {
+	for _, rn := range r.runners {
 		if rn.Name == req.Name {
 			return githubapp.JITConfig{}, &githubapp.APIError{StatusCode: http.StatusConflict}
 		}
@@ -204,47 +243,83 @@ func (f *fakeGitHub) GenerateRepoJITConfig(_ context.Context, _ githubapp.Reposi
 	for _, l := range req.Labels {
 		rn.Labels = append(rn.Labels, githubapp.RunnerLabel{Name: l})
 	}
-	f.runners[rn.ID] = rn
+	r.runners[rn.ID] = rn
 	secret := fmt.Sprintf("SECRET-JIT-%d-%s", rn.ID, req.Name)
 	f.jitSecret[req.Name] = secret
 	return githubapp.JITConfig{Runner: *rn, EncodedJITConfig: secret}, nil
 }
 
-// DeleteRepoRunner answers 422 for a busy runner, as GitHub does.
-func (f *fakeGitHub) DeleteRepoRunner(_ context.Context, _ githubapp.Repository, id int64) error {
+// DeleteRepoRunner answers 422 for a busy runner, as GitHub does ("Runner
+// ... is still running a job"; see the README).
+func (f *fakeGitHub) DeleteRepoRunner(_ context.Context, repo githubapp.Repository, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.gate(); err != nil {
+	r, err := f.gate(opDelete, repo, 0)
+	if err != nil {
 		return err
 	}
 	if f.beforeDelete != nil {
 		f.beforeDelete()
 		f.beforeDelete = nil
 	}
-	rn, ok := f.runners[id]
+	rn, ok := r.runners[id]
 	if !ok {
 		return &githubapp.APIError{StatusCode: 404}
 	}
 	if rn.Busy {
 		return &githubapp.APIError{StatusCode: 422}
 	}
-	delete(f.runners, id)
+	delete(r.runners, id)
 	f.deleted = append(f.deleted, rn.Name)
 	return nil
 }
 
 // Test controls.
 
-func (f *fakeGitHub) queue(jobID int64, status string, labels ...string) {
+func (f *fakeGitHub) repo(full string) *fakeRepo {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.jobs[jobID] = &fakeJob{id: jobID, runID: jobID * 10, status: status, labels: labels}
+	return f.repos[full]
+}
+
+// queue adds a job to acme/widgets in a workflow run of its own.
+func (f *fakeGitHub) queue(jobID int64, status string, labels ...string) {
+	f.queueIn(widgets, jobID*10, jobID, status, labels...)
+}
+
+func (f *fakeGitHub) queueIn(repo string, runID, jobID int64, status string, labels ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos[repo].jobs[jobID] = &fakeJob{id: jobID, runID: runID, status: status, labels: labels}
+}
+
+// addRunner registers a runner directly, as another tool or bridge would.
+func (f *fakeGitHub) addRunner(repo string, id int64, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos[repo].runners[id] = &githubapp.Runner{ID: id, Name: name, Status: "online"}
+}
+
+func (f *fakeGitHub) find(name string) (*fakeRepo, *githubapp.Runner) {
+	for _, r := range f.repos {
+		for _, rn := range r.runners {
+			if rn.Name == name {
+				return r, rn
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeGitHub) runnerByName(name string) *githubapp.Runner {
-	for _, rn := range f.runners {
-		if rn.Name == name {
-			return rn
+	_, rn := f.find(name)
+	return rn
+}
+
+func (f *fakeGitHub) job(jobID int64) *fakeJob {
+	for _, r := range f.repos {
+		if j := r.jobs[jobID]; j != nil {
+			return j
 		}
 	}
 	return nil
@@ -258,15 +333,22 @@ func (f *fakeGitHub) setOnline(name string, online bool) {
 	}
 }
 
-// pick assigns a queued job to an online idle runner.
+// pick assigns a queued job to an online idle runner of the same repository
+// whose labels cover every label the job requests.
 func (f *fakeGitHub) pick(runner string, jobID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	rn, j := f.runnerByName(runner), f.jobs[jobID]
-	if rn == nil || rn.Busy || rn.Status != "online" || j == nil || j.status != "queued" {
+	r, rn := f.find(runner)
+	if rn == nil || rn.Busy || rn.Status != "online" || r.jobs[jobID] == nil || r.jobs[jobID].status != "queued" {
 		return fmt.Errorf("fake: %s cannot pick job %d", runner, jobID)
 	}
-	rn.Busy, j.status, j.runner = true, "in_progress", runner
+	j := r.jobs[jobID]
+	for _, want := range j.labels {
+		if !slices.ContainsFunc(rn.Labels, func(l githubapp.RunnerLabel) bool { return strings.EqualFold(l.Name, want) }) {
+			return fmt.Errorf("fake: %s lacks label %q for job %d", runner, want, jobID)
+		}
+	}
+	rn.Busy, j.status, j.runner, j.runnerID = true, "in_progress", runner, rn.ID
 	return nil
 }
 
@@ -274,10 +356,10 @@ func (f *fakeGitHub) pick(runner string, jobID int64) error {
 func (f *fakeGitHub) complete(jobID int64, conclusion string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	j := f.jobs[jobID]
+	j := f.job(jobID)
 	j.status, j.conclusion = "completed", conclusion
-	if rn := f.runnerByName(j.runner); rn != nil {
-		delete(f.runners, rn.ID)
+	if r, rn := f.find(j.runner); rn != nil {
+		delete(r.runners, rn.ID)
 	}
 }
 
@@ -285,8 +367,10 @@ func (f *fakeGitHub) runnerNames() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var names []string
-	for _, rn := range f.runners {
-		names = append(names, rn.Name)
+	for _, r := range f.repos {
+		for _, rn := range r.runners {
+			names = append(names, rn.Name)
+		}
 	}
 	slices.Sort(names)
 	return names
@@ -307,16 +391,45 @@ type fakeRun struct {
 }
 
 // fakeLux keeps Runs with their labels and full submitted spec. Create
-// honours Idempotency-Key per tenant as Lux does.
+// honours Idempotency-Key per tenant as Lux does: a repeated key returns the
+// first Run unchanged, whatever the new spec.
 type fakeLux struct {
-	mu         sync.Mutex
-	clock      *fakeClock
-	runs       []*fakeRun
-	creates    int
-	terminated []string // by the bridge
-	failCreate int      // fail the next n Creates before they reach state
-	noEcho     bool
-	onCreate   func(luxclient.Run)
+	mu            sync.Mutex
+	clock         *fakeClock
+	runs          []*fakeRun
+	creates       int
+	terminated    []string // by the bridge
+	failCreate    int      // fail the next n Creates before they reach state
+	failTerminate int      // fail the next n Terminates
+	noEcho        bool
+	onCreate      func(luxclient.Run)
+	// lateCommit, when >= 0, makes the next Create answer a transport error
+	// while its Run stays pending; the pending Run commits at the
+	// (lateCommit+1)th List after that, or when its key is submitted again.
+	lateCommit   int
+	pending      *fakeRun
+	pendingLists int
+}
+
+func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
+
+func (l *fakeLux) newRun(key string, spec luxclient.RunSpec) *fakeRun {
+	l.creates++
+	return &fakeRun{key: key, spec: spec, run: luxclient.Run{
+		ID: fmt.Sprintf("run_%d", l.creates), Labels: maps.Clone(spec.Labels), State: "submitted", CreatedAt: l.clock.Now(),
+		Spec: luxclient.RunSpecEcho{ResumePolicy: luxclient.ResumePolicyNever}}}
+}
+
+// commitPending makes the pending Run visible; the caller holds mu and runs
+// the returned hook after unlocking.
+func (l *fakeLux) commitPending() func() {
+	r, hook := l.pending, l.onCreate
+	l.runs = append(l.runs, r)
+	l.pending = nil
+	if hook == nil {
+		return func() {}
+	}
+	return func() { hook(r.run) }
 }
 
 func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) (*luxclient.Run, error) {
@@ -324,6 +437,12 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 		return nil, err
 	}
 	l.mu.Lock()
+	if l.pending != nil && l.pending.key == key {
+		hook := l.commitPending()
+		l.mu.Unlock()
+		hook()
+		l.mu.Lock()
+	}
 	for _, r := range l.runs {
 		if r.key == key {
 			run := r.run
@@ -336,10 +455,12 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 		l.mu.Unlock()
 		return nil, &luxclient.APIError{Op: "create run", Status: 503}
 	}
-	l.creates++
-	r := &fakeRun{key: key, spec: spec, run: luxclient.Run{
-		ID: fmt.Sprintf("run_%d", len(l.runs)+1), Labels: maps.Clone(spec.Labels), State: "submitted", CreatedAt: l.clock.Now(),
-		Spec: luxclient.RunSpecEcho{ResumePolicy: luxclient.ResumePolicyNever}}}
+	r := l.newRun(key, spec)
+	if l.lateCommit >= 0 {
+		l.pending, l.pendingLists, l.lateCommit = r, l.lateCommit, -1
+		l.mu.Unlock()
+		return nil, errors.New("fake: create run: connection reset")
+	}
 	if l.noEcho {
 		r.run.Spec.ResumePolicy = ""
 	}
@@ -358,6 +479,10 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 func (l *fakeLux) Terminate(_ context.Context, id string) (*luxclient.Run, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.failTerminate > 0 {
+		l.failTerminate--
+		return nil, &luxclient.APIError{Op: "terminate run", Status: 503}
+	}
 	for _, r := range l.runs {
 		if r.run.ID == id {
 			if slices.Contains(LiveStates, r.run.State) {
@@ -373,6 +498,16 @@ func (l *fakeLux) Terminate(_ context.Context, id string) (*luxclient.Run, error
 
 func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...string) ([]luxclient.Run, error) {
 	l.mu.Lock()
+	if l.pending != nil {
+		if l.pendingLists == 0 {
+			hook := l.commitPending()
+			l.mu.Unlock()
+			hook()
+			l.mu.Lock()
+		} else {
+			l.pendingLists--
+		}
+	}
 	var out []luxclient.Run
 	for i := len(l.runs) - 1; i >= 0; i-- {
 		r := l.runs[i]
@@ -391,6 +526,16 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 	}
 	l.mu.Unlock()
 	return out, nil
+}
+
+// seed stores a Run under key as if another client had submitted it.
+func (l *fakeLux) seed(key string, spec luxclient.RunSpec) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.newRun(key, spec)
+	r.run.State = "running"
+	l.runs = append(l.runs, r)
+	return r.run.ID
 }
 
 // end makes a Run finish on its own, as a never Run does: terminated.

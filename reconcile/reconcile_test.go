@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func newEnv(t *testing.T, edits ...func(string) string) *env {
 		t.Fatal(err)
 	}
 	clock := &fakeClock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
-	e := &env{t: t, clock: clock, gh: newFakeGitHub(clock), lux: &fakeLux{clock: clock}, cfg: cfg}
+	e := &env{t: t, clock: clock, gh: newFakeGitHub(clock), lux: newFakeLux(clock), cfg: cfg}
 	// The runner process connects once its Run starts.
 	e.lux.onCreate = func(r luxclient.Run) {
 		e.lux.setState(r.ID, "running")
@@ -120,7 +121,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 	if !mapsEqual(r.run.Labels, wantLabels) {
 		t.Fatalf("labels %v", r.run.Labels)
 	}
-	if r.key != "api.github.com/1001/7/0" {
+	if r.key != "api.github.com/t1/1001/7/0" {
 		t.Fatalf("idempotency key %q", r.key)
 	}
 	s := r.spec
@@ -318,7 +319,12 @@ func TestGitHubErrorSkipsTheRepositoryWithoutCleanup(t *testing.T) {
 	e.gh.complete(7, "cancelled")
 	e.pass()
 	e.clock.Add(time.Hour)
-	e.gh.failRunners = true
+	e.gh.fail = func(op, _ string, _ int) error {
+		if op == opRunners {
+			return &githubapp.APIError{StatusCode: 500}
+		}
+		return nil
+	}
 	e.pass()
 	e.clock.Add(time.Hour)
 	st := e.pass()
@@ -337,9 +343,9 @@ func TestRunnerThatTurnsBusyBeforeDeletionKeepsItsRun(t *testing.T) {
 	// Job 8 arrives after the pass listed demand and runners; job 7's runner
 	// takes it just before the bridge deletes it.
 	e.gh.beforeDelete = func() {
-		e.gh.jobs[8] = &fakeJob{id: 8, runID: 80, status: "queued", labels: lux3}
-		e.gh.runnerByName(runner("7", 0)).Busy = true
-		e.gh.jobs[8].status, e.gh.jobs[8].runner = "in_progress", runner("7", 0)
+		rn := e.gh.runnerByName(runner("7", 0))
+		rn.Busy = true
+		e.gh.repos[widgets].jobs[8] = &fakeJob{id: 8, runID: 80, status: "in_progress", labels: lux3, runner: rn.Name, runnerID: rn.ID}
 	}
 	e.pass()
 	if len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 || len(e.lux.liveForJob("7")) != 1 {
@@ -373,7 +379,7 @@ func TestSurplusLeavesOneIdleRunnerPerQueuedJob(t *testing.T) {
 	}
 }
 
-func TestLuxCreateFailureReprovisionsAndCleansTheOrphanRunner(t *testing.T) {
+func TestLuxCreateFailureWaitsForOrphanCleanupThenReprovisions(t *testing.T) {
 	e := newEnv(t)
 	e.gh.queue(7, "queued", lux3...)
 	e.lux.failCreate = 1
@@ -381,35 +387,37 @@ func TestLuxCreateFailureReprovisionsAndCleansTheOrphanRunner(t *testing.T) {
 	if st.Error != ErrLux || e.gh.jitCount() != 1 || e.lux.createCount() != 0 {
 		t.Fatalf("status %+v jit=%d", st, e.gh.jitCount())
 	}
+	// gen 0's runner has no Run: its submission's outcome is unknown, so no
+	// other gen is provisioned until orphan cleanup removes it.
+	e.pass()
+	e.clock.Add(2*time.Minute - time.Second)
+	e.pass()
+	if e.lux.createCount() != 0 || e.gh.jitCount() != 1 || len(e.gh.deletedNames()) != 0 {
+		t.Fatalf("creates=%d jit=%d deleted=%v", e.lux.createCount(), e.gh.jitCount(), e.gh.deletedNames())
+	}
+	e.clock.Add(time.Second)
+	e.pass()
+	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || e.lux.createCount() != 0 {
+		t.Fatalf("deleted=%v creates=%d", e.gh.deletedNames(), e.lux.createCount())
+	}
 	e.pass()
 	live := e.lux.liveForJob("7")
-	if len(live) != 1 || live[0].run.Labels[LabelGen] != "1" || live[0].run.Labels[LabelRunner] != runner("7", 1) || live[0].key != "api.github.com/1001/7/1" {
+	if len(live) != 1 || live[0].run.Labels[LabelRunner] != runner("7", 0) || live[0].key != "api.github.com/t1/1001/7/0" {
 		t.Fatalf("reprovisioned %+v", live)
 	}
-	if len(e.gh.deletedNames()) != 0 {
-		t.Fatalf("orphan deleted before idleGrace: %v", e.gh.deletedNames())
-	}
-	e.clock.Add(2 * time.Minute)
-	e.pass()
-	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || !slices.Equal(e.gh.runnerNames(), []string{runner("7", 1)}) {
-		t.Fatalf("deleted=%v runners=%v", e.gh.deletedNames(), e.gh.runnerNames())
-	}
-	if len(e.lux.terminatedIDs()) != 0 || e.lux.createCount() != 1 {
-		t.Fatalf("terminated=%v creates=%d", e.lux.terminatedIDs(), e.lux.createCount())
-	}
-	// gen 1 is lost before pickup and its runner is gone: the next gen is 2,
-	// not a replay of gen 1's Idempotency-Key.
+	// gen 0 is lost before pickup while its runner stays registered: gen 1
+	// follows at once, not a replay of gen 0's Idempotency-Key.
 	e.lux.end(live[0].run.ID, "its secrets are no longer held")
-	e.gh.setOnline(runner("7", 1), false)
+	e.gh.setOnline(runner("7", 0), false)
 	e.pass()
+	live = e.lux.liveForJob("7")
+	if len(live) != 1 || live[0].run.Labels[LabelGen] != "1" || e.lux.createCount() != 2 {
+		t.Fatalf("after loss: live %+v creates=%d", live, e.lux.createCount())
+	}
 	e.clock.Add(2 * time.Minute)
 	e.pass()
-	if !slices.Contains(e.gh.deletedNames(), runner("7", 1)) {
-		t.Fatalf("gen 1 runner not deleted: %v", e.gh.deletedNames())
-	}
-	live = e.lux.liveForJob("7")
-	if len(live) != 1 || live[0].run.Labels[LabelGen] != "2" || e.lux.createCount() != 2 {
-		t.Fatalf("after loss: live %+v creates=%d", live, e.lux.createCount())
+	if !slices.Equal(e.gh.runnerNames(), []string{runner("7", 1)}) || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("runners=%v terminated=%v", e.gh.runnerNames(), e.lux.terminatedIDs())
 	}
 }
 
@@ -419,7 +427,7 @@ func TestJITConflictDeletesRunnerByNameThenProvisions(t *testing.T) {
 	// A runner of this name was registered by a pass that died before Create,
 	// and the full listing does not show it yet.
 	e.gh.GenerateRepoJITConfig(context.Background(), e.repo(), jitReq(runner("7", 0)))
-	e.gh.unlisted[runner("7", 0)] = true
+	e.gh.repos[widgets].unlisted[runner("7", 0)] = true
 	e.gh.jit = nil
 
 	st := e.pass()
@@ -476,7 +484,7 @@ func TestRunnerThatServedAnotherJobLeadsToNextGen(t *testing.T) {
 	// Job 7 is still queued; its gen-0 runner and Run are both gone.
 	e.pass()
 	live := e.lux.liveForJob("7")
-	if len(live) != 1 || live[0].run.Labels[LabelGen] != "1" || live[0].key != "api.github.com/1001/7/1" {
+	if len(live) != 1 || live[0].run.Labels[LabelGen] != "1" || live[0].key != "api.github.com/t1/1001/7/1" {
 		t.Fatalf("live %+v", live)
 	}
 	if err := e.gh.pick(runner("7", 1), 7); err != nil {
@@ -587,25 +595,31 @@ func TestRestartRederivesStateWithoutDuplicates(t *testing.T) {
 	e.lux.failCreate = 1 // job 1's runner is registered without a Run
 	e.pass()
 	e.pass()
-	if e.lux.createCount() != 2 {
+	if e.lux.createCount() != 1 || len(e.lux.liveForJob("2")) != 1 {
 		t.Fatalf("creates=%d", e.lux.createCount())
 	}
 
 	e.rec = e.newReconciler()
 	st := e.pass()
-	if st.Provisioned != 0 || e.lux.createCount() != 2 || e.gh.jitCount() != 3 {
+	if st.Provisioned != 0 || e.lux.createCount() != 1 || e.gh.jitCount() != 2 {
 		t.Fatalf("restart duplicated: %+v creates=%d jit=%d", st, e.lux.createCount(), e.gh.jitCount())
 	}
 	e.gh.complete(2, "cancelled")
 	e.pass()
 	e.clock.Add(2 * time.Minute)
 	e.pass()
+	// Job 1's orphan is deleted; until job 1 has a Run, job 2's idle runner
+	// may serve it, so it is not surplus yet.
+	if !slices.Equal(e.gh.deletedNames(), []string{runner("1", 0)}) || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("deleted=%v terminated=%v", e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+	e.pass()
 	deleted := e.gh.deletedNames()
 	slices.Sort(deleted)
 	if !slices.Equal(deleted, []string{runner("1", 0), runner("2", 0)}) || len(e.lux.terminatedIDs()) != 1 {
 		t.Fatalf("deleted=%v terminated=%v", deleted, e.lux.terminatedIDs())
 	}
-	if live := e.lux.live(); len(live) != 1 || live[0].run.Labels[LabelRunner] != runner("1", 1) {
+	if live := e.lux.live(); len(live) != 1 || live[0].run.Labels[LabelRunner] != runner("1", 0) {
 		t.Fatalf("live %+v", live)
 	}
 }
@@ -638,15 +652,107 @@ func jitReq(name string) githubapp.JITConfigRequest {
 	return githubapp.JITConfigRequest{Name: name, RunnerGroupID: 7, Labels: lux3}
 }
 
+// loop runs e.rec.Run with every pass held at entry until released, and the
+// wait for the minimum gap between passes under the test's control.
+type loop struct {
+	t                *testing.T
+	entered, exited  chan struct{}
+	release, stop    chan struct{}
+	afters           chan time.Duration
+	fire             chan time.Time
+	cancel           context.CancelFunc
+	done             chan struct{}
+	stopped, aborted bool
+}
+
+func (e *env) startLoop() *loop {
+	l := &loop{t: e.t, entered: make(chan struct{}), exited: make(chan struct{}), release: make(chan struct{}),
+		stop: make(chan struct{}), afters: make(chan time.Duration, 16), fire: make(chan time.Time), done: make(chan struct{})}
+	e.rec.passHook = func(enter bool) {
+		ch := l.exited
+		if enter {
+			ch = l.entered
+		}
+		select {
+		case ch <- struct{}{}:
+		case <-l.stop:
+			return
+		}
+		if enter {
+			select {
+			case <-l.release:
+			case <-l.stop:
+			}
+		}
+	}
+	e.rec.after = func(d time.Duration) <-chan time.Time { l.afters <- d; return l.fire }
+	ctx, cancel := context.WithCancel(context.Background())
+	l.cancel = cancel
+	go func() { e.rec.Run(ctx); close(l.done) }()
+	e.t.Cleanup(l.shutdown)
+	return l
+}
+
+func (l *loop) shutdown() {
+	if l.stopped {
+		return
+	}
+	l.stopped = true
+	close(l.stop)
+	l.cancel()
+	select {
+	case <-l.done:
+	case <-time.After(10 * time.Second):
+		l.t.Error("Run did not return after cancellation")
+	}
+}
+
+func await[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	var zero T
+	return zero
+}
+
+// pass lets one held pass run to completion.
+func (l *loop) pass() {
+	l.t.Helper()
+	await(l.t, l.entered, "a pass to start")
+	l.release <- struct{}{}
+	await(l.t, l.exited, "the pass to end")
+}
+
+// gap returns the wait Run requested before its next pass, failing if a
+// pass starts without one.
+func (l *loop) gap() time.Duration {
+	l.t.Helper()
+	select {
+	case d := <-l.afters:
+		select {
+		case <-l.entered:
+			l.t.Fatal("a pass started while Run waited for the gap")
+		default:
+		}
+		return d
+	case <-l.entered:
+		l.t.Fatal("a pass started without waiting for the minimum gap")
+	case <-time.After(10 * time.Second):
+		l.t.Fatal("Run did not wait for its next pass")
+	}
+	return 0
+}
+
 func TestWebhookWakesARunLoopWithoutWaitingForThePass(t *testing.T) {
 	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"interval": "1h"}`))
-	e.gh.block = make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { e.rec.Run(ctx); close(done) }()
-	t.Cleanup(func() { cancel(); <-done })
+	l := e.startLoop()
+	await(t, l.entered, "the startup pass")
 
-	// The first pass is now blocked inside GitHub; deliveries must not wait for it.
+	// The startup pass is held; deliveries must not wait for it.
 	secret := []byte("hook-secret")
 	h, err := webhook.New(secret, 42, e.cfg.AllowsRepository, func(context.Context, webhook.WorkflowJobEvent) error {
 		e.rec.Wake()
@@ -655,42 +761,60 @@ func TestWebhookWakesARunLoopWithoutWaitingForThePass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.gh.queue(7, "queued", lux3...)
 	body := []byte(`{"action":"queued","installation":{"id":42},"repository":{"full_name":"acme/widgets"},
 		"workflow_job":{"id":7,"run_id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","lux"]}}`)
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
 	for range 3 {
-		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-GitHub-Event", "workflow_job")
-		req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("webhook status %d", rec.Code)
+		codes := make(chan int, 1)
+		go func() {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-GitHub-Event", "workflow_job")
+			req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes <- rec.Code
+		}()
+		if code := await(t, codes, "the webhook handler"); code != http.StatusAccepted {
+			t.Fatalf("webhook status %d", code)
 		}
 	}
-	// Each pass lists queued then in_progress runs, so two receives on
-	// block are one pass. Release the startup pass and the woken one.
-	for range 4 {
-		select {
-		case e.gh.block <- struct{}{}:
-		case <-time.After(10 * time.Second):
-			t.Fatal("pass did not reach GitHub")
-		}
+	l.release <- struct{}{}
+	await(t, l.exited, "the startup pass to end")
+	e.gh.queue(7, "queued", lux3...)
+	// The three wakes coalesce into one pass after the minimum gap (1h/12).
+	if d := l.gap(); d != 5*time.Minute {
+		t.Fatalf("gap %v", d)
 	}
-	// The three wakes coalesced into that one pass: no third pass starts.
-	select {
-	case e.gh.block <- struct{}{}:
-		t.Fatal("a third pass started")
-	case <-time.After(50 * time.Millisecond):
-	}
-	cancel()
-	<-done
+	e.clock.Add(5 * time.Minute)
+	l.fire <- e.clock.Now()
+	l.pass()
 	if e.lux.createCount() != 1 || e.gh.jitCount() != 1 {
 		t.Fatalf("creates=%d jit=%d", e.lux.createCount(), e.gh.jitCount())
 	}
+}
+
+func TestWakesDuringAndAfterAPassWaitForTheMinimumGap(t *testing.T) {
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"interval": "2m"}`))
+	l := e.startLoop()
+	await(t, l.entered, "the startup pass")
+	e.clock.Add(3 * time.Second)
+	for range 5 {
+		e.rec.Wake()
+	}
+	l.release <- struct{}{}
+	await(t, l.exited, "the startup pass to end")
+	for range 5 {
+		e.rec.Wake()
+	}
+	// minGap is 2m/12 = 10s from the start of the last pass, 3s ago.
+	if d := l.gap(); d != 7*time.Second {
+		t.Fatalf("gap %v, want 7s", d)
+	}
+	e.clock.Add(7 * time.Second)
+	l.fire <- e.clock.Now()
+	l.pass()
 }
 
 func TestStatusJSONHasCountsAndNoSecret(t *testing.T) {
@@ -723,5 +847,436 @@ func TestStatusJSONHasCountsAndNoSecret(t *testing.T) {
 	}
 	if strings.Contains(body, "SECRET") {
 		t.Fatalf("secret in status: %s", body)
+	}
+}
+
+// assertOneLive fails when a job has more than one live Run.
+func (e *env) assertAtMostOneLive(job string) {
+	e.t.Helper()
+	if live := e.lux.liveForJob(job); len(live) > 1 {
+		e.t.Fatalf("job %s has %d live Runs", job, len(live))
+	}
+}
+
+func TestSubmissionWithUnknownOutcomeNeverYieldsTwoLiveRuns(t *testing.T) {
+	// The failed Create's Run commits at the Nth Lux List after it: 0 is the
+	// next pass's supply read, 1 its per-job history read, 2 the following
+	// pass's supply read (after this pass's history read showed nothing).
+	for _, tc := range []struct {
+		name    string
+		lists   int
+		restart bool
+	}{
+		{"before supply read", 0, false},
+		{"between supply and history read", 1, false},
+		{"after history read", 2, false},
+		{"after history read across a restart", 2, true},
+		{"between reads across a restart", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.gh.queue(7, "queued", lux3...)
+			e.lux.lateCommit = tc.lists
+			if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 || len(e.lux.all()) != 0 {
+				t.Fatalf("status %+v runs %+v", st, e.lux.all())
+			}
+			if tc.restart {
+				e.rec = e.newReconciler()
+			}
+			for range 6 {
+				e.pass()
+				e.assertAtMostOneLive("7")
+				e.clock.Add(30 * time.Second)
+			}
+			live := e.lux.liveForJob("7")
+			if len(live) != 1 || live[0].run.Labels[LabelGen] != "0" || e.lux.createCount() != 1 || e.gh.jitCount() != 1 {
+				t.Fatalf("live %+v creates=%d jit=%d", live, e.lux.createCount(), e.gh.jitCount())
+			}
+			if len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
+				t.Fatalf("deleted=%v terminated=%v", e.gh.deletedNames(), e.lux.terminatedIDs())
+			}
+			if err := e.gh.pick(runner("7", 0), 7); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLiveRunFromHistoryReadCountsAgainstCaps(t *testing.T) {
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	e.gh.queue(7, "queued", lux3...)
+	e.gh.queue(8, "queued", lux3...)
+	e.lux.lateCommit = 1
+	e.pass()
+	// Job 7's Run appears at the history read; it fills the global cap of 1.
+	st := e.pass()
+	if st.Provisioned != 0 || st.Live["default"] != 1 || e.lux.createCount() != 1 || len(e.lux.liveForJob("8")) != 0 {
+		t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+	}
+}
+
+func instanceEnv(e *env, instance string) *Reconciler {
+	raw := strings.Replace(testConfig, `"instance": "t1"`, `"instance": "`+instance+`"`, 1)
+	cfg, err := config.Parse([]byte(raw))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	r, err := New(Options{Config: cfg, GitHub: e.gh, Lux: e.lux, Host: "api.github.com", Now: e.clock.Now,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return r
+}
+
+func TestInstancesSharingATenantNeverAdoptOrTerminateEachOthersRuns(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	t1Run := e.runID("7")
+	// Instance t2 replaces t1 while job 7 is still queued.
+	t2 := instanceEnv(e, "t2")
+	for range 4 {
+		st := t2.Pass(context.Background())
+		if st.Error != "" {
+			t.Fatalf("t2 status %+v", st)
+		}
+		e.clock.Add(time.Minute)
+	}
+	var t2Runs []fakeRun
+	for _, r := range e.lux.liveForJob("7") {
+		if r.run.Labels[LabelManaged] == "t2" {
+			t2Runs = append(t2Runs, r)
+		}
+	}
+	if len(t2Runs) != 1 || t2Runs[0].key != "api.github.com/t2/1001/7/0" || t2Runs[0].run.Labels[LabelRunner] != "lux-gha-t2-1001-7-0" {
+		t.Fatalf("t2 Runs %+v", t2Runs)
+	}
+	if len(e.lux.terminatedIDs()) != 0 || len(e.lux.liveForJob("7")) != 2 {
+		t.Fatalf("terminated=%v; t1 Run %s must stay live", e.lux.terminatedIDs(), t1Run)
+	}
+}
+
+func TestReplayedRunWithForeignLabelsIsNeitherAdoptedNorTerminated(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	// Another client already used this bridge's key for a different Run.
+	foreign := e.lux.seed("api.github.com/t1/1001/7/0", luxclient.RunSpec{Labels: map[string]string{
+		LabelManaged: "t0", LabelRepo: "1001", LabelJob: "7", LabelGen: "0", LabelRunner: "lux-gha-t0-1001-7-0"}})
+	// The replay stops provisioning; the runner registered for it is then an
+	// orphan, and the job is tried again after its cleanup.
+	mismatches := 0
+	for range 8 {
+		st := e.pass()
+		if st.Error == ErrRunMismatch {
+			mismatches++
+		}
+		if st.Provisioned != 0 || st.Live["default"] != 0 || st.Terminated != 0 {
+			t.Fatalf("status %+v", st)
+		}
+		e.clock.Add(time.Minute)
+	}
+	if mismatches < 2 {
+		t.Fatalf("mismatches=%d", mismatches)
+	}
+	if len(e.lux.terminatedIDs()) != 0 || len(e.lux.liveForJob("7")) != 1 || e.lux.liveForJob("7")[0].run.ID != foreign {
+		t.Fatalf("terminated=%v live=%+v", e.lux.terminatedIDs(), e.lux.liveForJob("7"))
+	}
+}
+
+func TestFakeContract(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	first := luxclient.RunSpec{Name: "a", ImageRef: "img@sha256:1", Command: []string{"/x"}, Timeout: time.Hour, Labels: map[string]string{"k": "1"}}
+	run1, err := e.lux.Create(ctx, "key", first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.lux.end(run1.ID, "")
+	second := first
+	second.Labels = map[string]string{"k": "2"}
+	run2, err := e.lux.Create(ctx, "key", second)
+	if err != nil || run2.ID != run1.ID || run2.Labels["k"] != "1" || run2.State != "terminated" || e.lux.createCount() != 1 {
+		t.Fatalf("replay %+v err=%v creates=%d", run2, err, e.lux.createCount())
+	}
+
+	e.gh.queue(7, "queued", lux3...)
+	e.gh.queue(8, "queued", "self-hosted", "lux-big")
+	e.pass()
+	if err := e.gh.pick(runner("7", 0), 8); err == nil {
+		t.Fatal("a default runner picked a lux-big job")
+	}
+	if err := e.gh.pick(runner("7", 0), 7); err != nil {
+		t.Fatal(err)
+	}
+	jobs := func() githubapp.WorkflowJob {
+		p, err := e.gh.ListWorkflowRunJobs(ctx, e.repo(), 70, githubapp.WorkflowJobListOptions{Filter: "latest"})
+		if err != nil || len(p.Jobs) != 1 {
+			t.Fatalf("jobs %+v err=%v", p, err)
+		}
+		return p.Jobs[0]
+	}
+	rn := e.gh.runnerByName(runner("7", 0))
+	j := jobs()
+	if j.RunnerName == nil || *j.RunnerName != runner("7", 0) || j.RunnerID == nil || *j.RunnerID != rn.ID || j.Conclusion != nil {
+		t.Fatalf("assigned job %+v", j)
+	}
+	e.gh.complete(7, "success")
+	j = jobs()
+	if e.gh.runnerByName(runner("7", 0)) != nil || j.RunnerName == nil || *j.RunnerName != runner("7", 0) || j.Conclusion == nil || *j.Conclusion != "success" {
+		t.Fatalf("completed job %+v", j)
+	}
+	// Repositories are separate: acme/gadgets sees none of acme/widgets' state.
+	e.gh.addRepo("acme/gadgets", 1002)
+	gadgets := githubapp.Repository{InstallationID: 42, Owner: "acme", Name: "gadgets"}
+	runs, _ := e.gh.ListWorkflowRuns(ctx, gadgets, githubapp.WorkflowRunListOptions{Status: "queued"})
+	runners, _ := e.gh.ListRepoRunners(ctx, gadgets, githubapp.RunnerListOptions{})
+	if len(runs.Runs) != 0 || len(runners.Runners) != 0 {
+		t.Fatalf("gadgets sees runs %+v runners %+v", runs, runners)
+	}
+}
+
+func twoRepos(maxRunners int) func(string) string {
+	return func(s string) string {
+		s = strings.Replace(s, `"maxRunners": 10`, `"maxRunners": `+strconv.Itoa(maxRunners), 1)
+		return strings.Replace(s, `["acme/widgets"]`, `["acme/widgets", "acme/gadgets"]`, 1)
+	}
+}
+
+func liveJobs(e *env, repo string) []string {
+	var jobs []string
+	for _, r := range e.lux.live() {
+		if r.run.Labels[LabelRepo] == repo {
+			jobs = append(jobs, r.run.Labels[LabelJob])
+		}
+	}
+	slices.Sort(jobs)
+	return jobs
+}
+
+func TestTwoRepositoriesShareTheGlobalCapAndFailIndependently(t *testing.T) {
+	e := newEnv(t, twoRepos(3))
+	e.gh.addRepo("acme/gadgets", 1002)
+	e.gh.queue(1, "queued", lux3...)
+	e.gh.queue(2, "queued", lux3...)
+	e.gh.queueIn("acme/gadgets", 30, 3, "queued", lux3...)
+	e.gh.queueIn("acme/gadgets", 40, 4, "queued", lux3...)
+	st := e.pass()
+	if st.Demand["default"] != 4 || st.Provisioned != 3 || len(e.lux.live()) != 3 {
+		t.Fatalf("status %+v", st)
+	}
+	if got := liveJobs(e, "1001"); !slices.Equal(got, []string{"1", "2"}) {
+		t.Fatalf("widgets Runs %v", got)
+	}
+	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"3"}) {
+		t.Fatalf("gadgets Runs %v", got)
+	}
+	// Each runner is registered in its own repository.
+	if err := e.gh.pick("lux-gha-t1-1002-3-0", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.gh.pick(runner("1", 0), 3); err == nil {
+		t.Fatal("a widgets runner picked a gadgets job")
+	}
+
+	// widgets fails to read; gadgets proceeds once job 3 frees a slot.
+	e.gh.complete(3, "success")
+	e.gh.complete(1, "cancelled")
+	e.gh.fail = func(op, repo string, _ int) error {
+		if repo == widgets && op == opRunners {
+			return &githubapp.APIError{StatusCode: 500}
+		}
+		return nil
+	}
+	e.clock.Add(time.Minute)
+	e.pass()
+	e.clock.Add(2 * time.Minute)
+	e.pass() // job 3's Run, whose runner deregistered, frees its slot
+	st = e.pass()
+	if st.Error != ErrGitHub {
+		t.Fatalf("status %+v", st)
+	}
+	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
+		t.Fatalf("gadgets Runs %v", got)
+	}
+	for _, r := range e.lux.all() {
+		if r.run.Labels[LabelRepo] == "1001" && slices.Contains(e.lux.terminatedIDs(), r.run.ID) {
+			t.Fatalf("terminated widgets Run %s while widgets was unreadable", r.run.ID)
+		}
+	}
+	if slices.ContainsFunc(e.gh.deletedNames(), func(n string) bool { return strings.HasPrefix(n, "lux-gha-t1-1001-") }) {
+		t.Fatalf("deleted widgets runners %v", e.gh.deletedNames())
+	}
+}
+
+func rateLimitOn(e *env, target string, until time.Time) {
+	e.gh.fail = func(op, _ string, _ int) error {
+		if op == target {
+			return &githubapp.APIError{StatusCode: 403, RateLimited: true, RetryAt: until}
+		}
+		return nil
+	}
+}
+
+func TestRateLimitAfterDiscoveryStopsThePassUntilRetryAt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(e *env) // leaves the next pass due to hit target
+		op    string
+	}{
+		{"JIT registration", func(e *env) {
+			e.gh.queue(7, "queued", lux3...)
+			e.gh.queue(8, "queued", lux3...)
+		}, opJIT},
+		{"surplus deletion", func(e *env) {
+			e.gh.queue(7, "queued", lux3...)
+			e.pass()
+			e.gh.complete(7, "cancelled")
+			e.pass()
+			e.clock.Add(3 * time.Minute)
+		}, opDelete},
+		{"orphan deletion", func(e *env) {
+			e.gh.queue(7, "queued", lux3...)
+			e.lux.failCreate = 1
+			e.pass()
+			e.gh.complete(7, "cancelled")
+			e.pass()
+			e.clock.Add(3 * time.Minute)
+		}, opDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			tc.setup(e)
+			creates, jits, deleted := e.lux.createCount(), e.gh.jitCount(), len(e.gh.deletedNames())
+			until := e.clock.Now().Add(10 * time.Minute)
+			rateLimitOn(e, tc.op, until)
+			st := e.pass()
+			if st.Error != ErrRateLimited || st.RateLimitedUntil == nil || !st.RateLimitedUntil.Equal(until) {
+				t.Fatalf("status %+v", st)
+			}
+			if e.lux.createCount() != creates || e.gh.jitCount() != jits || len(e.gh.deletedNames()) != deleted || len(e.lux.terminatedIDs()) != 0 {
+				t.Fatalf("acted after the limit: creates=%d jit=%d deleted=%v terminated=%v",
+					e.lux.createCount(), e.gh.jitCount(), e.gh.deletedNames(), e.lux.terminatedIDs())
+			}
+			calls := e.gh.callCount()
+			e.clock.Add(9 * time.Minute)
+			if st := e.pass(); st.Error != ErrRateLimited || e.gh.callCount() != calls {
+				t.Fatalf("called GitHub while limited: %d -> %d, %+v", calls, e.gh.callCount(), st)
+			}
+			e.gh.fail = nil
+			e.clock.Add(time.Minute)
+			if st := e.pass(); st.Error != "" || st.RateLimitedUntil != nil {
+				t.Fatalf("after RetryAt: %+v", st)
+			}
+		})
+	}
+}
+
+func failOn(target, repo string, page int) func(string, string, int) error {
+	return func(op, r string, p int) error {
+		if op == target && r == repo && p == page {
+			return &githubapp.APIError{StatusCode: 502}
+		}
+		return nil
+	}
+}
+
+func TestFailedJobPageSkipsTheRepositoryButNotOthers(t *testing.T) {
+	e := newEnv(t, twoRepos(10))
+	e.gh.addRepo("acme/gadgets", 1002)
+	// A cancelled job's idle runner in widgets, past idleGrace.
+	e.gh.queue(9, "queued", lux3...)
+	e.pass()
+	e.gh.complete(9, "cancelled")
+	e.pass()
+	e.clock.Add(3 * time.Minute)
+	// Three queued jobs in one widgets workflow: two pages at two per page.
+	for id := int64(1); id <= 3; id++ {
+		e.gh.queueIn(widgets, 70, id, "queued", lux3...)
+	}
+	e.gh.queueIn("acme/gadgets", 80, 4, "queued", lux3...)
+	e.gh.fail = failOn(opJobs, widgets, 2)
+	st := e.pass()
+	if st.Error != ErrGitHub || len(liveJobs(e, "1001")) != 1 || len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("acted on widgets: %+v live=%v deleted=%v terminated=%v", st, liveJobs(e, "1001"), e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
+		t.Fatalf("gadgets Runs %v", got)
+	}
+}
+
+func TestRunnerListingBeyondItsPageBoundRemovesNothing(t *testing.T) {
+	e := newEnv(t, twoRepos(10))
+	e.gh.addRepo("acme/gadgets", 1002)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	// 100 other runners sort first and fill all 50 pages of two; job 7's
+	// runner, which finished nothing and is still registered, is on page 51.
+	for i := int64(1); i <= 2*maxRunnerPages; i++ {
+		e.gh.addRunner(widgets, i, "other-"+strconv.FormatInt(i, 10))
+	}
+	e.gh.queueIn("acme/gadgets", 80, 4, "queued", lux3...)
+	for range 3 {
+		st := e.pass()
+		if st.Error != ErrGitHub {
+			t.Fatalf("status %+v", st)
+		}
+		e.clock.Add(2 * time.Minute)
+	}
+	if slices.Contains(e.lux.terminatedIDs(), id) || len(e.gh.deletedNames()) != 0 {
+		t.Fatalf("terminated=%v deleted=%v", e.lux.terminatedIDs(), e.gh.deletedNames())
+	}
+	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
+		t.Fatalf("gadgets Runs %v", got)
+	}
+}
+
+func TestWorkflowRunPageBoundKeepsIdleSupply(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	e.gh.complete(7, "cancelled")
+	// More queued workflow runs than 10 pages of two hold; their jobs are not
+	// demand, so the job budget is not what truncates the view.
+	for id := int64(100); id < 100+2*maxRunPages+2; id++ {
+		e.gh.queue(id, "queued", "self-hosted", "gpu")
+	}
+	e.pass()
+	e.clock.Add(time.Hour)
+	e.pass()
+	if len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("deleted=%v terminated=%v", e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+}
+
+func TestQueuedJobBehindAnActiveSiblingGetsARun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 1, "in_progress", lux3...)
+	e.gh.queueIn(widgets, 70, 2, "queued", lux3...)
+	st := e.pass()
+	if st.Demand["default"] != 1 || len(e.lux.liveForJob("2")) != 1 || len(e.lux.liveForJob("1")) != 0 {
+		t.Fatalf("status %+v live=%+v", st, e.lux.live())
+	}
+}
+
+func TestRunWhoseTerminateFailedAfterRunnerDeletionIsTerminatedLater(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.complete(7, "cancelled")
+	e.pass()
+	e.clock.Add(2 * time.Minute)
+	e.lux.failTerminate = 1
+	st := e.pass()
+	if st.Error != ErrLux || !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("status %+v deleted=%v terminated=%v", st, e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+	e.pass()
+	e.clock.Add(2 * time.Minute)
+	e.pass()
+	if !slices.Equal(e.lux.terminatedIDs(), []string{id}) || e.lux.createCount() != 1 {
+		t.Fatalf("terminated=%v creates=%d", e.lux.terminatedIDs(), e.lux.createCount())
 	}
 }
