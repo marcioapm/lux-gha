@@ -75,9 +75,13 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 		return err
 	}
 	// Events are only wake-ups: each pass re-reads job state from GitHub.
+	// Only a queued job a route serves needs a prompt pass; the tick serves
+	// the rest, which keeps passes from following every delivery.
 	hook, err := webhook.New(secrets.WebhookSecret, cfg.GitHub.InstallationID, cfg.AllowsRepository, func(_ context.Context, ev webhook.WorkflowJobEvent) error {
 		log.Debug("workflow_job received", "delivery", ev.DeliveryID, "action", ev.Action, "repository", ev.Repository, "job", ev.JobID)
-		rec.Wake()
+		if _, err := cfg.MatchRoute(ev.Labels); ev.Action == "queued" && err == nil {
+			rec.Wake()
+		}
 		return nil
 	}, log)
 	if err != nil {
