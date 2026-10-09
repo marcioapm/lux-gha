@@ -49,14 +49,17 @@ type clock struct {
 func (c *clock) now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
 func (c *clock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
-// fakeGitHub verifies app JWTs against the public key and issues sequential installation tokens.
+// fakeGitHub verifies app JWTs against the public key and issues sequential
+// installation tokens that expire tokenTTL (default one hour) after issuance.
 type fakeGitHub struct {
-	t          *testing.T
-	clock      *clock
-	tokenCalls atomic.Int32
-	tokenDelay chan struct{}
-	mu         sync.Mutex
-	api        func(w http.ResponseWriter, r *http.Request)
+	t            *testing.T
+	clock        *clock
+	tokenCalls   atomic.Int32
+	tokenTTL     time.Duration
+	tokenArrived chan struct{}
+	tokenDelay   chan struct{}
+	mu           sync.Mutex
+	api          func(w http.ResponseWriter, r *http.Request)
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -69,12 +72,22 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 401)
 			return
 		}
+		if f.tokenArrived != nil {
+			select {
+			case f.tokenArrived <- struct{}{}:
+			default:
+			}
+		}
 		if f.tokenDelay != nil {
 			<-f.tokenDelay
 		}
 		n := f.tokenCalls.Add(1)
+		ttl := f.tokenTTL
+		if ttl == 0 {
+			ttl = time.Hour
+		}
 		w.WriteHeader(201)
-		fmt.Fprintf(w, `{"token":"ghs_token%d","expires_at":%q}`, n, f.clock.now().Add(time.Hour).Format(time.RFC3339))
+		fmt.Fprintf(w, `{"token":"ghs_token%d","expires_at":%q}`, n, f.clock.now().Add(ttl).Format(time.RFC3339))
 		return
 	}
 	f.mu.Lock()
@@ -116,13 +129,17 @@ func (f *fakeGitHub) verifyJWT(jwt string) error {
 	return nil
 }
 
-func newTestClient(t *testing.T, key []byte, api http.HandlerFunc) (*Client, *fakeGitHub, *clock) {
+func newTestClient(t *testing.T, key []byte, api http.HandlerFunc, mod ...func(*Config)) (*Client, *fakeGitHub, *clock) {
 	t.Helper()
 	clk := &clock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
 	fake := &fakeGitHub{t: t, clock: clk, api: api}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	c, err := New(Config{AppID: "Iv1.client", PrivateKey: key, BaseURL: srv.URL, RequestTimeout: 2 * time.Second})
+	cfg := Config{AppID: "Iv1.client", PrivateKey: key, BaseURL: srv.URL, RequestTimeout: 2 * time.Second}
+	for _, m := range mod {
+		m(&cfg)
+	}
+	c, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,15 +190,29 @@ func TestParsePrivateKeyRejectsNonRSAAndShortKeys(t *testing.T) {
 
 func TestConcurrentCallersShareOneTokenAndRefreshNearExpiry(t *testing.T) {
 	c, fake, clk := newTestClient(t, pkcs1PEM(testKey), nil)
+	fake.tokenArrived = make(chan struct{}, 1)
 	fake.tokenDelay = make(chan struct{})
 	var wg sync.WaitGroup
 	tokens := make([]string, 20)
 	errs := make([]error, 20)
-	for i := range tokens {
-		wg.Add(1)
-		go func(i int) { defer wg.Done(); tokens[i], errs[i] = c.InstallationToken(context.Background(), 42) }(i)
+	call := func(i int) {
+		defer wg.Done()
+		tokens[i], errs[i] = c.InstallationToken(context.Background(), 42)
 	}
-	time.Sleep(50 * time.Millisecond)
+	wg.Add(1)
+	go call(0)
+	// The first fetch is now registered and held by the server, so every
+	// later caller either joins it or, if it arrives after release, reads
+	// the cached token; neither may issue a second token.
+	<-fake.tokenArrived
+	started := make(chan struct{}, len(tokens)-1)
+	for i := 1; i < len(tokens); i++ {
+		wg.Add(1)
+		go func(i int) { started <- struct{}{}; call(i) }(i)
+	}
+	for i := 1; i < len(tokens); i++ {
+		<-started
+	}
 	close(fake.tokenDelay)
 	wg.Wait()
 	for i := range tokens {
@@ -205,11 +236,12 @@ func TestConcurrentCallersShareOneTokenAndRefreshNearExpiry(t *testing.T) {
 
 func TestCancelledWaiterDoesNotFailSharedTokenFetch(t *testing.T) {
 	c, fake, _ := newTestClient(t, pkcs1PEM(testKey), nil)
+	fake.tokenArrived = make(chan struct{}, 1)
 	fake.tokenDelay = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	first := make(chan error, 1)
 	go func() { _, err := c.InstallationToken(ctx, 42); first <- err }()
-	time.Sleep(20 * time.Millisecond)
+	<-fake.tokenArrived
 	cancel()
 	if err := <-first; !errors.Is(err, context.Canceled) {
 		t.Fatalf("first err=%v", err)
@@ -240,6 +272,69 @@ func TestUnauthorizedResponseEvictsCachedToken(t *testing.T) {
 	job, err := c.GetWorkflowJob(context.Background(), repo, 7)
 	if err != nil || job.ID != 7 || fake.tokenCalls.Load() != 2 {
 		t.Fatalf("job=%+v err=%v calls=%d", job, err, fake.tokenCalls.Load())
+	}
+}
+
+func TestTokenCacheHonoursReturnedExpiry(t *testing.T) {
+	c, fake, clk := newTestClient(t, pkcs1PEM(testKey), nil)
+	fake.tokenTTL = 5 * time.Minute
+	if tok, err := c.InstallationToken(context.Background(), 42); err != nil || tok != "ghs_token1" {
+		t.Fatalf("tok=%q err=%v", tok, err)
+	}
+	clk.add(3 * time.Minute)
+	if tok, err := c.InstallationToken(context.Background(), 42); err != nil || tok != "ghs_token1" || fake.tokenCalls.Load() != 1 {
+		t.Fatalf("refreshed early: tok=%q err=%v calls=%d", tok, err, fake.tokenCalls.Load())
+	}
+	// 4m30s after issuance the 5-minute token is inside the one-minute refresh margin.
+	clk.add(90 * time.Second)
+	if tok, err := c.InstallationToken(context.Background(), 42); err != nil || tok != "ghs_token2" || fake.tokenCalls.Load() != 2 {
+		t.Fatalf("tok=%q err=%v calls=%d", tok, err, fake.tokenCalls.Load())
+	}
+}
+
+// A request made with token1 that fails 401 after token2 has been cached
+// must not evict token2.
+func TestLateUnauthorizedForOldTokenKeepsReplacement(t *testing.T) {
+	oldArrived := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOld) }) }
+	var oldSeen atomic.Bool
+	c, fake, clk := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer ghs_token1":
+			// Only the first token1 request is held; any later one fails at once.
+			if oldSeen.CompareAndSwap(false, true) {
+				close(oldArrived)
+				<-releaseOld
+			}
+			http.Error(w, "expired", 401)
+		case "Bearer ghs_token2":
+			w.Write([]byte(`{"id":2}`))
+		default:
+			http.Error(w, "unknown token", 401)
+		}
+	})
+	// Registered after the server so it runs first and unblocks the handler.
+	t.Cleanup(release)
+	fake.tokenTTL = 5 * time.Minute
+	oldDone := make(chan error, 1)
+	go func() { _, err := c.GetWorkflowJob(context.Background(), repo, 1); oldDone <- err }()
+	<-oldArrived
+	clk.add(4*time.Minute + 30*time.Second)
+	if job, err := c.GetWorkflowJob(context.Background(), repo, 2); err != nil || job.ID != 2 {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	release()
+	var apiErr *APIError
+	if err := <-oldDone; !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+		t.Fatalf("old request err=%v", err)
+	}
+	if job, err := c.GetWorkflowJob(context.Background(), repo, 2); err != nil || job.ID != 2 {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	if got := fake.tokenCalls.Load(); got != 2 {
+		t.Fatalf("token calls=%d, want 2", got)
 	}
 }
 
@@ -460,13 +555,14 @@ func (filler) Read(p []byte) (int, error) {
 
 func TestRequestsHonourContextAndTimeout(t *testing.T) {
 	release := make(chan struct{})
-	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+	block := func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-release:
 		case <-r.Context().Done():
 		}
-	})
+	}
 	defer close(release)
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), block)
 	if _, err := c.InstallationToken(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
@@ -475,10 +571,12 @@ func TestRequestsHonourContextAndTimeout(t *testing.T) {
 	if _, err := c.GetWorkflowJob(ctx, repo, 1); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v", err)
 	}
-	c.timeout = 50 * time.Millisecond
-	start := time.Now()
-	if _, err := c.GetWorkflowJob(context.Background(), repo, 1); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
-		t.Fatalf("err=%v elapsed=%s", err, time.Since(start))
+	short, _, _ := newTestClient(t, pkcs1PEM(testKey), block, func(cfg *Config) { cfg.RequestTimeout = 50 * time.Millisecond })
+	if _, err := short.InstallationToken(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := short.GetWorkflowJob(context.Background(), repo, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
 	}
 }
 
