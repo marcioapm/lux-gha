@@ -30,10 +30,17 @@ A JIT runner registered with a set of labels can be assigned by GitHub to **any*
 ## Reconciliation
 
 One goroutine runs reconciliation passes, never two at once. A pass starts at
-startup, every `reconcile.interval`, and after any accepted webhook delivery.
+startup, every `reconcile.interval`, and after an accepted `queued` delivery
+for a job whose labels match a route. Other deliveries are left to the tick.
 A delivery only wakes the loop (a one-slot channel, so wakes coalesce) and is
-answered at once; the event's contents are not trusted, because every pass
-re-reads job state from GitHub. There is no database: the only persistent
+answered at once; a woken pass starts no sooner than `max(5s, interval/12)`
+after the previous pass started. The event's contents are not trusted beyond
+that, because every pass re-reads job state from GitHub.
+
+A pass costs `2 + active workflow runs + ⌈runners/100⌉` GitHub requests per
+repository (active = `queued` or `in_progress`, including runs with only
+GitHub-hosted jobs), plus one per provisioned runner; size `interval` against
+the installation's hourly limit and the number of repositories. There is no database: the only persistent
 state is Lux Run labels and GitHub's own records.
 
 The bridge keeps **one live Run per queued matching job**. A pass:
@@ -42,18 +49,28 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    and `in_progress` and their latest-attempt jobs. A job is demand when its
    status is `queued` and its labels match a route. `waiting` jobs
    (environment approval) are not demand. At most `reconcile.maxJobsPerPass`
-   jobs are read per pass.
+   jobs are read per pass, in configuration order, so a backlog over that
+   bound in one repository can delay the others.
 2. **Supply.** Lists the instance's live Lux Runs (`submitted`, `scheduled`,
    `provisioning`, `starting`, `running`, `stopping`, `resuming`) and the
    repository's runners named `lux-gha-<instance>-...`.
 3. **Provision.** A demand job with no live Run labelled with its ID gets a
    JIT runner and a Run, within the route's and the global `maxRunners`. The
    runner is named `lux-gha-<instance>-<repo id>-<job id>-<gen>` and the Run is
-   submitted with `Idempotency-Key: <github host>/<repo id>/<job id>/<gen>`.
-   `gen` counts earlier Runs and registered runners for that job, so it rises
-   only when an earlier attempt ended while the job was still queued (spot
-   loss, secrets lost to a luxd restart, or its runner took another job).
-   Past `reconcile.maxGensPerJob` the job is logged and left alone. A JIT
+   submitted with
+   `Idempotency-Key: <github host>/<instance>/<repo id>/<job id>/<gen>`.
+   `gen` is one more than the highest gen of the job's earlier Runs, so it
+   rises only when an earlier attempt ended while the job was still queued
+   (spot loss, secrets lost to a luxd restart, or its runner took another
+   job). Before provisioning, the job's Runs are listed again: a live one
+   (a submission whose outcome was unknown and has since committed) is
+   counted as its supply instead. A registered runner for the job whose gen
+   has no Run at all may still have a submission in flight, so the job waits
+   until that runner's Run appears or orphan cleanup deletes the runner.
+   Past `reconcile.maxGensPerJob` the job is logged and left alone. A Run
+   returned by Lux (new or replayed) whose `managed`, `repo`, `job`, `gen` or
+   `runner` label differs from the submission is logged, neither counted nor
+   terminated, and provisioning stops for the pass. A JIT
    `409` (a runner of that name already exists: the bridge stopped between JIT
    and Run submission) deletes that runner; the job is provisioned next pass.
    If Lux does not echo `resumePolicy: never`, the Run is terminated and
@@ -61,13 +78,17 @@ The bridge keeps **one live Run per queued matching job**. A pass:
 4. **Surplus.** An idle (not busy) runner whose Run is live, whose triggering
    job has not been queued for `reconcile.idleGrace`, and which exceeds its
    repository and route's queued demand, is deleted from GitHub and then its
-   Run is terminated. GitHub refuses to delete a busy runner (`422`), and a
-   Run is terminated only after its runner was deleted, so a busy runner is
-   never killed.
+   Run is terminated. A Run is terminated only after its runner was deleted,
+   and GitHub answers a delete of a runner assigned to a job with `422`
+   "Runner … is still running a job", which actions-runner-controller relies
+   on (`controllers/actions.summerwind.net/runner_graceful_stop.go`; the
+   scale-set API's equivalent is `JobStillRunningException`, see its
+   `docs/adrs/2022-12-27-pick-the-right-runner-to-scale-down.md`). Any delete
+   error other than a rate limit leaves the runner and its Run alone.
 5. **Finished runs and orphans.** A live Run whose runner is no longer
    registered (it ran its job and deregistered) is terminated if still live
    `idleGrace` later. An offline managed runner with no live Run (lost before
-   pickup, or Run submission failed) is deleted `idleGrace` after it was
+   pickup, or a submission whose outcome stayed unknown) is deleted `idleGrace` after it was
    first seen. A Run lost mid-job is left alone: GitHub fails the job and
    nothing reruns it.
 
@@ -90,7 +111,7 @@ timers, which delays cleanup but never duplicates a Run.
 
 `GET /status` returns the last pass as JSON: `time`, `durationMs`, `error`
 (a category: `github_rate_limited`, `github`, `lux`,
-`lux_resume_policy_not_echoed`), `rateLimitedUntil`, `demand` and `live` per
+`lux_resume_policy_not_echoed`, `lux_run_mismatch`), `rateLimitedUntil`, `demand` and `live` per
 route, `idle`, `busy`, and `provisioned`, `terminated` and `deleted` in that
 pass. It holds no credentials or JIT configuration.
 
@@ -181,7 +202,7 @@ A `never` Run ends `terminated` even when it succeeds. The outcome is in `exitCo
 
 There is no operator override for unverifiable Lux builds. Deploy a tagged release.
 
-The JIT config is delivered only as a Lux file secret. It never appears in labels, env or the command. GitHub documents no lifetime for a JIT config, so the bridge assumes none.
+The JIT config is delivered only as a Lux file secret. It never appears in labels, env or the submitted Lux command. At runtime the entrypoint passes it as `./run.sh --jitconfig` argv, which is GitHub's documented way to start a JIT runner. GitHub documents no lifetime for a JIT config, so the bridge assumes none.
 
 ## Development
 
