@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1172,10 +1173,11 @@ func TestRateLimitAfterDiscoveryStopsThePassUntilRetryAt(t *testing.T) {
 	}
 }
 
+// failOn fails one operation's page with a transport error, not an HTTP status.
 func failOn(target, repo string, page int) func(string, string, int) error {
 	return func(op, r string, p int) error {
 		if op == target && r == repo && p == page {
-			return &githubapp.APIError{StatusCode: 502}
+			return errors.New("fake: connection reset")
 		}
 		return nil
 	}
