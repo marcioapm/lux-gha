@@ -55,6 +55,8 @@ type fakeGitHub struct {
 	perPage int
 	// failRunners answers runner listings 500.
 	failRunners bool
+	// beforeDelete runs once, under the lock, before the next runner deletion.
+	beforeDelete func()
 }
 
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
@@ -214,6 +216,10 @@ func (f *fakeGitHub) DeleteRepoRunner(_ context.Context, _ githubapp.Repository,
 	defer f.mu.Unlock()
 	if err := f.gate(); err != nil {
 		return err
+	}
+	if f.beforeDelete != nil {
+		f.beforeDelete()
+		f.beforeDelete = nil
 	}
 	rn, ok := f.runners[id]
 	if !ok {

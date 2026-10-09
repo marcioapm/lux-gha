@@ -319,9 +319,31 @@ func TestGitHubErrorSkipsTheRepositoryWithoutCleanup(t *testing.T) {
 	e.pass()
 	e.clock.Add(time.Hour)
 	e.gh.failRunners = true
+	e.pass()
+	e.clock.Add(time.Hour)
 	st := e.pass()
 	if st.Error != ErrGitHub || len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
 		t.Fatalf("status %+v deleted=%v terminated=%v", st, e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+}
+
+func TestRunnerThatTurnsBusyBeforeDeletionKeepsItsRun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	e.gh.complete(7, "cancelled")
+	e.pass()
+	e.clock.Add(3 * time.Minute)
+	// Job 8 arrives after the pass listed demand and runners; job 7's runner
+	// takes it just before the bridge deletes it.
+	e.gh.beforeDelete = func() {
+		e.gh.jobs[8] = &fakeJob{id: 8, runID: 80, status: "queued", labels: lux3}
+		e.gh.runnerByName(runner("7", 0)).Busy = true
+		e.gh.jobs[8].status, e.gh.jobs[8].runner = "in_progress", runner("7", 0)
+	}
+	e.pass()
+	if len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 || len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("deleted=%v terminated=%v", e.gh.deletedNames(), e.lux.terminatedIDs())
 	}
 }
 
@@ -437,6 +459,28 @@ func TestPrePickupLossBumpsGenerationUpToTheCap(t *testing.T) {
 	e.pass()
 	if e.lux.createCount() != 5 {
 		t.Fatalf("provisioned past the cap: creates=%d", e.lux.createCount())
+	}
+}
+
+func TestRunnerThatServedAnotherJobLeadsToNextGen(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	// Job 9 is queued and picked by job 7's runner before any pass sees it.
+	e.gh.queue(9, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 9); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.complete(9, "success")
+	e.lux.end(e.runID("7"), "")
+	// Job 7 is still queued; its gen-0 runner and Run are both gone.
+	e.pass()
+	live := e.lux.liveForJob("7")
+	if len(live) != 1 || live[0].run.Labels[LabelGen] != "1" || live[0].key != "api.github.com/1001/7/1" {
+		t.Fatalf("live %+v", live)
+	}
+	if err := e.gh.pick(runner("7", 1), 7); err != nil {
+		t.Fatal(err)
 	}
 }
 

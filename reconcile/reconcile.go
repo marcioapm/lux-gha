@@ -451,7 +451,7 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool
 	}
 	// Every earlier Run used its gen, and so did a runner registered without
 	// a Run (Lux create failed): neither its name nor its key is reused.
-	gen := len(previous)
+	gen := 0
 	for _, run := range previous {
 		if n, err := strconv.Atoi(run.Labels[LabelGen]); err == nil && n >= gen {
 			gen = n + 1
