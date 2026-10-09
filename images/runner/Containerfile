@@ -1,0 +1,91 @@
+# lux-gha runner: GitHub's official runner, run once with the JIT config Lux
+# places as a file secret, plus rootless Docker for Lux nested Runs
+# (sandbox.nestedContainers). Built and tested for linux/arm64.
+
+# ubuntu:24.04, multi-arch index digest (resolved 2026-10-10).
+FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+ARG TARGETARCH
+ARG RUNNER_VERSION=2.338.0
+# SHA-256 of actions-runner-linux-<arch>-2.338.0.tar.gz, from the v2.338.0
+# release notes (also the asset digests the GitHub releases API reports).
+ARG RUNNER_SHA256_ARM64=628b4a7258487b80c1d3c221095a7ded349f5ae0175fd3dfab708d07428f041b
+ARG RUNNER_SHA256_AMD64=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
+# Versions from download.docker.com/linux/ubuntu noble stable, present for
+# both arm64 and amd64.
+ARG DOCKER_VERSION=5:29.9.0-1~ubuntu.24.04~noble
+ARG CONTAINERD_VERSION=2.4.1-2~ubuntu.24.04~noble
+ARG BUILDX_VERSION=0.38.0-1~ubuntu.24.04~noble
+ARG COMPOSE_VERSION=5.6.0-1~ubuntu.24.04~noble
+# Docker Release (CE deb) <docker@docker.com>
+ARG DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+LABEL org.opencontainers.image.source="https://github.com/marcioapm/lux-gha" \
+      org.opencontainers.image.description="lux-gha one-shot GitHub Actions runner with rootless Docker" \
+      io.github.actions.runner.version="${RUNNER_VERSION}"
+
+SHELL ["/bin/sh", "-eux", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    install -d -m 0755 /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.asc; \
+    fpr=$(gpg --batch --with-colons --show-keys /tmp/docker.asc | awk -F: '$1 == "fpr" {print $10; exit}'); \
+    [ "$fpr" = "$DOCKER_GPG_FINGERPRINT" ]; \
+    gpg --batch --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.asc; \
+    rm /tmp/docker.asc; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
+      > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      "docker-ce=${DOCKER_VERSION}" "docker-ce-cli=${DOCKER_VERSION}" \
+      "docker-ce-rootless-extras=${DOCKER_VERSION}" "containerd.io=${CONTAINERD_VERSION}" \
+      "docker-buildx-plugin=${BUILDX_VERSION}" "docker-compose-plugin=${COMPOSE_VERSION}" \
+      uidmap libcap2-bin fuse-overlayfs slirp4netns iptables \
+      git jq unzip xz-utils python3; \
+    apt-get purge -y --auto-remove gnupg; \
+    rm -rf /var/lib/apt/lists/*
+
+# The base image's "ubuntu" user holds uid 1000.
+RUN userdel -r ubuntu; \
+    useradd -m -u 1000 -U -s /bin/bash runner; \
+    printf 'runner:1:999\nrunner:1001:64535\n' > /etc/subuid; \
+    cp /etc/subuid /etc/subgid
+
+WORKDIR /home/runner/actions-runner
+RUN case "$TARGETARCH" in \
+      arm64) arch=arm64 sha=$RUNNER_SHA256_ARM64 ;; \
+      amd64) arch=x64 sha=$RUNNER_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"; \
+    echo "${sha}  /tmp/runner.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/runner.tar.gz; \
+    rm /tmp/runner.tar.gz; \
+    apt-get update; \
+    ./bin/installdependencies.sh; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -o runner -g runner /home/runner/.local /home/runner/.local/share /home/runner/.local/share/docker; \
+    chown -R runner:runner /home/runner
+
+# Lux runs nested workloads without no-new-privileges, so any setuid or
+# setgid program would let the job become root in its container. Strip them
+# all; newuidmap/newgidmap get only the file capability they need.
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} +; \
+    setcap cap_setuid=ep /usr/bin/newuidmap; \
+    setcap cap_setgid=ep /usr/bin/newgidmap; \
+    [ -z "$(find / -xdev -type f -perm /6000)" ]
+
+COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
+
+ENV RUNNER_DIR=/home/runner/actions-runner \
+    RUNNER_USER=runner \
+    HOME=/home/runner \
+    XDG_RUNTIME_DIR=/tmp/xdg \
+    DOCKER_HOST=unix:///tmp/xdg/docker.sock
+
+USER runner
+WORKDIR /home/runner
+ENTRYPOINT ["/usr/local/bin/lux-gha-runner"]
