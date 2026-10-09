@@ -23,7 +23,7 @@ const (
 	maxBody      = 16 << 20
 	maxErrorBody = 64 << 10
 	// Lux accepts 1..200 Runs per page on a paged GET /v1/runs.
-	pageSize        = 100
+	pageSize        = 200
 	defaultMaxPages = 100
 	defaultTimeout  = 30 * time.Second
 )

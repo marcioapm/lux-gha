@@ -160,11 +160,29 @@ func runPath(id string) (string, error) {
 	return "/v1/runs/" + url.PathEscape(id), nil
 }
 
-// List returns every Run carrying all the given labels, newest first, by
-// paging GET /v1/runs?sort=created&label=k=v... over its next cursors. It
-// fails rather than truncate: on a repeated cursor or past MaxPages.
-func (c *Client) List(ctx context.Context, labels map[string]string) ([]Run, error) {
+// runStates are Lux's Run state names, accepted by GET /v1/runs?state=.
+var runStates = map[string]bool{
+	"submitted": true, "scheduled": true, "provisioning": true, "starting": true,
+	"running": true, "stopping": true, "stopped": true, "resuming": true,
+	"succeeded": true, "failed": true, "terminated": true, "lost": true,
+}
+
+// List returns every Run carrying all the given labels and, when states is
+// non-empty, in one of those states, newest first, by paging
+// GET /v1/runs?sort=created&label=k=v...&state=a,b over its next cursors.
+// Terminated Runs are retained by Lux, so a label-only listing grows without
+// bound; pass the live states to keep it bounded. It fails rather than
+// truncate: on a repeated cursor or past MaxPages.
+func (c *Client) List(ctx context.Context, labels map[string]string, states ...string) ([]Run, error) {
 	q := url.Values{"sort": {"created"}, "limit": {strconv.Itoa(pageSize)}}
+	for _, s := range states {
+		if !runStates[s] {
+			return nil, errors.New("luxclient: invalid run state filter")
+		}
+	}
+	if len(states) > 0 {
+		q.Set("state", strings.Join(states, ","))
+	}
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
 		// Lux splits each selector at its first "=".

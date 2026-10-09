@@ -372,19 +372,60 @@ func TestListPagesWithLabelsAndCursor(t *testing.T) {
 	}
 	labels := `["a=b=c&d" "lux-gha/repo=acme/api"]`
 	want := []string{
-		"label=" + labels + " sort=created limit=100 next=",
-		"label=" + labels + " sort=created limit=100 next=c+/=1",
-		"label=" + labels + " sort=created limit=100 next=c2",
+		"label=" + labels + " sort=created limit=200 next=",
+		"label=" + labels + " sort=created limit=200 next=c+/=1",
+		"label=" + labels + " sort=created limit=200 next=c2",
 	}
 	if !reflect.DeepEqual(queries, want) {
 		t.Fatalf("queries\n%q\nwant\n%q", queries, want)
 	}
 }
 
+func TestListSendsStateFilterOnEveryPage(t *testing.T) {
+	var queries []string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		queries = append(queries, fmt.Sprintf("state=%q label=%q next=%s", q["state"], q["label"], q.Get("next")))
+		switch q.Get("next") {
+		case "":
+			writeJSON(w, 200, `{"runs":[{"id":"run_2","state":"running"}],"next":"c1"}`)
+		case "c1":
+			writeJSON(w, 200, `{"runs":[{"id":"run_1","state":"submitted"}],"next":"c2"}`)
+		default:
+			writeJSON(w, 200, `{"runs":[]}`)
+		}
+	})
+	runs, err := c.List(context.Background(), map[string]string{"lux-gha/repo": "acme/api"}, "submitted", "running", "stopping")
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("runs %v err %v", runs, err)
+	}
+	want := []string{
+		`state=["submitted,running,stopping"] label=["lux-gha/repo=acme/api"] next=`,
+		`state=["submitted,running,stopping"] label=["lux-gha/repo=acme/api"] next=c1`,
+		`state=["submitted,running,stopping"] label=["lux-gha/repo=acme/api"] next=c2`,
+	}
+	if !reflect.DeepEqual(queries, want) {
+		t.Fatalf("queries\n%q\nwant\n%q", queries, want)
+	}
+}
+
+func TestListRejectsInvalidStateBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+	for _, states := range [][]string{{"bogus"}, {"running", ""}, {"running,stopped"}, {"Running"}} {
+		if _, err := c.List(context.Background(), nil, states...); err == nil {
+			t.Errorf("states %q accepted", states)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("%d requests sent", calls.Load())
+	}
+}
+
 func TestListEmptyMatch(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Has("label") {
-			t.Errorf("unexpected label")
+		if r.URL.Query().Has("label") || r.URL.Query().Has("state") {
+			t.Errorf("unexpected label or state")
 		}
 		writeJSON(w, 200, `{"runs":[]}`)
 	})
