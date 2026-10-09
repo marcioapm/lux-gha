@@ -368,6 +368,56 @@ func TestGenerateRepoJITConfig(t *testing.T) {
 	}
 }
 
+func TestGenerateRepoJITConfigValidatesRequestAndResponse(t *testing.T) {
+	labels := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("l%d", i)
+		}
+		return out
+	}
+	var posts atomic.Int32
+	response := `{"runner":{"id":23},"encoded_jit_config":"SECRET-JIT"}`
+	var mu sync.Mutex
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		mu.Lock()
+		body := response
+		mu.Unlock()
+		w.WriteHeader(201)
+		w.Write([]byte(body))
+	})
+	for name, req := range map[string]JITConfigRequest{
+		"missing name":     {RunnerGroupID: 1, Labels: []string{"lux"}},
+		"zero group":       {Name: "r", RunnerGroupID: 0, Labels: []string{"lux"}},
+		"negative group":   {Name: "r", RunnerGroupID: -1, Labels: []string{"lux"}},
+		"whitespace label": {Name: "r", RunnerGroupID: 1, Labels: []string{"lux", " \t"}},
+		"101 labels":       {Name: "r", RunnerGroupID: 1, Labels: labels(101)},
+	} {
+		if _, err := c.GenerateRepoJITConfig(context.Background(), repo, req); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if n := posts.Load(); n != 0 {
+		t.Fatalf("%d requests sent for invalid input", n)
+	}
+	if cfg, err := c.GenerateRepoJITConfig(context.Background(), repo, JITConfigRequest{Name: "r", RunnerGroupID: 1, Labels: labels(100)}); err != nil || cfg.Runner.ID != 23 {
+		t.Fatalf("100 labels: cfg=%v err=%v", cfg, err)
+	}
+	for name, body := range map[string]string{
+		"no runner id": `{"runner":{"name":"r"},"encoded_jit_config":"SECRET-JIT"}`,
+		"no config":    `{"runner":{"id":23}}`,
+		"empty config": `{"runner":{"id":23},"encoded_jit_config":""}`,
+	} {
+		mu.Lock()
+		response = body
+		mu.Unlock()
+		if cfg, err := c.GenerateRepoJITConfig(context.Background(), repo, JITConfigRequest{Name: "r", RunnerGroupID: 1, Labels: []string{"lux"}}); err == nil || cfg.EncodedJITConfig != "" || cfg.Runner.ID != 0 {
+			t.Errorf("%s: cfg=%v err=%v", name, cfg, err)
+		}
+	}
+}
+
 func TestGetWorkflowJobDecodesNullableRunnerAttribution(t *testing.T) {
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/octo-org/app.repo/actions/jobs/99" {
