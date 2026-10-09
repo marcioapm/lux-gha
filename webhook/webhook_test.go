@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,41 @@ func TestSignatureIsVerifiedOverRawBytesBeforeDispatch(t *testing.T) {
 				t.Fatalf("status %d, %d callbacks", w.Code, len(rec.events))
 			}
 		})
+	}
+}
+
+// Well-formed signatures that agree with the true digest on a prefix must
+// still fail: the full 32-byte digest has to match.
+func TestSignatureRequiresEveryDigestByte(t *testing.T) {
+	body := fixture(t, "workflow_job_queued.json")
+	digest, err := hex.DecodeString(strings.TrimPrefix(sign(body), "sha256="))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigs := map[string]string{}
+	for _, n := range []int{1, 2, 7, 16, 31} {
+		sigs["prefix "+strconv.Itoa(n)] = "sha256=" + hex.EncodeToString(digest[:n])
+	}
+	// Odd hex lengths do not decode; included so a lenient decoder is caught too.
+	sigs["odd hex 63"] = sign(body)[:7+63]
+	sigs["extended"] = sign(body) + "00"
+	for i := 1; i < len(digest); i++ {
+		flipped := bytes.Clone(digest)
+		flipped[i] ^= 0x01
+		sigs["flip byte "+strconv.Itoa(i)] = "sha256=" + hex.EncodeToString(flipped)
+	}
+	for name, sig := range sigs {
+		t.Run(name, func(t *testing.T) {
+			rec := &recorder{}
+			w := deliver(newHandler(t, rec.on, nil), "workflow_job", body, sig)
+			if w.Code != http.StatusUnauthorized || len(rec.events) != 0 {
+				t.Fatalf("status %d, %d callbacks", w.Code, len(rec.events))
+			}
+		})
+	}
+	rec := &recorder{}
+	if w := deliver(newHandler(t, rec.on, nil), "workflow_job", body, sign(body)); w.Code != http.StatusAccepted || len(rec.events) != 1 {
+		t.Fatalf("valid signature: status %d, %d callbacks", w.Code, len(rec.events))
 	}
 }
 
