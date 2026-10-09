@@ -1,0 +1,6 @@
+/lux-gha
+/bin/
+*.pem
+*.key
+*.secret
+.env
