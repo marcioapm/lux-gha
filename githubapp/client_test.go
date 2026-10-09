@@ -52,7 +52,6 @@ func (c *clock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unloc
 // fakeGitHub verifies app JWTs against the public key and issues sequential
 // installation tokens that expire tokenTTL (default one hour) after issuance.
 type fakeGitHub struct {
-	t            *testing.T
 	clock        *clock
 	tokenCalls   atomic.Int32
 	tokenTTL     time.Duration
@@ -132,7 +131,7 @@ func (f *fakeGitHub) verifyJWT(jwt string) error {
 func newTestClient(t *testing.T, key []byte, api http.HandlerFunc, mod ...func(*Config)) (*Client, *fakeGitHub, *clock) {
 	t.Helper()
 	clk := &clock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
-	fake := &fakeGitHub{t: t, clock: clk, api: api}
+	fake := &fakeGitHub{clock: clk, api: api}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 	cfg := Config{AppID: "Iv1.client", PrivateKey: key, BaseURL: srv.URL, RequestTimeout: 2 * time.Second}

@@ -100,30 +100,26 @@ func (c *Client) InstallationToken(ctx context.Context, installationID int64) (s
 		c.mu.Unlock()
 		return token.value, nil
 	}
-	if flight, ok := c.flights[installationID]; ok {
-		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-flight.done:
-			return flight.token, flight.err
-		}
+	flight, ok := c.flights[installationID]
+	if !ok {
+		flight = &tokenFlight{done: make(chan struct{})}
+		c.flights[installationID] = flight
 	}
-	flight := &tokenFlight{done: make(chan struct{})}
-	c.flights[installationID] = flight
 	c.mu.Unlock()
-	// The shared fetch is detached from the first caller's cancellation and bounded by c.timeout.
-	go func() {
-		token, err := c.createToken(context.WithoutCancel(ctx), installationID)
-		c.mu.Lock()
-		if err == nil {
-			c.tokens[installationID] = token
-		}
-		flight.token, flight.err = token.value, err
-		delete(c.flights, installationID)
-		close(flight.done)
-		c.mu.Unlock()
-	}()
+	if !ok {
+		// The shared fetch is detached from the first caller's cancellation and bounded by c.timeout.
+		go func() {
+			token, err := c.createToken(context.WithoutCancel(ctx), installationID)
+			c.mu.Lock()
+			if err == nil {
+				c.tokens[installationID] = token
+			}
+			flight.token, flight.err = token.value, err
+			delete(c.flights, installationID)
+			close(flight.done)
+			c.mu.Unlock()
+		}()
+	}
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
