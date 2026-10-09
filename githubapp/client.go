@@ -20,6 +20,7 @@ import (
 const APIBaseURL = "https://api.github.com"
 const APIVersion = "2026-03-10"
 const maxBody = 4 << 20
+const maxErrorBody = 64 << 10
 
 // BaseURL overrides are restricted to HTTPS or loopback HTTP test servers.
 type Config struct {
@@ -187,6 +188,20 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("githubapp: API returned HTTP %d (rate limited: %t)", e.StatusCode, e.RateLimited)
 }
 
+// secondaryLimitMessage reports whether a 403 body is GitHub's secondary rate
+// limit error, which may arrive with quota remaining and no Retry-After. The
+// message can echo request content, so it is only classified, never kept.
+func secondaryLimitMessage(body io.Reader) bool {
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBody))
+	var env struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(data, &env) != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(env.Message), "secondary rate limit")
+}
+
 func (c *Client) request(ctx context.Context, method, path, token string, body any, status int, out any) (http.Header, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -223,7 +238,7 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 	if resp.StatusCode != status {
 		e := &APIError{StatusCode: resp.StatusCode}
 		remaining := resp.Header.Get("X-RateLimit-Remaining")
-		e.RateLimited = resp.StatusCode == 429 || (resp.StatusCode == 403 && (remaining == "0" || resp.Header.Get("Retry-After") != ""))
+		e.RateLimited = resp.StatusCode == 429 || (resp.StatusCode == 403 && (remaining == "0" || resp.Header.Get("Retry-After") != "" || secondaryLimitMessage(resp.Body)))
 		if e.RateLimited {
 			e.RetryAt = c.now().Add(time.Minute)
 		}

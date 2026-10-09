@@ -366,14 +366,18 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 
 func TestRateLimitErrorsCarryRetryTimeAndOmitBody(t *testing.T) {
 	reset := time.Date(2026, 10, 9, 12, 30, 0, 0, time.UTC)
+	const leaky = `{"message":"leaked ghs_token1 SECRET"}`
+	const secondary = `{"message":"You have exceeded a secondary rate limit for ghs_token1 SECRET. Please wait a few minutes before you try again."}`
 	cases := map[string]struct {
 		status  int
 		headers map[string]string
+		body    string
 		want    time.Time
 	}{
-		"primary":   {403, map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": fmt.Sprint(reset.Unix())}, reset},
-		"secondary": {429, map[string]string{"Retry-After": "120"}, time.Date(2026, 10, 9, 12, 2, 0, 0, time.UTC)},
-		"fallback":  {429, nil, time.Date(2026, 10, 9, 12, 1, 0, 0, time.UTC)},
+		"primary":       {403, map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": fmt.Sprint(reset.Unix())}, leaky, reset},
+		"secondary":     {429, map[string]string{"Retry-After": "120"}, leaky, time.Date(2026, 10, 9, 12, 2, 0, 0, time.UTC)},
+		"fallback":      {429, nil, leaky, time.Date(2026, 10, 9, 12, 1, 0, 0, time.UTC)},
+		"secondary 403": {403, map[string]string{"X-RateLimit-Remaining": "4999"}, secondary, time.Date(2026, 10, 9, 12, 1, 0, 0, time.UTC)},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -382,22 +386,30 @@ func TestRateLimitErrorsCarryRetryTimeAndOmitBody(t *testing.T) {
 					w.Header().Set(k, v)
 				}
 				w.WriteHeader(tc.status)
-				w.Write([]byte(`{"message":"leaked ghs_token1 SECRET"}`))
+				w.Write([]byte(tc.body))
 			})
 			_, err := c.GetWorkflowJob(context.Background(), repo, 1)
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || !apiErr.RateLimited || !apiErr.RetryAt.Equal(tc.want) || apiErr.StatusCode != tc.status {
 				t.Fatalf("err=%#v", err)
 			}
-			if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "ghs_") {
-				t.Fatalf("error leaks body: %v", err)
+			if s := err.Error() + fmt.Sprintf("%#v", apiErr); strings.Contains(s, "SECRET") || strings.Contains(s, "ghs_") {
+				t.Fatalf("error leaks body: %s", s)
 			}
 		})
 	}
-	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) { http.Error(w, "forbidden", 403) })
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.WriteHeader(403)
+		w.Write([]byte(`{"message":"Resource not accessible by integration SECRET"}`))
+	})
 	var apiErr *APIError
-	if _, err := c.GetWorkflowJob(context.Background(), repo, 1); !errors.As(err, &apiErr) || apiErr.RateLimited {
-		t.Fatalf("plain 403 marked rate limited: %v", err)
+	_, err := c.GetWorkflowJob(context.Background(), repo, 1)
+	if !errors.As(err, &apiErr) || apiErr.RateLimited || !apiErr.RetryAt.IsZero() {
+		t.Fatalf("plain 403 marked rate limited: %#v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("error leaks body: %v", err)
 	}
 }
 
