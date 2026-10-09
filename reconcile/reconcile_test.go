@@ -279,6 +279,21 @@ func TestCancelledJobRunnerRemovedOnlyAfterIdleGrace(t *testing.T) {
 	}
 }
 
+func TestUnstartedRunForCancelledJobIsReclaimedAfterGrace(t *testing.T) {
+	e := newEnv(t)
+	e.lux.onCreate = nil // the Run waits for capacity; its runner never connects
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.complete(7, "cancelled")
+	e.pass()
+	e.clock.Add(2 * time.Minute)
+	e.pass()
+	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || !slices.Equal(e.lux.terminatedIDs(), []string{id}) {
+		t.Fatalf("deleted=%v terminated=%v", e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+}
+
 func TestSurplusLeavesOneIdleRunnerPerQueuedJob(t *testing.T) {
 	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 2`))
 	e.gh.queue(1, "queued", lux3...)
@@ -484,8 +499,7 @@ func TestRateLimitStopsThePassUntilRetryAt(t *testing.T) {
 	if st.Error != "" || st.RateLimitedUntil != nil || e.lux.createCount() != 2 {
 		t.Fatalf("after RetryAt: %+v creates=%d", st, e.lux.createCount())
 	}
-	// Job 8's new runner registered during that pass; now job 7's idle runner is surplus.
-	st = e.pass()
+	// Job 8 has its own runner, so job 7's idle one is surplus.
 	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) {
 		t.Fatalf("after RetryAt: %+v creates=%d deleted=%v", st, e.lux.createCount(), e.gh.deletedNames())
 	}

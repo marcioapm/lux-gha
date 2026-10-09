@@ -424,7 +424,7 @@ func (p *pass) provision() error {
 			if p.liveByJob[key] {
 				continue
 			}
-			if len(p.live)+p.st.Provisioned >= cfg.MaxRunners || (route.MaxRunners > 0 && p.liveRoute[route.Name] >= route.MaxRunners) {
+			if len(p.live) >= cfg.MaxRunners || (route.MaxRunners > 0 && p.liveRoute[route.Name] >= route.MaxRunners) {
 				continue
 			}
 			ok, err := p.provisionJob(v, jobID, route)
@@ -488,6 +488,9 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool
 		p.setError(ErrGitHub)
 		return false, nil
 	}
+	// Later steps of this pass see the new runner and its Run (appended to
+	// p.live) like ones listed at the start.
+	v.runners[name] = jit.Runner
 	spec := luxclient.RunSpec{
 		Name: fmt.Sprintf("gha %s job %d", v.full, jobID),
 		Labels: map[string]string{
@@ -529,6 +532,7 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (bool
 		return false, nil
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
+	p.live = append(p.live, *run)
 	return true, nil
 }
 
@@ -557,8 +561,9 @@ func (p *pass) deleteRunnerByName(v *repoView, name string) error {
 }
 
 // removeSurplus deletes idle runners beyond their repo and route's queued
-// demand, runner first: GitHub refuses to delete a busy runner, and a Run is
-// terminated only after its runner is gone.
+// demand once their trigger job has not been queued for idleGrace. The runner
+// is deleted first: GitHub refuses to delete a busy runner (422), and a Run is
+// terminated only after its runner is gone, so a busy runner's Run never is.
 func (p *pass) removeSurplus() error {
 	r := p.r
 	now := r.now()
@@ -577,14 +582,19 @@ func (p *pass) removeSurplus() error {
 				continue
 			}
 			rn, ok := v.runners[run.Labels[LabelRunner]]
-			if !ok || rn.Status != "online" {
+			if !ok {
 				continue
 			}
 			if rn.Busy {
 				p.st.Busy++
 				continue
 			}
-			p.st.Idle++
+			// A registered runner whose Run has not started yet (offline) is
+			// supply too: left alone, a Run waiting for capacity for a
+			// cancelled job would hold a runner slot indefinitely.
+			if rn.Status == "online" {
+				p.st.Idle++
+			}
 			idle[run.Labels[LabelRoute]]++
 			job, _ := strconv.ParseInt(run.Labels[LabelJob], 10, 64)
 			if _, queued := v.demand[job]; queued || !v.complete || p.truncated {
