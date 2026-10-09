@@ -455,41 +455,70 @@ func (p *pass) readLux() error {
 	return nil
 }
 
+type provisionable struct {
+	v     *repoView
+	jobID int64
+	route *config.Route
+	gen   int
+}
+
+// provision classifies every unserved job before creating any Run, so the
+// cap check for each creation counts every adopted Run and every unresolved
+// submission of the pass, whatever their repo, route or job order.
 func (p *pass) provision() error {
 	cfg := p.r.cfg
+	var todo []provisionable
 	for _, v := range p.repos {
 		for _, jobID := range sortedKeys(v.demand) {
 			route := v.demand[jobID]
-			key := strconv.FormatInt(v.id, 10) + "/" + strconv.FormatInt(jobID, 10)
-			if p.liveByJob[key] {
+			if p.liveByJob[jobKey(v, jobID)] {
 				continue
 			}
-			if len(p.live)+p.unresolved >= cfg.MaxRunners ||
-				(route.MaxRunners > 0 && p.liveRoute[route.Name]+p.unresolvedRoute[route.Name] >= route.MaxRunners) {
-				continue
-			}
-			run, created, err := p.provisionJob(v, jobID, route)
+			run, gen, err := p.classifyJob(v, jobID, route)
 			if err != nil {
 				return err
 			}
 			if run != nil {
-				// Later steps of this pass see the Run like ones listed at the start.
-				p.live = append(p.live, *run)
-				p.liveByJob[key] = true
-				p.liveRoute[run.Labels[LabelRoute]]++
-				p.st.Live[run.Labels[LabelRoute]]++
-				if created {
-					p.st.Provisioned++
-				}
+				p.addLive(v, jobID, *run)
+			} else if gen >= 0 {
+				todo = append(todo, provisionable{v, jobID, route, gen})
 			}
+		}
+	}
+	for _, j := range todo {
+		if len(p.live)+p.unresolved >= cfg.MaxRunners ||
+			(j.route.MaxRunners > 0 && p.liveRoute[j.route.Name]+p.unresolvedRoute[j.route.Name] >= j.route.MaxRunners) {
+			continue
+		}
+		run, err := p.createRun(j)
+		if err != nil {
+			return err
+		}
+		if run != nil {
+			p.addLive(j.v, j.jobID, *run)
+			p.st.Provisioned++
 		}
 	}
 	return nil
 }
 
-// provisionJob returns the live Run that now serves the job, if any, and
-// whether this call created it; a non-nil error aborts the pass.
-func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*luxclient.Run, bool, error) {
+func jobKey(v *repoView, jobID int64) string {
+	return strconv.FormatInt(v.id, 10) + "/" + strconv.FormatInt(jobID, 10)
+}
+
+// addLive makes later steps of this pass see run like ones listed at the start.
+func (p *pass) addLive(v *repoView, jobID int64, run luxclient.Run) {
+	p.live = append(p.live, run)
+	p.liveByJob[jobKey(v, jobID)] = true
+	p.liveRoute[run.Labels[LabelRoute]]++
+	p.st.Live[run.Labels[LabelRoute]]++
+}
+
+// classifyJob reads the job's Run history once. It returns the live Run to
+// adopt, or the gen to submit next, or neither (gen -1) when the job waits
+// on an unresolved submission or reached the gen cap; a non-nil error aborts
+// the pass.
+func (p *pass) classifyJob(v *repoView, jobID int64, route *config.Route) (*luxclient.Run, int, error) {
 	r := p.r
 	log := r.log.With("repository", v.full, "job", jobID, "route", route.Name)
 	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(jobID, 10)
@@ -499,7 +528,7 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 	if err != nil {
 		log.Error("listing the job's Runs failed", "error", err)
 		p.setError(ErrLux)
-		return nil, false, errAbort
+		return nil, -1, errAbort
 	}
 	gen := 0
 	hasRun := map[int]bool{}
@@ -513,10 +542,10 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 		if slices.Contains(LiveStates, run.State) {
 			// A submission whose outcome was unknown committed after the supply read.
 			if !carries(run, owned, n, jobPrefix) {
-				return nil, false, p.mismatch(log, run)
+				return nil, -1, p.mismatch(log, run)
 			}
 			log.Info("adopting a live Run for the job", "run", run.ID, "gen", n)
-			return &run, false, nil
+			return &run, -1, nil
 		}
 	}
 	// A registered runner whose gen has no Run is a submission with an
@@ -529,32 +558,43 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 			log.Info("runner registered without a Run; waiting for its Run or its cleanup", "runner", name)
 			p.unresolved++
 			p.unresolvedRoute[route.Name]++
-			return nil, false, nil
+			return nil, -1, nil
 		}
 	}
 	if gen >= r.cfg.Reconcile.MaxGensPerJob {
 		log.Warn("job reached the runner generation cap; not provisioning", "gens", gen)
-		return nil, false, nil
+		return nil, -1, nil
 	}
+	return nil, gen, nil
+}
+
+// createRun registers j's runner and submits its Run. It returns the Run
+// when it is live; a non-nil error aborts the pass.
+func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
+	r, v, route, gen := p.r, j.v, j.route, j.gen
+	log := r.log.With("repository", v.full, "job", j.jobID, "route", route.Name)
+	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(j.jobID, 10)
+	jobPrefix := r.runnerPrefix(v.id) + job + "-"
+	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
 	name := jobPrefix + strconv.Itoa(gen)
 	jit, err := r.gh.GenerateRepoJITConfig(p.ctx, v.ref, githubapp.JITConfigRequest{Name: name, RunnerGroupID: r.cfg.GitHub.RunnerGroupID, Labels: route.Labels})
 	if p.rateLimited(err) {
-		return nil, false, errAbort
+		return nil, errAbort
 	}
 	var apiErr *githubapp.APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
 		// A runner with this name exists: a JIT from a pass that ended before Create.
 		log.Warn("runner name already registered; deleting it", "runner", name)
-		return nil, false, p.deleteRunnerByName(v, name)
+		return nil, p.deleteRunnerByName(v, name)
 	}
 	if err != nil {
 		log.Error("JIT config failed", "error", err)
 		p.setError(ErrGitHub)
-		return nil, false, nil
+		return nil, nil
 	}
 	v.runners[name] = jit.Runner
 	spec := luxclient.RunSpec{
-		Name: fmt.Sprintf("gha %s job %d", v.full, jobID),
+		Name: fmt.Sprintf("gha %s job %d", v.full, j.jobID),
 		Labels: map[string]string{
 			LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelRoute: route.Name,
 			LabelJob: job, LabelGen: strconv.Itoa(gen), LabelRunner: name,
@@ -574,7 +614,7 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%s/%d", r.host, r.cfg.Instance, repoID, job, gen), spec)
 	if run != nil && !carries(*run, owned, gen, jobPrefix) {
 		// A replayed key answered with a Run this submission did not describe.
-		return nil, false, p.mismatch(log, *run)
+		return nil, p.mismatch(log, *run)
 	}
 	if errors.Is(err, luxclient.ErrResumePolicyNotEchoed) {
 		log.Error("Lux did not echo resumePolicy never: terminating the Run and stopping provisioning", "run", run.ID)
@@ -584,22 +624,22 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 			p.st.Terminated++
 		}
 		p.setError(ErrNeverNotEchoed)
-		return nil, false, errAbort
+		return nil, errAbort
 	}
 	if err != nil {
 		// The outcome is unknown: the Run may still appear. Until it does or
 		// orphan cleanup deletes the runner, this job is not provisioned again.
 		log.Error("Lux create failed; stopping provisioning", "error", err)
 		p.setError(ErrLux)
-		return nil, false, errAbort
+		return nil, errAbort
 	}
 	if !slices.Contains(LiveStates, run.State) {
 		// A replayed key answers with the earlier Run, which has ended.
 		log.Warn("Lux returned an ended Run for a new runner", "run", run.ID, "state", run.State)
-		return nil, false, nil
+		return nil, nil
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
-	return run, true, nil
+	return run, nil
 }
 
 // carries reports whether run has the ownership labels and the gen and

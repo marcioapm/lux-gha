@@ -931,27 +931,50 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 	big := []string{"self-hosted", "linux", "lux-big"}
 	globalCap := []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": 1`)}
 	// The big route has maxRunners 1 under a global cap of 10.
+	type job struct {
+		repo   string
+		id     int64
+		runner string
+	}
+	j7, j8, j9 := job{widgets, 7, runner("7", 0)}, job{widgets, 8, runner("8", 0)}, job{widgets, 9, runner("9", 0)}
+	gadgets9 := job{"acme/gadgets", 9, "lux-gha-t1-1002-9-0"}
+	// The unresolved job's Create fails in the first pass; the fresh job is
+	// queued after it. In the second pass the Lux Lists are the supply read
+	// and one history read per job, in repo then job order. lateCommit 2
+	// commits the Run at the second history read; 3 at the third pass's
+	// supply read, after the second pass provisioned whatever it would.
 	for _, tc := range []struct {
-		name    string
-		edits   []func(string) string
-		labels  []string
-		restart bool
+		name              string
+		edits             []func(string) string
+		labels            []string
+		restart           bool
+		unresolved, fresh job
+		lateCommit        int
 	}{
-		{"global cap", globalCap, lux3, false},
-		{"global cap across a restart", globalCap, lux3, true},
-		{"route cap", nil, big, false},
-		{"route cap across a restart", nil, big, true},
+		{"global cap", globalCap, lux3, false, j7, j8, 2},
+		{"global cap across a restart", globalCap, lux3, true, j7, j8, 2},
+		{"route cap", nil, big, false, j7, j8, 2},
+		{"route cap across a restart", nil, big, true, j7, j8, 2},
+		{"global cap, unresolved job sorts last", globalCap, lux3, false, j9, j8, 3},
+		{"global cap, unresolved job sorts last, across a restart", globalCap, lux3, true, j9, j8, 3},
+		{"route cap, unresolved job sorts last", nil, big, false, j9, j8, 3},
+		{"route cap, unresolved job sorts last, across a restart", nil, big, true, j9, j8, 3},
+		{"global cap, unresolved job in the second repository", []func(string) string{twoRepos(1)}, lux3, false, gadgets9, j8, 3},
+		{"global cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(1)}, lux3, true, gadgets9, j8, 3},
+		{"route cap, unresolved job in the second repository", []func(string) string{twoRepos(10)}, big, false, gadgets9, j8, 3},
+		{"route cap, unresolved job in the second repository, across a restart", []func(string) string{twoRepos(10)}, big, true, gadgets9, j8, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, tc.edits...)
-			e.gh.queue(7, "queued", tc.labels...)
-			e.gh.queue(8, "queued", tc.labels...)
-			// Job 7's Create fails; its Run commits at the next pass's third
-			// List: after job 7's history read, before job 8 is provisioned.
-			e.lux.lateCommit = 2
+			e.gh.addRepo("acme/gadgets", 1002)
+			u, f := tc.unresolved, tc.fresh
+			uJob, fJob := strconv.FormatInt(u.id, 10), strconv.FormatInt(f.id, 10)
+			e.gh.queueIn(u.repo, u.id*10, u.id, "queued", tc.labels...)
+			e.lux.lateCommit = tc.lateCommit
 			if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
 				t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
 			}
+			e.gh.queueIn(f.repo, f.id*10, f.id, "queued", tc.labels...)
 			if tc.restart {
 				e.rec = e.newReconciler()
 			}
@@ -962,21 +985,21 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 				}
 				e.clock.Add(30 * time.Second)
 			}
-			if len(e.lux.liveForJob("7")) != 1 || len(e.lux.liveForJob("8")) != 0 || e.lux.createCount() != 1 {
-				t.Fatalf("job7=%d job8=%d creates=%d", len(e.lux.liveForJob("7")), len(e.lux.liveForJob("8")), e.lux.createCount())
+			if len(e.lux.liveForJob(uJob)) != 1 || len(e.lux.liveForJob(fJob)) != 0 || e.lux.createCount() != 1 {
+				t.Fatalf("unresolved=%d fresh=%d creates=%d", len(e.lux.liveForJob(uJob)), len(e.lux.liveForJob(fJob)), e.lux.createCount())
 			}
-			// Job 7's runner serves it and its Run ends, freeing the slot.
-			id := e.runID("7")
-			if err := e.gh.pick(runner("7", 0), 7); err != nil {
+			// The unresolved job's runner serves it and its Run ends, freeing the slot.
+			id := e.runID(uJob)
+			if err := e.gh.pick(u.runner, u.id); err != nil {
 				t.Fatal(err)
 			}
-			e.gh.complete(7, "success")
+			e.gh.complete(u.id, "success")
 			e.lux.end(id, "exited")
 			e.pass()
-			if len(e.lux.live()) != 1 || len(e.lux.liveForJob("8")) != 1 || e.lux.createCount() != 2 {
-				t.Fatalf("live=%d job8=%d creates=%d", len(e.lux.live()), len(e.lux.liveForJob("8")), e.lux.createCount())
+			if len(e.lux.live()) != 1 || len(e.lux.liveForJob(fJob)) != 1 || e.lux.createCount() != 2 {
+				t.Fatalf("live=%d fresh=%d creates=%d", len(e.lux.live()), len(e.lux.liveForJob(fJob)), e.lux.createCount())
 			}
-			if err := e.gh.pick(runner("8", 0), 8); err != nil {
+			if err := e.gh.pick(f.runner, f.id); err != nil {
 				t.Fatal(err)
 			}
 		})
