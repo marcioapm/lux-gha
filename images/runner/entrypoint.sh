@@ -19,21 +19,23 @@ jitconfig=$(cat "$config_file")
 # Rootless dockerd needs an unprivileged user; as root the runner drops to
 # RUNNER_USER below and the engine is left to the job.
 start_docker() {
-	command -v dockerd-rootless >/dev/null 2>&1 || return 0
+	# Docker's deb packages name it dockerd-rootless.sh; Alpine's drop the .sh.
+	dockerd=$(command -v dockerd-rootless || command -v dockerd-rootless.sh) || return 0
 	case ${DOCKER_HOST:-} in unix://*) ;; *) return 0 ;; esac
 	[ "$(id -u)" -ne 0 ] || return 0
 	log=/tmp/dockerd.log
 	mkdir -p "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
 	chmod 700 "$XDG_RUNTIME_DIR"
 	# Own session, so a signal to the runner's process group does not reach it.
-	setsid dockerd-rootless </dev/null >"$log" 2>&1 &
+	setsid "$dockerd" </dev/null >"$log" 2>&1 &
+	pid=$!
 	i=0
-	while [ "$i" -lt 60 ]; do
+	while [ "$i" -lt 60 ] && kill -0 "$pid" 2>/dev/null; do
 		docker info >/dev/null 2>&1 && return 0
 		sleep 1
 		i=$((i + 1))
 	done
-	echo "lux-gha-runner: rootless dockerd did not start within 60s; last lines of $log:" >&2
+	echo "lux-gha-runner: rootless dockerd did not come up within 60s; last lines of $log:" >&2
 	tail -n 20 "$log" >&2 || true
 	if [ "${LUXGHA_DOCKER:-required}" = optional ]; then
 		echo "lux-gha-runner: continuing without Docker (LUXGHA_DOCKER=optional)" >&2

@@ -42,7 +42,7 @@ RUN apt-get update; \
       "docker-ce=${DOCKER_VERSION}" "docker-ce-cli=${DOCKER_VERSION}" \
       "docker-ce-rootless-extras=${DOCKER_VERSION}" "containerd.io=${CONTAINERD_VERSION}" \
       "docker-buildx-plugin=${BUILDX_VERSION}" "docker-compose-plugin=${COMPOSE_VERSION}" \
-      uidmap libcap2-bin fuse-overlayfs slirp4netns iptables \
+      uidmap libcap2-bin fuse-overlayfs slirp4netns iptables iproute2 \
       git jq unzip xz-utils python3; \
     apt-get purge -y --auto-remove gnupg; \
     rm -rf /var/lib/apt/lists/*
