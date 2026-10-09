@@ -174,6 +174,26 @@ func awaitPass(t *testing.T, passes <-chan struct{}, what string) {
 	}
 }
 
+type endpointStatus struct {
+	Time  time.Time `json:"time"`
+	Error string    `json:"error"`
+}
+
+func getStatus(t *testing.T, client *http.Client, base string) endpointStatus {
+	t.Helper()
+	resp, err := client.Get(base + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st endpointStatus
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("status endpoint: %d %v", resp.StatusCode, err)
+	}
+	return st
+}
+
 func TestRunReconcilesAtStartupAndOnMatchingQueuedJobs(t *testing.T) {
 	githubURL, passes := fakeGitHub(t)
 	path := writeConfig(t, fakeLux(t, "v0.1.14"), githubURL)
@@ -198,19 +218,7 @@ func TestRunReconcilesAtStartupAndOnMatchingQueuedJobs(t *testing.T) {
 	// The status endpoint publishes the pass once it ends.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		var st struct {
-			Time  time.Time `json:"time"`
-			Error string    `json:"error"`
-		}
-		resp, err := client.Get(base + "/status")
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = json.NewDecoder(resp.Body).Decode(&st)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			t.Fatalf("status endpoint: %d %v", resp.StatusCode, err)
-		}
+		st := getStatus(t, client, base)
 		if !st.Time.IsZero() {
 			if st.Error != "" {
 				t.Fatalf("status after a pass: %+v", st)
@@ -335,19 +343,7 @@ func TestRunServesHealthAndSignedWebhookThenShutsDown(t *testing.T) {
 		}
 	}
 
-	resp, err = client.Get(base + "/status")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var st struct {
-		Time  time.Time `json:"time"`
-		Error string    `json:"error"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&st)
-	resp.Body.Close()
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("status endpoint: %d %v", resp.StatusCode, err)
-	}
+	getStatus(t, client, base)
 
 	cancel()
 	select {
