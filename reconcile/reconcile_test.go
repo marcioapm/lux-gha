@@ -813,9 +813,20 @@ func TestWakesDuringAndAfterAPassWaitForTheMinimumGap(t *testing.T) {
 	if d := l.gap(); d != 7*time.Second {
 		t.Fatalf("gap %v, want 7s", d)
 	}
+	// A wake during the gap wait is served by the pass the wait leads to.
+	e.rec.Wake()
 	e.clock.Add(7 * time.Second)
 	l.fire <- e.clock.Now()
 	l.pass()
+	// The 2m tick is far off, so with the wake consumed Run stays idle. The
+	// window is real time: a stale wake makes Run ask for a gap at once.
+	select {
+	case d := <-l.afters:
+		t.Fatalf("a consumed wake led to another gap request of %v", d)
+	case <-l.entered:
+		t.Fatal("a pass started without a wake or tick")
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 func TestStatusJSONHasCountsAndNoSecret(t *testing.T) {

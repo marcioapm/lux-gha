@@ -171,7 +171,8 @@ func (r *Reconciler) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		start := r.now()
-		// A wake that arrived before this pass starts is served by it.
+		// A wake that arrived before this pass starts is served by it; left
+		// pending, it would cause a redundant pass minGap later.
 		select {
 		case <-r.wake:
 		default:
