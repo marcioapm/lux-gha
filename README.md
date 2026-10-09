@@ -1,19 +1,16 @@
 # lux-gha
 
-Foundation for a bridge supplying one-shot, just-in-time GitHub Actions
-self-hosted runners as Lux generic Runs. GitHub remains the workflow engine;
-Lux runs the runner process.
+A bridge supplying one-shot, just-in-time GitHub Actions self-hosted runners
+as Lux generic Runs. GitHub remains the workflow engine; Lux runs the runner
+process.
 
-## Status: foundation only
+## Packages
 
-`lux-gha` does **not** provision runners or launch jobs yet.
-
-What exists:
-
-- `config`: JSON configuration, validated before serving. It has an explicit installation ID, a runner group ID, allowed repositories, and routes keyed by label set.
+- `config`: JSON configuration, validated before serving. It has an explicit installation ID, a runner group ID, allowed repositories, routes keyed by label set, and reconciler settings.
 - `githubapp`: GitHub App client:
   - RS256 app JWT
   - cached installation tokens
+  - repository lookup (numeric ID)
   - repository JIT config
   - workflow job and run reads
   - listing and deleting repository runners
@@ -21,19 +18,106 @@ What exists:
   - create (with `Idempotency-Key`), get, paged list and terminate
   - a startup compatibility check
 - `webhook`: signed `workflow_job` ingress that calls an injected function.
-- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, then serves `GET /healthz` and `POST /webhook`. The webhook callback only logs the event and the matching route.
+- `reconcile`: the single reconciler that provisions and removes runners.
+- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`.
 
-Wave 2 adds runner provisioning, deduplication by job identity, cleanup, reconciliation, and restart recovery. The runner image is also not implemented.
+The runner image is not built here yet; `images/runner/entrypoint.sh` is the reference entrypoint (see [Runner entrypoint contract](#runner-entrypoint-contract)).
 
 ### Runner attribution
 
 A JIT runner registered with a set of labels can be assigned by GitHub to **any** queued job whose labels it satisfies. That job need not be the one whose `queued` event led to the runner being provisioned. Nothing here assumes a provisioned runner belongs to the triggering job.
+
+## Reconciliation
+
+One goroutine runs reconciliation passes, never two at once. A pass starts at
+startup, every `reconcile.interval`, and after any accepted webhook delivery.
+A delivery only wakes the loop (a one-slot channel, so wakes coalesce) and is
+answered at once; the event's contents are not trusted, because every pass
+re-reads job state from GitHub. There is no database: the only persistent
+state is Lux Run labels and GitHub's own records.
+
+The bridge keeps **one live Run per queued matching job**. A pass:
+
+1. **Demand.** For each repository, lists workflow runs with status `queued`
+   and `in_progress` and their latest-attempt jobs. A job is demand when its
+   status is `queued` and its labels match a route. `waiting` jobs
+   (environment approval) are not demand. At most `reconcile.maxJobsPerPass`
+   jobs are read per pass.
+2. **Supply.** Lists the instance's live Lux Runs (`submitted`, `scheduled`,
+   `provisioning`, `starting`, `running`, `stopping`, `resuming`) and the
+   repository's runners named `lux-gha-<instance>-...`.
+3. **Provision.** A demand job with no live Run labelled with its ID gets a
+   JIT runner and a Run, within the route's and the global `maxRunners`. The
+   runner is named `lux-gha-<instance>-<repo id>-<job id>-<gen>` and the Run is
+   submitted with `Idempotency-Key: <github host>/<repo id>/<job id>/<gen>`.
+   `gen` counts earlier Runs and registered runners for that job, so it rises
+   only when an earlier attempt ended while the job was still queued (spot
+   loss, secrets lost to a luxd restart, or its runner took another job).
+   Past `reconcile.maxGensPerJob` the job is logged and left alone. A JIT
+   `409` (a runner of that name already exists: the bridge stopped between JIT
+   and Run submission) deletes that runner; the job is provisioned next pass.
+   If Lux does not echo `resumePolicy: never`, the Run is terminated and
+   provisioning stops for the pass.
+4. **Surplus.** An idle (not busy) runner whose Run is live, whose triggering
+   job has not been queued for `reconcile.idleGrace`, and which exceeds its
+   repository and route's queued demand, is deleted from GitHub and then its
+   Run is terminated. GitHub refuses to delete a busy runner (`422`), and a
+   Run is terminated only after its runner was deleted, so a busy runner is
+   never killed.
+5. **Finished runs and orphans.** A live Run whose runner is no longer
+   registered (it ran its job and deregistered) is terminated if still live
+   `idleGrace` later. An offline managed runner with no live Run (lost before
+   pickup, or Run submission failed) is deleted `idleGrace` after it was
+   first seen. A Run lost mid-job is left alone: GitHub fails the job and
+   nothing reruns it.
+
+Run labels (no secrets ever go in labels):
+
+| Label | Value |
+|---|---|
+| `lux-gha/managed` | instance |
+| `lux-gha/repo` | numeric repository ID |
+| `lux-gha/route` | route name |
+| `lux-gha/job` | ID of the job that triggered provisioning |
+| `lux-gha/gen` | generation for that job |
+| `lux-gha/runner` | GitHub runner name |
+
+A GitHub rate limit stops the pass where it is; no pass calls GitHub again
+until the reported retry time. Other errors end the pass early or skip one
+item; the next pass retries. The idle and orphan timers are in memory: a
+restart re-derives everything else from Lux and GitHub and only restarts those
+timers, which delays cleanup but never duplicates a Run.
+
+`GET /status` returns the last pass as JSON: `time`, `durationMs`, `error`
+(a category: `github_rate_limited`, `github`, `lux`,
+`lux_resume_policy_not_echoed`), `rateLimitedUntil`, `demand` and `live` per
+route, `idle`, `busy`, and `provisioned`, `terminated` and `deleted` in that
+pass. It holds no credentials or JIT configuration.
+
+## Runner entrypoint contract
+
+The Run's command is `["/usr/local/bin/lux-gha-runner"]`, or the route's
+`command`. Lux places the JIT configuration as a file secret at
+`/run/lux-gha/jitconfig` and the Run's environment has
+`LUXGHA_JITCONFIG_FILE=/run/lux-gha/jitconfig`. (Lux reserves the `LUX_`
+environment prefix for itself.) The entrypoint:
+
+- reads the JIT configuration from the file named by `LUXGHA_JITCONFIG_FILE`;
+- deletes nothing;
+- `exec`s `./run.sh --jitconfig "<contents>"` from the runner directory as a
+  non-root user;
+- exits when the runner exits, after at most one job.
+
+`images/runner/entrypoint.sh` is a reference POSIX `sh` implementation.
 
 ## Configuration
 
 ```json
 {
   "listen": "127.0.0.1:8080",
+  "instance": "prod",
+  "maxRunners": 20,
+  "reconcile": {"interval": "60s", "idleGrace": "2m", "maxJobsPerPass": 200, "maxGensPerJob": 5},
   "github": {
     "appID": "Iv1.0123456789abcdef",
     "installationID": 12345678,
@@ -47,11 +131,15 @@ A JIT runner registered with a set of labels can be assigned by GitHub to **any*
     {"name": "default", "labels": ["self-hosted", "linux", "lux"], "pool": "gha",
      "image": "ghcr.io/acme/gha-runner@sha256:...", "cpus": 2, "memoryMiB": 4096, "diskGiB": 20,
      "timeout": "90m", "egressHosts": ["github.com", "*.actions.githubusercontent.com"],
-     "nestedContainers": false}
+     "nestedContainers": false, "maxRunners": 10}
   ]
 }
 ```
 
+- **`instance`**: required, 1-20 of `a-z`, `0-9` and `-`. It names this bridge in Run labels and runner names; two bridges sharing a GitHub repository or Lux tenant need different instances.
+- **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
+- **`reconcile`**: optional; the values shown are the defaults.
+- **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.
 - **`runnerGroupID`**: required by `generate-jitconfig`. Read the repository's runner group ID from GitHub rather than assuming `1`.
 - **`apiURL`**: optional. It defaults to `https://api.github.com` and must be HTTPS. Plain HTTP is accepted only for loopback test servers. The API host never comes from webhook payloads.
@@ -76,7 +164,7 @@ Subscribe to the **Workflow job** webhook event. Actions write is not needed.
 - **Ignored deliveries**: unsigned or invalid deliveries get `401`. Signed `ping`s, other events, unknown actions, and other installations or repositories get `204`, and no callback is made.
 - **Actions handled**: `queued`, `waiting`, `in_progress` and `completed`. Cancellation is `completed` with `conclusion: cancelled`; it is not a separate action.
 - **Callback budget**: the callback runs inline and must be a fast signal, not provisioning, because GitHub expects a response within 10 seconds. The callback gets an 8 s context.
-- **Callback failure**: returns `503`. **GitHub does not automatically redeliver failed or missed deliveries.** Recovery will come from wave-2 reconciliation against the GitHub API, not from redelivery. There is no in-memory queue that claims durability.
+- **Callback failure**: returns `503`. **GitHub does not automatically redeliver failed or missed deliveries.** Recovery comes from the periodic reconciliation pass against the GitHub API, not from redelivery. There is no in-memory queue that claims durability.
 
 ## Lux compatibility
 
