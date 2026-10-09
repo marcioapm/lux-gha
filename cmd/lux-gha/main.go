@@ -1,7 +1,7 @@
-// Command lux-gha is the GitHub Actions to Lux bridge. In this foundation
-// release it verifies configuration, credentials and Lux compatibility, then
-// serves /healthz and a signed webhook endpoint whose workflow_job callback
-// only logs. It does not provision runners.
+// Command lux-gha is the GitHub Actions to Lux bridge. It verifies
+// configuration, credentials and Lux compatibility, then runs the reconciler
+// and serves /healthz, /status and a signed webhook endpoint whose
+// workflow_job callback only wakes the reconciler.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
 	"github.com/marcioapm/lux-gha/luxclient"
+	"github.com/marcioapm/lux-gha/reconcile"
 	"github.com/marcioapm/lux-gha/webhook"
 )
 
@@ -44,9 +46,17 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	// Validate the GitHub key and URL before serving, without making an API request.
-	if _, err := githubapp.New(githubapp.Config{AppID: cfg.GitHub.AppID, PrivateKey: secrets.AppPrivateKey, BaseURL: cfg.GitHub.APIURL}); err != nil {
+	gh, err := githubapp.New(githubapp.Config{AppID: cfg.GitHub.AppID, PrivateKey: secrets.AppPrivateKey, BaseURL: cfg.GitHub.APIURL})
+	if err != nil {
 		return fmt.Errorf("github app: %w", err)
+	}
+	apiURL := cfg.GitHub.APIURL
+	if apiURL == "" {
+		apiURL = githubapp.APIBaseURL
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return fmt.Errorf("github.apiURL: %w", err)
 	}
 	lux, err := luxclient.New(luxclient.Config{BaseURL: cfg.Lux.URL, APIKey: secrets.LuxAPIKey})
 	if err != nil {
@@ -60,13 +70,14 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	}
 	log.Info("lux compatible", "version", version)
 
+	rec, err := reconcile.New(reconcile.Options{Config: cfg, GitHub: gh, Lux: lux, Host: u.Host, Log: log})
+	if err != nil {
+		return err
+	}
+	// Events are only wake-ups: each pass re-reads job state from GitHub.
 	hook, err := webhook.New(secrets.WebhookSecret, cfg.GitHub.InstallationID, cfg.AllowsRepository, func(_ context.Context, ev webhook.WorkflowJobEvent) error {
-		route := ""
-		if r, err := cfg.MatchRoute(ev.Labels); err == nil {
-			route = r.Name
-		}
-		log.Info("workflow_job received; provisioning not implemented", "delivery", ev.DeliveryID, "action", ev.Action,
-			"repository", ev.Repository, "job", ev.JobID, "run", ev.RunID, "attempt", ev.RunAttempt, "route", route)
+		log.Debug("workflow_job received", "delivery", ev.DeliveryID, "action", ev.Action, "repository", ev.Repository, "job", ev.JobID)
+		rec.Wake()
 		return nil
 	}, log)
 	if err != nil {
@@ -75,6 +86,7 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	mux.Handle("GET /status", rec)
 	mux.Handle("/webhook", hook)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -83,6 +95,10 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
+	recCtx, stopRec := context.WithCancel(ctx)
+	recDone := make(chan struct{})
+	go func() { rec.Run(recCtx); close(recDone) }()
+	defer func() { stopRec(); <-recDone }()
 	// The bound address differs from cfg.Listen when it names port 0.
 	log.Info("serving", "listen", ln.Addr().String())
 	select {

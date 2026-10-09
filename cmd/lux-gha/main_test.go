@@ -26,11 +26,16 @@ import (
 
 const webhookSecret = "cmd-test-webhook-secret"
 
-// fakeLux serves only GET /openapi.json, reporting version; any other
-// request fails the test because startup must not touch Runs.
+// fakeLux serves GET /openapi.json, reporting version, and an empty
+// GET /v1/runs for the reconciler; any other request, such as a Run
+// submission, fails the test.
 func fakeLux(t *testing.T, version string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs" {
+			io.WriteString(w, `{"runs":[]}`)
+			return
+		}
 		if r.Method != http.MethodGet || r.URL.Path != "/openapi.json" {
 			t.Errorf("unexpected Lux request %s %s", r.Method, r.URL)
 			http.NotFound(w, r)
@@ -45,8 +50,8 @@ func fakeLux(t *testing.T, version string) string {
 }
 
 // writeConfig writes a valid configuration and its secret files to a temp
-// directory. GitHub's API URL points at a closed loopback port: startup
-// constructs the client but must make no GitHub request.
+// directory. GitHub's API URL points at a closed loopback port, so every
+// reconciler pass fails at GitHub and provisions nothing.
 func writeConfig(t *testing.T, luxURL string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -188,6 +193,20 @@ func TestRunServesHealthAndSignedWebhookThenShutsDown(t *testing.T) {
 		if resp.StatusCode != tc.want {
 			t.Fatalf("%s: status %d, want %d", tc.event, resp.StatusCode, tc.want)
 		}
+	}
+
+	resp, err = client.Get(base + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Time  time.Time `json:"time"`
+		Error string    `json:"error"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("status endpoint: %d %v", resp.StatusCode, err)
 	}
 
 	cancel()
