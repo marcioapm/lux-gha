@@ -191,6 +191,11 @@ func (r *Reconciler) Run(ctx context.Context) {
 					return
 				case <-r.after(wait):
 				}
+				// The woken pass serves a tick buffered during the wait.
+				select {
+				case <-t.C:
+				default:
+				}
 			}
 		}
 	}
