@@ -1,0 +1,39 @@
+{
+  "action": "completed",
+  "workflow_job": {
+    "id": 29679449,
+    "run_id": 5132587829,
+    "workflow_name": "CI",
+    "head_branch": "main",
+    "run_url": "https://api.github.com/repos/acme/widgets/actions/runs/5132587829",
+    "run_attempt": 2,
+    "node_id": "CR_kwDOABCDEF8AAAABcB2zWQ",
+    "head_sha": "f83a356604ae3c5d03e1b46ef4d1ca77d64a90b0",
+    "url": "https://api.github.com/repos/acme/widgets/actions/jobs/29679449",
+    "html_url": "https://github.com/acme/widgets/actions/runs/5132587829/job/29679449",
+    "status": "completed",
+    "conclusion": "cancelled",
+    "created_at": "2026-10-09T12:00:00Z",
+    "started_at": "2026-10-09T12:00:05Z",
+    "completed_at": "2026-10-09T12:03:00Z",
+    "name": "build",
+    "steps": [],
+    "check_run_url": "https://api.github.com/repos/acme/widgets/check-runs/29679449",
+    "labels": ["self-hosted", "linux", "lux"],
+    "runner_id": 23,
+    "runner_name": "lux-gha-a1b2c3",
+    "runner_group_id": 1,
+    "runner_group_name": "Default"
+  },
+  "repository": {
+    "id": 186853002,
+    "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+    "name": "widgets",
+    "full_name": "acme/widgets",
+    "private": true,
+    "owner": {"login": "acme", "id": 21031067, "type": "Organization"}
+  },
+  "organization": {"login": "acme", "id": 21031067},
+  "sender": {"login": "octocat", "id": 1, "type": "User"},
+  "installation": {"id": 42, "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uNDI="}
+}
