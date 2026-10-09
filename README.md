@@ -21,7 +21,7 @@ process.
 - `reconcile`: the single reconciler that provisions and removes runners.
 - `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`.
 
-The runner image is not built here yet; `images/runner/entrypoint.sh` is the reference entrypoint (see [Runner entrypoint contract](#runner-entrypoint-contract)).
+The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)).
 
 ### Runner attribution
 
@@ -138,7 +138,8 @@ environment prefix for itself.) The entrypoint:
   non-root user;
 - exits when the runner exits, after at most one job.
 
-`images/runner/entrypoint.sh` is a reference POSIX `sh` implementation.
+`images/runner/entrypoint.sh` is a reference POSIX `sh` implementation. It
+also starts rootless Docker first when the image has it.
 
 ## Configuration
 
