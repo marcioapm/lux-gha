@@ -644,16 +644,50 @@ func (p *pass) classifyJobRegistrations(v *repoView, jobID int64, gens []int) er
 		case !hasRun:
 			log.Info("runner registered without a Run; holding a cap slot for it", "runner", name)
 			p.unresolved++
-			var labels []string
-			for _, l := range v.runners[name].Labels {
-				labels = append(labels, l.Name)
-			}
-			if route, err := r.cfg.MatchRoute(labels); err == nil {
+			if route := r.routeOf(v.runners[name]); route != nil {
 				p.unresolvedRoute[route.Name]++
 			}
 		}
 	}
 	return nil
+}
+
+// routeOf returns the route whose labels the runner carries. The runner was
+// registered with exactly its route's labels, but GitHub also reports its
+// default ones (self-hosted, OS, architecture), so this is the reverse of
+// MatchRoute's containment. With no single such route the slot stays global.
+func (r *Reconciler) routeOf(rn githubapp.Runner) *config.Route {
+	have := make([]string, 0, len(rn.Labels))
+	for _, l := range rn.Labels {
+		have = append(have, strings.ToLower(l.Name))
+	}
+	var found *config.Route
+	tie := false
+	for i := range r.cfg.Routes {
+		route := &r.cfg.Routes[i]
+		if !containsAll(have, route.Labels) {
+			continue
+		}
+		switch {
+		case found == nil || len(route.Labels) > len(found.Labels):
+			found, tie = route, false
+		case len(route.Labels) == len(found.Labels):
+			tie = true
+		}
+	}
+	if tie {
+		return nil
+	}
+	return found
+}
+
+func containsAll(have, want []string) bool {
+	for _, w := range want {
+		if !slices.Contains(have, strings.ToLower(w)) {
+			return false
+		}
+	}
+	return true
 }
 
 // createRun registers j's runner and submits its Run. It returns the Run

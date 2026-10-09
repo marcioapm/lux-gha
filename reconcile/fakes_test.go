@@ -241,7 +241,13 @@ func (f *fakeGitHub) GenerateRepoJITConfig(_ context.Context, repo githubapp.Rep
 	f.nextID++
 	rn := &githubapp.Runner{ID: f.nextID, Name: req.Name, Status: "offline", RunnerGroupID: req.RunnerGroupID, Ephemeral: true}
 	for _, l := range req.Labels {
-		rn.Labels = append(rn.Labels, githubapp.RunnerLabel{Name: l})
+		rn.Labels = append(rn.Labels, githubapp.RunnerLabel{Name: l, Type: "custom"})
+	}
+	// GitHub also reports its default labels for a self-hosted runner.
+	for _, l := range []string{"self-hosted", "Linux", "ARM64"} {
+		if !slices.ContainsFunc(req.Labels, func(s string) bool { return strings.EqualFold(s, l) }) {
+			rn.Labels = append(rn.Labels, githubapp.RunnerLabel{Name: l, Type: "read-only"})
+		}
 	}
 	r.runners[rn.ID] = rn
 	secret := fmt.Sprintf("SECRET-JIT-%d-%s", rn.ID, req.Name)
