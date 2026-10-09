@@ -522,6 +522,24 @@ func jobKey(v *repoView, jobID int64) string {
 	return strconv.FormatInt(v.id, 10) + "/" + strconv.FormatInt(jobID, 10)
 }
 
+func (r *Reconciler) jobLabels(v *repoView, jobID int64) map[string]string {
+	return map[string]string{
+		LabelManaged: r.cfg.Instance,
+		LabelRepo:    strconv.FormatInt(v.id, 10),
+		LabelJob:     strconv.FormatInt(jobID, 10),
+	}
+}
+
+func (p *pass) readJobHistory(owned map[string]string, log *slog.Logger) ([]luxclient.Run, error) {
+	history, err := p.r.lux.List(p.ctx, owned)
+	if err != nil {
+		log.Error("listing the job's Runs failed", "error", err)
+		p.setError(ErrLux)
+		return nil, errAbort
+	}
+	return history, nil
+}
+
 // addLive makes later steps of this pass see run like ones listed at the start.
 func (p *pass) addLive(v *repoView, jobID int64, run luxclient.Run) {
 	p.live = append(p.live, run)
@@ -537,14 +555,11 @@ func (p *pass) addLive(v *repoView, jobID int64, run luxclient.Run) {
 func (p *pass) classifyJob(v *repoView, jobID int64, route *config.Route) (*luxclient.Run, int, error) {
 	r := p.r
 	log := r.log.With("repository", v.full, "job", jobID, "route", route.Name)
-	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(jobID, 10)
-	jobPrefix := r.runnerPrefix(v.id) + job + "-"
-	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
-	previous, err := r.lux.List(p.ctx, owned)
+	owned := r.jobLabels(v, jobID)
+	jobPrefix := r.runnerPrefix(v.id) + owned[LabelJob] + "-"
+	previous, err := p.readJobHistory(owned, log)
 	if err != nil {
-		log.Error("listing the job's Runs failed", "error", err)
-		p.setError(ErrLux)
-		return nil, -1, errAbort
+		return nil, -1, err
 	}
 	gen := 0
 	hasRun := map[int]bool{}
@@ -620,14 +635,11 @@ func (p *pass) classifyRegistrations(classified map[string]bool) error {
 func (p *pass) classifyJobRegistrations(v *repoView, jobID int64, gens []int) error {
 	r := p.r
 	log := r.log.With("repository", v.full, "job", jobID)
-	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(jobID, 10)
-	jobPrefix := r.runnerPrefix(v.id) + job + "-"
-	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
-	history, err := r.lux.List(p.ctx, owned)
+	owned := r.jobLabels(v, jobID)
+	jobPrefix := r.runnerPrefix(v.id) + owned[LabelJob] + "-"
+	history, err := p.readJobHistory(owned, log)
 	if err != nil {
-		log.Error("listing the job's Runs failed", "error", err)
-		p.setError(ErrLux)
-		return errAbort
+		return err
 	}
 	slices.Sort(gens)
 	for _, n := range gens {
@@ -694,9 +706,9 @@ func containsAll(have, want []string) bool {
 func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	r, v, route, gen := p.r, j.v, j.route, j.gen
 	log := r.log.With("repository", v.full, "job", j.jobID, "route", route.Name)
-	repoID, job := strconv.FormatInt(v.id, 10), strconv.FormatInt(j.jobID, 10)
+	owned := r.jobLabels(v, j.jobID)
+	repoID, job := owned[LabelRepo], owned[LabelJob]
 	jobPrefix := r.runnerPrefix(v.id) + job + "-"
-	owned := map[string]string{LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelJob: job}
 	name := jobPrefix + strconv.Itoa(gen)
 	jit, err := r.gh.GenerateRepoJITConfig(p.ctx, v.ref, githubapp.JITConfigRequest{Name: name, RunnerGroupID: r.cfg.GitHub.RunnerGroupID, Labels: route.Labels})
 	if p.rateLimited(err) {
