@@ -4,8 +4,9 @@
 # takes at most one job, deregisters itself and exits; the Run ends with it.
 #
 # When dockerd-rootless is installed and DOCKER_HOST is a unix socket, a
-# rootless Docker engine is started first for the job's steps. It is required
-# unless LUXGHA_DOCKER=optional.
+# rootless Docker engine is started first for the job's steps, listening on
+# DOCKER_HOST. It must answer `docker info` within LUXGHA_DOCKER_WAIT seconds
+# (default 60) and is required unless LUXGHA_DOCKER=optional.
 set -eu
 
 RUNNER_DIR=${RUNNER_DIR:-/home/runner/actions-runner}
@@ -23,19 +24,27 @@ start_docker() {
 	dockerd=$(command -v dockerd-rootless || command -v dockerd-rootless.sh) || return 0
 	case ${DOCKER_HOST:-} in unix://*) ;; *) return 0 ;; esac
 	[ "$(id -u)" -ne 0 ] || return 0
+	# Seconds for the whole wait, probes included. Tests shorten it.
+	wait_s=${LUXGHA_DOCKER_WAIT:-60}
+	case $wait_s in '' | *[!0-9]* | 0) echo "lux-gha-runner: LUXGHA_DOCKER_WAIT must be a positive integer" >&2; exit 1 ;; esac
 	log=/tmp/dockerd.log
 	mkdir -p "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
 	chmod 700 "$XDG_RUNTIME_DIR"
 	# Own session, so a signal to the runner's process group does not reach it.
-	setsid "$dockerd" </dev/null >"$log" 2>&1 &
+	# --host makes dockerd listen where the CLI and the job's steps look.
+	setsid "$dockerd" --host "$DOCKER_HOST" </dev/null >"$log" 2>&1 &
 	pid=$!
-	i=0
-	while [ "$i" -lt 60 ] && kill -0 "$pid" 2>/dev/null; do
-		docker info >/dev/null 2>&1 && return 0
+	deadline=$(($(date +%s) + wait_s))
+	while kill -0 "$pid" 2>/dev/null; do
+		left=$((deadline - $(date +%s)))
+		[ "$left" -gt 0 ] || break
+		# A daemon that accepts the connection but never answers must not
+		# outlast the deadline: each probe gets at most 5 s.
+		[ "$left" -le 5 ] || left=5
+		timeout -k 1 "$left" docker info >/dev/null 2>&1 && return 0
 		sleep 1
-		i=$((i + 1))
 	done
-	echo "lux-gha-runner: rootless dockerd did not come up within 60s; last lines of $log:" >&2
+	echo "lux-gha-runner: rootless dockerd did not come up within ${wait_s}s; last lines of $log:" >&2
 	tail -n 20 "$log" >&2 || true
 	if [ "${LUXGHA_DOCKER:-required}" = optional ]; then
 		echo "lux-gha-runner: continuing without Docker (LUXGHA_DOCKER=optional)" >&2
