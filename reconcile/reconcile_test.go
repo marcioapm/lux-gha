@@ -1242,8 +1242,14 @@ func TestTwoRepositoriesShareTheGlobalCapAndFailIndependently(t *testing.T) {
 	if st.Error != ErrGitHub {
 		t.Fatalf("status %+v", st)
 	}
+	// widgets' unresolved submissions are unknown, so nothing is created.
+	if got := liveJobs(e, "1002"); len(got) != 0 || st.Provisioned != 0 {
+		t.Fatalf("gadgets Runs %v while widgets was unreadable, status %+v", got, st)
+	}
+	e.gh.fail = nil
+	e.pass()
 	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
-		t.Fatalf("gadgets Runs %v", got)
+		t.Fatalf("gadgets Runs %v once widgets read again", got)
 	}
 	for _, r := range e.lux.all() {
 		if r.run.Labels[LabelRepo] == "1001" && slices.Contains(e.lux.terminatedIDs(), r.run.ID) {
@@ -1328,7 +1334,7 @@ func failOn(target, repo string, page int) func(string, string, int) error {
 	}
 }
 
-func TestFailedJobPageSkipsTheRepositoryButNotOthers(t *testing.T) {
+func TestFailedJobPageSkipsTheRepositoryAndHoldsBackCreation(t *testing.T) {
 	e := newEnv(t, twoRepos(10))
 	e.gh.addRepo("acme/gadgets", 1002)
 	// A cancelled job's idle runner in widgets, past idleGrace.
@@ -1347,8 +1353,14 @@ func TestFailedJobPageSkipsTheRepositoryButNotOthers(t *testing.T) {
 	if st.Error != ErrGitHub || len(liveJobs(e, "1001")) != 1 || len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
 		t.Fatalf("acted on widgets: %+v live=%v deleted=%v terminated=%v", st, liveJobs(e, "1001"), e.gh.deletedNames(), e.lux.terminatedIDs())
 	}
+	// widgets may hide an unresolved submission, so gadgets waits too.
+	if got := liveJobs(e, "1002"); len(got) != 0 {
+		t.Fatalf("gadgets Runs %v while widgets was partly read", got)
+	}
+	e.gh.fail = nil
+	e.pass()
 	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
-		t.Fatalf("gadgets Runs %v", got)
+		t.Fatalf("gadgets Runs %v once widgets read again", got)
 	}
 }
 
@@ -1374,8 +1386,9 @@ func TestRunnerListingBeyondItsPageBoundRemovesNothing(t *testing.T) {
 	if slices.Contains(e.lux.terminatedIDs(), id) || len(e.gh.deletedNames()) != 0 {
 		t.Fatalf("terminated=%v deleted=%v", e.lux.terminatedIDs(), e.gh.deletedNames())
 	}
-	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
-		t.Fatalf("gadgets Runs %v", got)
+	// widgets' registrations are unknown, so gadgets is not provisioned.
+	if got := liveJobs(e, "1002"); len(got) != 0 {
+		t.Fatalf("gadgets Runs %v while widgets' runners were unread", got)
 	}
 }
 
@@ -1425,5 +1438,96 @@ func TestRunWhoseTerminateFailedAfterRunnerDeletionIsTerminatedLater(t *testing.
 	e.pass()
 	if !slices.Equal(e.lux.terminatedIDs(), []string{id}) || e.lux.createCount() != 1 {
 		t.Fatalf("terminated=%v creates=%d", e.lux.terminatedIDs(), e.lux.createCount())
+	}
+}
+
+// A repository that cannot be read may hold a submission with an unknown
+// outcome; creating a Run anywhere could exceed a cap once it commits.
+func TestUnreadableRepositoryHoldsBackCreation(t *testing.T) {
+	big := []string{"self-hosted", "linux", "lux-big"}
+	for _, c := range []struct {
+		name   string
+		edits  []func(string) string
+		labels []string
+	}{
+		{"global cap", []func(string) string{twoRepos(1)}, lux3},
+		{"route cap", []func(string) string{twoRepos(10)}, big},
+	} {
+		for _, restart := range []bool{false, true} {
+			name := c.name
+			if restart {
+				name += " across a restart"
+			}
+			t.Run(name, func(t *testing.T) {
+				e := newEnv(t, c.edits...)
+				e.gh.addRepo("acme/gadgets", 1002)
+				e.gh.queue(7, "queued", c.labels...)
+				e.lux.lateCommit = 1
+				if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
+					t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+				}
+				e.gh.complete(7, "cancelled")
+				e.gh.queueIn("acme/gadgets", 80, 8, "queued", c.labels...)
+				e.gh.fail = func(op, repo string, _ int) error {
+					if repo == widgets && op == opRunners {
+						return &githubapp.APIError{StatusCode: 500}
+					}
+					return nil
+				}
+				if restart {
+					e.rec = e.newReconciler()
+				}
+				for range 3 {
+					e.pass()
+					if live := e.lux.live(); len(live) > 1 {
+						t.Fatalf("cap of 1 exceeded: %d live Runs", len(live))
+					}
+				}
+				if e.lux.createCount() != 1 {
+					t.Fatalf("creates=%d while widgets was unreadable", e.lux.createCount())
+				}
+			})
+		}
+	}
+}
+
+// GitHub reports its default labels on every self-hosted runner, so an
+// unresolved runner's labels can contain several routes; each holds a slot.
+func TestUnresolvedRunnerHoldsASlotOnEveryRouteItsLabelsContain(t *testing.T) {
+	for _, c := range []struct{ name, other string }{
+		{"equally specific route", `["ARM64"]`},
+		{"more specific route", `["ARM64", "linux"]`},
+	} {
+		for _, restart := range []bool{false, true} {
+			name := c.name
+			if restart {
+				name += " across a restart"
+			}
+			t.Run(name, func(t *testing.T) {
+				e := newEnv(t,
+					replace(`"labels": ["self-hosted", "linux", "lux"], "pool": "gha",`, `"labels": ["lux"], "pool": "gha", "maxRunners": 1,`),
+					replace(`"labels": ["self-hosted", "linux", "lux-big"]`, `"labels": `+c.other))
+				e.gh.queue(7, "queued", "lux")
+				e.lux.lateCommit = 3
+				if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
+					t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+				}
+				e.gh.complete(7, "cancelled")
+				e.gh.queue(8, "queued", "lux")
+				if restart {
+					e.rec = e.newReconciler()
+				}
+				for range 4 {
+					e.pass()
+					if live := e.lux.live(); len(live) > 1 {
+						t.Fatalf("default route cap of 1 exceeded: %d live Runs", len(live))
+					}
+					e.clock.Add(30 * time.Second)
+				}
+				if len(e.lux.liveForJob("8")) != 0 {
+					t.Fatalf("job 8 got a Run while job 7's submission held the slot")
+				}
+			})
+		}
 	}
 }

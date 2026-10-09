@@ -257,6 +257,9 @@ type pass struct {
 	st        Status
 	repos     []*repoView
 	truncated bool
+	// unread: a configured repository could not be read this pass, so its
+	// unresolved submissions are unknown and no Run may be created.
+	unread    bool
 	live      []luxclient.Run
 	ended     map[string]bool // Run ids terminated this pass
 	liveByJob map[string]bool // repo id/job id
@@ -331,6 +334,7 @@ func (p *pass) readGitHub() error {
 			// A partial view could hide registered runners; act on none of it.
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
 			p.setError(ErrGitHub)
+			p.unread = true
 			continue
 		}
 		p.repos = append(p.repos, v)
@@ -491,6 +495,12 @@ func (p *pass) provision() error {
 	if err := p.classifyRegistrations(classified); err != nil {
 		return err
 	}
+	if p.unread && len(todo) > 0 {
+		// Its registrations, and so its unresolved submissions, are unknown:
+		// any creation could exceed a cap once they commit.
+		p.r.log.Warn("not provisioning: a repository could not be read", "jobs", len(todo))
+		return nil
+	}
 	for _, j := range todo {
 		if len(p.live)+p.unresolved >= cfg.MaxRunners ||
 			(j.route.MaxRunners > 0 && p.liveRoute[j.route.Name]+p.unresolvedRoute[j.route.Name] >= j.route.MaxRunners) {
@@ -644,7 +654,7 @@ func (p *pass) classifyJobRegistrations(v *repoView, jobID int64, gens []int) er
 		case !hasRun:
 			log.Info("runner registered without a Run; holding a cap slot for it", "runner", name)
 			p.unresolved++
-			if route := r.routeOf(v.runners[name]); route != nil {
+			for _, route := range r.routesOf(v.runners[name]) {
 				p.unresolvedRoute[route.Name]++
 			}
 		}
@@ -652,33 +662,22 @@ func (p *pass) classifyJobRegistrations(v *repoView, jobID int64, gens []int) er
 	return nil
 }
 
-// routeOf returns the route whose labels the runner carries. The runner was
-// registered with exactly its route's labels, but GitHub also reports its
-// default ones (self-hosted, OS, architecture), so this is the reverse of
-// MatchRoute's containment. With no single such route the slot stays global.
-func (r *Reconciler) routeOf(rn githubapp.Runner) *config.Route {
+// routesOf returns every route whose labels the runner carries. The runner
+// was registered with exactly its route's labels, but GitHub also reports its
+// default ones (self-hosted, OS, architecture), so more than one route can
+// match; the slot is held against each of them, never against none.
+func (r *Reconciler) routesOf(rn githubapp.Runner) []*config.Route {
 	have := make([]string, 0, len(rn.Labels))
 	for _, l := range rn.Labels {
 		have = append(have, strings.ToLower(l.Name))
 	}
-	var found *config.Route
-	tie := false
+	var routes []*config.Route
 	for i := range r.cfg.Routes {
-		route := &r.cfg.Routes[i]
-		if !containsAll(have, route.Labels) {
-			continue
-		}
-		switch {
-		case found == nil || len(route.Labels) > len(found.Labels):
-			found, tie = route, false
-		case len(route.Labels) == len(found.Labels):
-			tie = true
+		if containsAll(have, r.cfg.Routes[i].Labels) {
+			routes = append(routes, &r.cfg.Routes[i])
 		}
 	}
-	if tie {
-		return nil
-	}
-	return found
+	return routes
 }
 
 func containsAll(have, want []string) bool {

@@ -78,6 +78,12 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    and Run submission) deletes that runner; the job is provisioned next pass.
    If Lux does not echo `resumePolicy: never`, the Run is terminated and
    provisioning stops for the pass.
+   Every managed runner whose job was not looked at this way (cancelled,
+   picked by another runner, or beyond `maxJobsPerPass`) is checked too: a
+   live Run is counted, and a runner with no Run holds a slot against the
+   global cap and every route whose labels it carries (GitHub adds its
+   default labels, so more than one can match). If any repository could not
+   be read, its submissions are unknown and no Run is created that pass.
 4. **Surplus.** An idle (not busy) runner whose Run is live, whose triggering
    job has not been queued for `reconcile.idleGrace`, and which exceeds its
    repository and route's queued demand, is deleted from GitHub and then its
