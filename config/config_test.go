@@ -125,8 +125,10 @@ func TestLoadSecretsTrimsNewlineAndRedacts(t *testing.T) {
 		s.String(),
 		fmt.Sprintf("%v", s), fmt.Sprintf("%+v", s), fmt.Sprintf("%#v", s),
 	} {
-		if strings.Contains(rendered, "lux-key-value") || strings.Contains(rendered, "hook-secret") {
-			t.Fatalf("secret leaked in %q", rendered)
+		for _, secret := range []string{"PEM-DATA", "lux-key-value", "hook-secret"} {
+			if strings.Contains(rendered, secret) {
+				t.Fatalf("secret %q leaked in formatted value", secret)
+			}
 		}
 	}
 
