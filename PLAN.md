@@ -16,7 +16,7 @@ Keep GitHub Actions as the workflow engine. Supply one-job, just-in-time self-ho
 - Dedup must follow logical GitHub job/attempt identity, not only X-GitHub-Delivery: a second delivery must not create a second runner.
 - JIT runners match labels; investigate actual runner-to-job attribution before tying completed webhook cleanup to the job that caused provisioning.
 - Lux resumePolicy never now ends in terminated, with exitCode/stateReason preserving outcome. Do not interpret terminated alone as failure.
-- FEATURES is a release artifact, not an established HTTP capability endpoint. Validate current OpenAPI resumePolicy enum at startup if supported and check echoed spec on submission; do not invent /features.
+- FEATURES is a release artifact, not an established HTTP capability endpoint. Current OpenAPI has a resumePolicy property but no enum; property presence alone does not prove never support. Require a known compatible deployed release (minimum v0.1.14, no dev build unless explicitly verified) and check echoed spec on submission; do not invent /features.
 - Wildcard egress is shipped: unrestricted network is not the default.
 
 ## Open pilot decision
