@@ -21,7 +21,9 @@ import (
 	"time"
 )
 
-const MaxBodyBytes = 25 << 20 // GitHub caps payloads at 25 MB.
+// MaxBodyBytes bounds the unauthenticated read before HMAC verification.
+// workflow_job and ping payloads are a few KiB; larger events are not consumed.
+const MaxBodyBytes = 1 << 20
 
 // CallbackTimeout leaves headroom inside GitHub's 10-second delivery budget.
 var CallbackTimeout = 8 * time.Second

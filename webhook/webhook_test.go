@@ -181,9 +181,15 @@ func TestMalformedAndOversizedSignedBodies(t *testing.T) {
 			t.Fatalf("status %d for %s", w.Code, body)
 		}
 	}
-	big := bytes.Repeat([]byte(" "), MaxBodyBytes+1)
+	// A signed workflow_job just over 1 MiB is refused before verification.
+	queued := fixture(t, "workflow_job_queued.json")
+	big := append(bytes.Repeat([]byte(" "), 1<<20+1-len(queued)), queued...)
 	if w := deliver(h, "workflow_job", big, sign(big)); w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized status %d", w.Code)
+	}
+	atLimit := append(bytes.Repeat([]byte(" "), 1<<20-len(queued)), queued...)
+	if w := deliver(newHandler(t, (&recorder{}).on, nil), "workflow_job", atLimit, sign(atLimit)); w.Code != http.StatusAccepted {
+		t.Fatalf("1 MiB body status %d", w.Code)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/webhook", nil)
 	w := httptest.NewRecorder()
