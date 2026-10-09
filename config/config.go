@@ -105,7 +105,8 @@ func Parse(b []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	if dec.More() {
+	// More() is false before a closing delimiter, so require end of input.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return nil, errors.New("config: trailing data after JSON object")
 	}
 	if err := c.validate(); err != nil {

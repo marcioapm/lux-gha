@@ -34,6 +34,9 @@ func TestParseValid(t *testing.T) {
 	if c.Routes[0].Timeout.Minutes() != 90 || !c.Routes[1].NestedContainers || c.GitHub.RunnerGroupID != 1 {
 		t.Fatalf("unexpected parse: %+v", c)
 	}
+	if _, err := Parse([]byte(validConfig + "\n\t \n")); err != nil {
+		t.Fatalf("trailing whitespace rejected: %v", err)
+	}
 }
 
 func TestParseRejectsInvalidInputs(t *testing.T) {
@@ -55,6 +58,9 @@ func TestParseRejectsInvalidInputs(t *testing.T) {
 		"duplicate label":   mutate(`"lux-docker"`, `"LINUX"`),
 		"no pool":           mutate(`"lux-docker"], "pool": "gha"`, `"lux-docker"], "pool": ""`),
 		"trailing data":     []byte(validConfig + `{}`),
+		"trailing brace":    []byte(validConfig + "\n}"),
+		"trailing bracket":  []byte(validConfig + "]"),
+		"trailing garbage":  []byte(validConfig + " x"),
 		"negative resource": mutate(`"cpus": 2`, `"cpus": -1`),
 	}
 	for name, input := range cases {
