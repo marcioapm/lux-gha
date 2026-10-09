@@ -34,8 +34,11 @@ startup, every `reconcile.interval`, and after an accepted `queued` delivery
 for a job whose labels match a route. Other deliveries are left to the tick.
 A delivery only wakes the loop (a one-slot channel, so wakes coalesce) and is
 answered at once; a woken pass starts no sooner than `max(5s, interval/12)`
-after the previous pass started. The event's contents are not trusted beyond
-that, because every pass re-reads job state from GitHub.
+after the previous pass started, and a tick that falls in that wait is served
+by the woken pass. The loop does not tick during the wait, so with
+`interval < 5s` a wake can delay the next pass past the next tick. The
+event's contents are not trusted beyond that, because every pass re-reads job
+state from GitHub.
 
 A pass costs `2 + active workflow runs + ⌈runners/100⌉` GitHub requests per
 repository (active = `queued` or `in_progress`, including runs with only
