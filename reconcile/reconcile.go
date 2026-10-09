@@ -209,9 +209,6 @@ type repoView struct {
 	id      int64
 	demand  map[int64]*config.Route
 	runners map[string]githubapp.Runner // managed runners by name
-	// complete: the runner listing finished, so an absent runner is absent.
-	// Demand may still be truncated (pass.truncated).
-	complete bool
 }
 
 type pass struct {
@@ -287,11 +284,10 @@ func (p *pass) readGitHub() error {
 			return errAbort
 		}
 		if err != nil {
+			// A partial view could hide registered runners; act on none of it.
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
 			p.fail(err)
-			if v.id == 0 {
-				continue
-			}
+			continue
 		}
 		p.repos = append(p.repos, v)
 		for _, route := range v.demand {
@@ -333,7 +329,6 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 			break
 		}
 	}
-	v.complete = true
 	return nil
 }
 
@@ -597,7 +592,7 @@ func (p *pass) removeSurplus() error {
 			}
 			idle[run.Labels[LabelRoute]]++
 			job, _ := strconv.ParseInt(run.Labels[LabelJob], 10, 64)
-			if _, queued := v.demand[job]; queued || !v.complete || p.truncated {
+			if _, queued := v.demand[job]; queued || p.truncated {
 				continue
 			}
 			since, ok := r.surplusSince[rn.Name]
@@ -657,9 +652,6 @@ func (p *pass) cleanUp() error {
 		liveRunner[run.Labels[LabelRunner]] = true
 	}
 	for _, v := range p.repos {
-		if !v.complete {
-			continue
-		}
 		repoID := strconv.FormatInt(v.id, 10)
 		for _, run := range p.live {
 			if run.Labels[LabelRepo] != repoID || p.ended[run.ID] {

@@ -294,6 +294,37 @@ func TestUnstartedRunForCancelledJobIsReclaimedAfterGrace(t *testing.T) {
 	}
 }
 
+func TestTruncatedDemandProvisionsWithinBoundAndRemovesNothing(t *testing.T) {
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 2}`))
+	e.gh.queue(1, "queued", lux3...)
+	e.pass()
+	e.gh.complete(1, "cancelled")
+	e.gh.queue(2, "queued", lux3...)
+	e.gh.queue(3, "queued", lux3...)
+	e.gh.queue(4, "queued", lux3...)
+	e.pass()
+	e.clock.Add(time.Hour)
+	st := e.pass()
+	// Job 4 was beyond the bound, so job 1's idle runner may be its supply.
+	if e.lux.createCount() != 3 || len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("status %+v creates=%d deleted=%v terminated=%v", st, e.lux.createCount(), e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+}
+
+func TestGitHubErrorSkipsTheRepositoryWithoutCleanup(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.pass()
+	e.gh.complete(7, "cancelled")
+	e.pass()
+	e.clock.Add(time.Hour)
+	e.gh.failRunners = true
+	st := e.pass()
+	if st.Error != ErrGitHub || len(e.gh.deletedNames()) != 0 || len(e.lux.terminatedIDs()) != 0 {
+		t.Fatalf("status %+v deleted=%v terminated=%v", st, e.gh.deletedNames(), e.lux.terminatedIDs())
+	}
+}
+
 func TestSurplusLeavesOneIdleRunnerPerQueuedJob(t *testing.T) {
 	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 2`))
 	e.gh.queue(1, "queued", lux3...)

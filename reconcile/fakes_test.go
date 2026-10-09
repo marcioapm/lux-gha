@@ -53,6 +53,8 @@ type fakeGitHub struct {
 	block chan struct{}
 	// perPage bounds page sizes to exercise paging.
 	perPage int
+	// failRunners answers runner listings 500.
+	failRunners bool
 }
 
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
@@ -167,6 +169,9 @@ func (f *fakeGitHub) ListRepoRunners(_ context.Context, _ githubapp.Repository, 
 	defer f.mu.Unlock()
 	if err := f.gate(); err != nil {
 		return githubapp.RunnerPage{}, err
+	}
+	if f.failRunners {
+		return githubapp.RunnerPage{}, &githubapp.APIError{StatusCode: 500}
 	}
 	var all []githubapp.Runner
 	for _, id := range sortedKeys(f.runners) {
