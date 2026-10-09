@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -24,7 +24,7 @@ var releaseRe = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9]
 // (v0.1.16-1-gabc), prereleases and anything unparseable are refused.
 // The schema has no enum for resumePolicy, so presence alone does not prove
 // "never" support: the version gate is what does.
-func (c *Client) CheckCompatibility(ctx context.Context) (version string, err error) {
+func (c *Client) CheckCompatibility(ctx context.Context) (string, error) {
 	var doc struct {
 		Info struct {
 			Version string `json:"version"`
@@ -37,8 +37,7 @@ func (c *Client) CheckCompatibility(ctx context.Context) (version string, err er
 			} `json:"schemas"`
 		} `json:"components"`
 	}
-	err = c.do(ctx, request{op: "openapi", method: http.MethodGet, path: "/openapi.json", anonymous: true, want: []int{http.StatusOK}}, &doc)
-	if err != nil {
+	if err := c.do(ctx, request{op: "openapi", method: http.MethodGet, path: "/openapi.json", anonymous: true, want: []int{http.StatusOK}}, &doc); err != nil {
 		return "", err
 	}
 	v := doc.Info.Version
@@ -54,7 +53,7 @@ func (c *Client) CheckCompatibility(ctx context.Context) (version string, err er
 		}
 		got[i] = n
 	}
-	if !atLeast(got, MinVersion) {
+	if slices.Compare(got[:], MinVersion[:]) < 0 {
 		return "", fmt.Errorf("%w: version %s is older than v%d.%d.%d", ErrIncompatible, v, MinVersion[0], MinVersion[1], MinVersion[2])
 	}
 	prop, ok := doc.Components.Schemas.RunSpec.Properties["resumePolicy"]
@@ -63,15 +62,6 @@ func (c *Client) CheckCompatibility(ctx context.Context) (version string, err er
 		return "", fmt.Errorf("%w: RunSpec schema has no resumePolicy", ErrIncompatible)
 	}
 	return v, nil
-}
-
-func atLeast(got, min [3]uint64) bool {
-	for i := range got {
-		if got[i] != min[i] {
-			return got[i] > min[i]
-		}
-	}
-	return true
 }
 
 // Create submits spec with POST /v1/runs. idempotencyKey is required: Lux
@@ -191,7 +181,7 @@ func (c *Client) List(ctx context.Context, labels map[string]string, states ...s
 		}
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for _, k := range keys {
 		q.Add("label", k+"="+labels[k])
 	}

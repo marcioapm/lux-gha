@@ -44,7 +44,7 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	// Constructed now so a bad key or URL fails before serving; used from wave 2.
+	// Validate the GitHub key and URL before serving, without making an API request.
 	if _, err := githubapp.New(githubapp.Config{AppID: cfg.GitHub.AppID, PrivateKey: secrets.AppPrivateKey, BaseURL: cfg.GitHub.APIURL}); err != nil {
 		return fmt.Errorf("github app: %w", err)
 	}

@@ -1,12 +1,11 @@
 # lux-gha
 
-Bridge that supplies one-shot, just-in-time GitHub Actions self-hosted runners as
-Lux generic Runs. GitHub remains the workflow
-engine; Lux only runs the runner process.
+Foundation for a bridge supplying one-shot, just-in-time GitHub Actions
+self-hosted runners as Lux generic Runs. GitHub remains the workflow engine;
+Lux runs the runner process.
 
 ## Status: foundation only
 
-This repository currently contains the building blocks, **not** a working bridge.
 `lux-gha` does **not** provision runners or launch jobs yet.
 
 What exists:
@@ -24,7 +23,7 @@ What exists:
 - `webhook`: signed `workflow_job` ingress that calls an injected function.
 - `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, then serves `GET /healthz` and `POST /webhook`. The webhook callback only logs the event and the matching route.
 
-Not implemented yet (wave 2): runner provisioning, deduplication by job identity, cleanup, and reconciliation and restart recovery. The runner image is also not implemented.
+Wave 2 adds runner provisioning, deduplication by job identity, cleanup, reconciliation, and restart recovery. The runner image is also not implemented.
 
 ### Runner attribution
 
