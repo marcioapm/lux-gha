@@ -138,6 +138,27 @@ func (c *Client) GenerateRepoJITConfig(ctx context.Context, repo Repository, req
 	return out, err
 }
 
+// RepositoryInfo is the subset of GET /repos/{owner}/{repo} the bridge reads.
+type RepositoryInfo struct {
+	ID       int64  `json:"id"`
+	FullName string `json:"full_name"`
+}
+
+// GetRepository resolves the numeric repository ID, which unlike owner/name
+// survives renames and transfers.
+func (c *Client) GetRepository(ctx context.Context, repo Repository) (RepositoryInfo, error) {
+	var out RepositoryInfo
+	path, err := repo.path("")
+	if err != nil {
+		return out, err
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	if err == nil && out.ID <= 0 {
+		return RepositoryInfo{}, errors.New("githubapp: invalid repository response")
+	}
+	return out, err
+}
+
 func (c *Client) GetWorkflowJob(ctx context.Context, repo Repository, jobID int64) (WorkflowJob, error) {
 	var out WorkflowJob
 	if jobID <= 0 {

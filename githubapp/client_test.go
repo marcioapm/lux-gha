@@ -431,6 +431,26 @@ func TestGetWorkflowJobDecodesNullableRunnerAttribution(t *testing.T) {
 	}
 }
 
+func TestGetRepositoryReadsNumericID(t *testing.T) {
+	var body atomic.Value
+	body.Store(`{"id":123456,"full_name":"octo-org/app.repo"}`)
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/repos/octo-org/app.repo" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(body.Load().(string)))
+	})
+	info, err := c.GetRepository(context.Background(), repo)
+	if err != nil || info.ID != 123456 || info.FullName != "octo-org/app.repo" {
+		t.Fatalf("info=%+v err=%v", info, err)
+	}
+	body.Store(`{"full_name":"octo-org/app.repo"}`)
+	if _, err := c.GetRepository(context.Background(), repo); err == nil {
+		t.Fatal("accepted a repository without id")
+	}
+}
+
 func TestListAndDeleteRunners(t *testing.T) {
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
 		switch {
