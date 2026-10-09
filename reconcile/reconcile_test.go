@@ -916,6 +916,62 @@ func TestLiveRunFromHistoryReadCountsAgainstCaps(t *testing.T) {
 	}
 }
 
+func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
+	big := []string{"self-hosted", "linux", "lux-big"}
+	globalCap := []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": 1`)}
+	// The big route has maxRunners 1 under a global cap of 10.
+	for _, tc := range []struct {
+		name    string
+		edits   []func(string) string
+		labels  []string
+		restart bool
+	}{
+		{"global cap", globalCap, lux3, false},
+		{"global cap across a restart", globalCap, lux3, true},
+		{"route cap", nil, big, false},
+		{"route cap across a restart", nil, big, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, tc.edits...)
+			e.gh.queue(7, "queued", tc.labels...)
+			e.gh.queue(8, "queued", tc.labels...)
+			// Job 7's Create fails; its Run commits at the next pass's third
+			// List: after job 7's history read, before job 8 is provisioned.
+			e.lux.lateCommit = 2
+			if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
+				t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+			}
+			if tc.restart {
+				e.rec = e.newReconciler()
+			}
+			for range 4 {
+				e.pass()
+				if live := e.lux.live(); len(live) > 1 {
+					t.Fatalf("cap of 1 exceeded: %d live Runs", len(live))
+				}
+				e.clock.Add(30 * time.Second)
+			}
+			if len(e.lux.liveForJob("7")) != 1 || len(e.lux.liveForJob("8")) != 0 || e.lux.createCount() != 1 {
+				t.Fatalf("job7=%d job8=%d creates=%d", len(e.lux.liveForJob("7")), len(e.lux.liveForJob("8")), e.lux.createCount())
+			}
+			// Job 7's runner serves it and its Run ends, freeing the slot.
+			id := e.runID("7")
+			if err := e.gh.pick(runner("7", 0), 7); err != nil {
+				t.Fatal(err)
+			}
+			e.gh.complete(7, "success")
+			e.lux.end(id, "exited")
+			e.pass()
+			if len(e.lux.live()) != 1 || len(e.lux.liveForJob("8")) != 1 || e.lux.createCount() != 2 {
+				t.Fatalf("live=%d job8=%d creates=%d", len(e.lux.live()), len(e.lux.liveForJob("8")), e.lux.createCount())
+			}
+			if err := e.gh.pick(runner("8", 0), 8); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func instanceEnv(e *env, instance string) *Reconciler {
 	raw := strings.Replace(testConfig, `"instance": "t1"`, `"instance": "`+instance+`"`, 1)
 	cfg, err := config.Parse([]byte(raw))

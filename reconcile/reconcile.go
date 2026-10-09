@@ -255,6 +255,10 @@ type pass struct {
 	ended     map[string]bool // Run ids terminated this pass
 	liveByJob map[string]bool // repo id/job id
 	liveRoute map[string]int
+	// Cap slots held this pass by submissions with an unknown outcome, in
+	// total and by route; their Runs may commit at any moment.
+	unresolved      int
+	unresolvedRoute map[string]int
 }
 
 func (p *pass) fail(err error) {
@@ -436,6 +440,7 @@ func (p *pass) readLux() error {
 	p.live = runs
 	p.liveByJob = map[string]bool{}
 	p.liveRoute = map[string]int{}
+	p.unresolvedRoute = map[string]int{}
 	for _, run := range runs {
 		p.liveByJob[run.Labels[LabelRepo]+"/"+run.Labels[LabelJob]] = true
 		p.liveRoute[run.Labels[LabelRoute]]++
@@ -453,7 +458,8 @@ func (p *pass) provision() error {
 			if p.liveByJob[key] {
 				continue
 			}
-			if len(p.live) >= cfg.MaxRunners || (route.MaxRunners > 0 && p.liveRoute[route.Name] >= route.MaxRunners) {
+			if len(p.live)+p.unresolved >= cfg.MaxRunners ||
+				(route.MaxRunners > 0 && p.liveRoute[route.Name]+p.unresolvedRoute[route.Name] >= route.MaxRunners) {
 				continue
 			}
 			run, created, err := p.provisionJob(v, jobID, route)
@@ -510,10 +516,13 @@ func (p *pass) provisionJob(v *repoView, jobID int64, route *config.Route) (*lux
 	// A registered runner whose gen has no Run is a submission with an
 	// unknown outcome: it may still be in flight. Its gen is not passed until
 	// orphan cleanup deletes the runner, so at most one Run serves the job.
+	// Until then it holds a cap slot, so its late Run cannot exceed a cap.
 	for name := range v.runners {
 		n, err := strconv.Atoi(strings.TrimPrefix(name, jobPrefix))
 		if err == nil && strings.HasPrefix(name, jobPrefix) && !hasRun[n] {
 			log.Info("runner registered without a Run; waiting for its Run or its cleanup", "runner", name)
+			p.unresolved++
+			p.unresolvedRoute[route.Name]++
 			return nil, false, nil
 		}
 	}
