@@ -226,23 +226,30 @@ make image             # the runner image for the host's architecture, as lux-gh
 make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
 
-CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, `make test` and a
-check that no test skipped; `shellcheck`, `sh -n` and `make entrypoint-test`; and a linux/arm64 build of the
-runner image with `images/runner/smoke.sh` (unprivileged).
+CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, one
+`go test -race -v` run that fails if any test skipped, and `make dist VERSION=v0.0.0`; `shellcheck`, `sh -n`
+and `make entrypoint-test`; and a linux/arm64 build of the runner image with `images/runner/smoke.sh`
+(unprivileged). The arm64 jobs run on `ubuntu-24.04-arm`, a hosted runner GitHub provides only to public
+repositories: while the repository is private they get no runner.
 
 ## Releases
 
 Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`:
 
-1. `make test`, then `make dist VERSION=vX.Y.Z`, published as a GitHub release with generated notes:
+1. `make test`, then `make dist` with `VERSION` set to the tag, published as a GitHub release with generated notes:
    - `lux-gha_vX.Y.Z_linux_arm64.tar.gz` and `lux-gha_vX.Y.Z_linux_amd64.tar.gz`, each holding
      `bin/lux-gha` (static, `lux-gha --version` prints `vX.Y.Z`) and `share/lux-gha/LICENSE`;
    - `SHA256SUMS` for both.
 
-   The tarballs are reproducible: rebuilding the same tag gives byte-identical files.
+   `make dist` fails unless each binary carries the tag as its version. The tarballs are reproducible:
+   rebuilding the same tag with the same Go toolchain and GNU gzip gives byte-identical files.
 2. The runner image, built for **linux/arm64 only** and smoke-tested before it is pushed as
    `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z`. The Containerfile can select the amd64 runner, but no amd64
    image is built or tested.
+
+The GitHub release is published before the image job starts. If the image job fails, re-run only that
+job. Re-running it after a successful push moves `:vX.Y.Z` to a new digest; routes pinned by digest keep
+working.
 
 Tags move; digests do not. The release job's summary prints the pushed reference,
 `ghcr.io/<owner>/lux-gha-runner@sha256:...`. Put that digest in each route's `image`. To read it later:

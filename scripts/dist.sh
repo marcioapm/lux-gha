@@ -6,7 +6,8 @@
 #
 # Static, trimmed binaries versioned from VERSION (the release tag). The
 # tarballs are reproducible: root-owned, sorted, and dated with the checked-out
-# commit's date, so a rebuild of the same tag is byte-identical. Needs GNU tar
+# commit's date, so a rebuild of the same tag with the same Go toolchain and
+# GNU gzip is byte-identical. Needs GNU tar
 # (as `tar`, or `gtar` on macOS) and sha256sum.
 set -euo pipefail
 
