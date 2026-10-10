@@ -218,8 +218,42 @@ The JIT config is delivered only as a Lux file secret. It never appears in label
 ## Development
 
 ```sh
-make check   # gofmt check, go vet ./..., go test -race ./...
+make lint              # gofmt check, go vet ./..., scripts/check-license.sh
+make test              # go test -race -count=1 ./...
+make check             # lint, then test
+make entrypoint-test   # images/runner/entrypoint_test.sh as uid 1000 in the runner's pinned ubuntu base (Docker)
+make image             # the runner image for the host's architecture, as lux-gha-runner:dev (IMAGE_TAG=...)
+make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
+
+CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, `make test` and a
+check that no test skipped; `shellcheck`, `sh -n` and `make entrypoint-test`; and a linux/arm64 build of the
+runner image with `images/runner/smoke.sh` (unprivileged).
+
+## Releases
+
+Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`:
+
+1. `make test`, then `make dist VERSION=vX.Y.Z`, published as a GitHub release with generated notes:
+   - `lux-gha_vX.Y.Z_linux_arm64.tar.gz` and `lux-gha_vX.Y.Z_linux_amd64.tar.gz`, each holding
+     `bin/lux-gha` (static, `lux-gha --version` prints `vX.Y.Z`) and `share/lux-gha/LICENSE`;
+   - `SHA256SUMS` for both.
+
+   The tarballs are reproducible: rebuilding the same tag gives byte-identical files.
+2. The runner image, built for **linux/arm64 only** and smoke-tested before it is pushed as
+   `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z`. The Containerfile can select the amd64 runner, but no amd64
+   image is built or tested.
+
+Tags move; digests do not. The release job's summary prints the pushed reference,
+`ghcr.io/<owner>/lux-gha-runner@sha256:...`. Put that digest in each route's `image`. To read it later:
+
+```sh
+docker buildx imagetools inspect ghcr.io/<owner>/lux-gha-runner:vX.Y.Z --format '{{.Manifest.Digest}}'
+```
+
+A new GHCR package is private. After the first release, make it public once (the package's
+**Package settings** → **Change visibility**, reached from the repository's or owner's **Packages**), so
+Lux hosts can pull it without registry credentials. Later pushes keep that visibility.
 
 ## License
 
