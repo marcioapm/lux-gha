@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # Tests, then the binary tarballs and SHA256SUMS as a GitHub release.
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make test
+        run: make test
+
+      - name: make dist
+        run: make dist VERSION=${{ github.ref_name }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+
+  # The runner image, linux/arm64 only: built and smoke-tested locally, and
+  # only that tested image is pushed to GHCR under the release tag.
+  image:
+    needs: release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: name
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        # GHCR repository names must be lowercase.
+        run: echo "image=ghcr.io/${OWNER,,}/lux-gha-runner:$TAG" >>"$GITHUB_OUTPUT"
+
+      - name: Build and smoke-test
+        env:
+          TAG: ${{ steps.name.outputs.image }}
+        run: images/runner/smoke.sh --keep
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push and record the digest
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+        run: |
+          docker push "$IMAGE"
+          ref=$(docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 "^${IMAGE%:*}@sha256:")
+          {
+            echo "### Runner image"
+            echo
+            echo "Pin routes to the digest:"
+            echo
+            echo '```'
+            echo "$ref"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "pushed $ref"
