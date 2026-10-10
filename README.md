@@ -19,7 +19,7 @@ process.
   - a startup compatibility check
 - `webhook`: signed `workflow_job` ingress that calls an injected function.
 - `reconcile`: the single reconciler that provisions and removes runners.
-- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`.
+- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
 The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)).
 

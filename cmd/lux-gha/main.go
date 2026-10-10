@@ -20,6 +20,7 @@ import (
 
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/internal/version"
 	"github.com/marcioapm/lux-gha/luxclient"
 	"github.com/marcioapm/lux-gha/reconcile"
 	"github.com/marcioapm/lux-gha/webhook"
@@ -27,8 +28,14 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/lux-gha/config.json", "path to the JSON configuration")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	log.Info("lux-gha starting", "version", version.Version)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, *configPath, log); err != nil {

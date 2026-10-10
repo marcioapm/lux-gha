@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -123,6 +124,26 @@ func writeConfig(t *testing.T, luxURL, githubURL string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// The release build's ldflags set the version --version prints, with exit 0
+// and nothing else read: there is no config at the default path here.
+func TestVersionFlagPrintsLinkedVersion(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "lux-gha")
+	build := exec.Command("go", "build", "-o", bin,
+		"-ldflags", "-X github.com/marcioapm/lux-gha/internal/version.Version=v9.8.7", ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(bin, "--version", "-config", filepath.Join(t.TempDir(), "absent.json"))
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("--version: %v (stderr %q)", err, stderr.String())
+	}
+	if stdout.String() != "v9.8.7\n" || stderr.Len() != 0 {
+		t.Fatalf("stdout %q stderr %q", stdout.String(), stderr.String())
+	}
 }
 
 // servingHandler reports the bound address from run's "serving" record.
