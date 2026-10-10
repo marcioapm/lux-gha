@@ -732,16 +732,16 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 			LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelRoute: route.Name,
 			LabelJob: job, LabelGen: strconv.Itoa(gen), LabelRunner: name,
 		},
-		ImageRef:  route.Image,
-		Command:   route.Command,
-		Env:       map[string]string{JITConfigEnv: JITConfigPath},
-		Secrets:   []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
-		Resources: luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
-		Timeout:   route.Timeout.Duration,
-		Pool:      route.Pool,
-		Sandbox:   luxclient.Sandbox{NestedContainers: route.NestedContainers},
+		ImageRef:           route.Image,
+		Command:            route.Command,
+		Env:                map[string]string{JITConfigEnv: JITConfigPath},
+		Secrets:            []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
+		Resources:          luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
+		Timeout:            route.Timeout.Duration,
+		Pool:               route.Pool,
+		Sandbox:            luxclient.Sandbox{NestedContainers: route.NestedContainers},
+		UnrestrictedEgress: route.UnrestrictedEgress,
 	}
-	spec.UnrestrictedEgress = route.UnrestrictedEgress
 	for _, h := range route.EgressHosts {
 		spec.Egress = append(spec.Egress, luxclient.EgressRule{Host: h})
 	}
