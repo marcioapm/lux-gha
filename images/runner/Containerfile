@@ -22,6 +22,7 @@ ARG DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 
 LABEL org.opencontainers.image.source="https://github.com/marcioapm/lux-gha" \
       org.opencontainers.image.description="lux-gha one-shot GitHub Actions runner with rootless Docker" \
+      org.opencontainers.image.licenses="Elastic-2.0" \
       io.github.actions.runner.version="${RUNNER_VERSION}"
 
 SHELL ["/bin/sh", "-eux", "-c"]
@@ -78,6 +79,7 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} +; \
     setcap cap_setgid=ep /usr/bin/newgidmap; \
     [ -z "$(find / -xdev -type f -perm /6000)" ]
 
+COPY --chmod=644 LICENSE /usr/share/lux-gha/LICENSE
 COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
 
 ENV RUNNER_DIR=/home/runner/actions-runner \

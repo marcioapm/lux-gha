@@ -17,6 +17,8 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.
+- The project licence at `/usr/share/lux-gha/LICENSE`, copied from `images/runner/LICENSE`, which must stay
+  byte-identical to the root `LICENSE` (`scripts/check-license.sh`, also run by `smoke.sh`).
 
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is

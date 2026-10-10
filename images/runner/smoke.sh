@@ -29,6 +29,8 @@ done
 fail() { echo "FAIL: $*" >&2; exit 1; }
 run() { docker run --rm --platform linux/arm64 "$@"; }
 
+sh "$dir/../../scripts/check-license.sh" || fail "images/runner/LICENSE does not match the root LICENSE"
+
 if $checksum_negative; then
 	log=$(mktemp)
 	trap 'rm -f "$log"' EXIT
@@ -69,6 +71,17 @@ run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
 	[ -z "$(find / -xdev -type f -perm /6000 2>/dev/null)" ] && echo "no setuid/setgid files"
 	! command -v sudo >/dev/null && echo "no sudo"
 '
+
+echo "== licence"
+[ "$(docker image inspect "$TAG" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = Elastic-2.0 ] ||
+	fail "image lacks the org.opencontainers.image.licenses=Elastic-2.0 label"
+run --entrypoint sh "$TAG" -euc '
+	f=/usr/share/lux-gha/LICENSE
+	[ -f "$f" ] || { echo "$f missing" >&2; exit 1; }
+	[ "$(stat -c %a "$f")" = 644 ] || { echo "$f mode $(stat -c %a "$f"), want 644" >&2; exit 1; }
+	cat "$f"
+' | cmp - "$dir/LICENSE" || fail "/usr/share/lux-gha/LICENSE in the image differs from images/runner/LICENSE"
+echo "/usr/share/lux-gha/LICENSE present, mode 644, matches images/runner/LICENSE"
 
 echo "== entrypoint lifecycle (entrypoint_test.sh against the installed entrypoint)"
 run -i --entrypoint sh "$TAG" -s /usr/local/bin/lux-gha-runner <"$dir/entrypoint_test.sh" ||
