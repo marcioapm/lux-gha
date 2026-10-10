@@ -17,7 +17,15 @@ if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
+# The Go linker ignores -X for a symbol that does not exist, so a wrong path
+# here builds binaries that report "dev": checked per binary below, and
+# TestVersionFlagPrintsLinkedVersion builds with these exact flags.
 LDFLAGS="-s -w -X github.com/marcioapm/lux-gha/internal/version.Version=$VERSION"
+if [ "${1:-}" = "--print-ldflags" ]; then
+  printf '%s\n' "$LDFLAGS"
+  exit 0
+fi
+HOST="$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
 MTIME="$(git -C "$ROOT" log -1 --format=%cI)"
 # The runner image ships images/runner/LICENSE: a release must not differ.
 sh "$ROOT/scripts/check-license.sh"
@@ -40,6 +48,23 @@ for arch in arm64 amd64; do
   echo "building lux-gha for linux/$arch"
   CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -C "$ROOT" -trimpath -ldflags "$LDFLAGS" \
     -o "$work/bin/lux-gha" ./cmd/lux-gha
+  # -trimpath keeps -ldflags out of the build info, so the version string is in
+  # the binary only if -X set it. Assert that premise rather than assume it.
+  if go version -m "$work/bin/lux-gha" | grep -qF -- "$VERSION"; then
+    echo "dist.sh: linux/$arch build info records $VERSION; the version check below would be vacuous" >&2
+    exit 1
+  fi
+  if ! grep -qaF -- "$VERSION" "$work/bin/lux-gha"; then
+    echo "dist.sh: linux/$arch binary does not contain $VERSION: is the -X path in LDFLAGS right?" >&2
+    exit 1
+  fi
+  if [ "$HOST" = "linux/$arch" ]; then
+    got="$("$work/bin/lux-gha" --version)"
+    if [ "$got" != "$VERSION" ]; then
+      echo "dist.sh: linux/$arch binary reports '$got', want $VERSION" >&2
+      exit 1
+    fi
+  fi
   cp "$ROOT/LICENSE" "$work/share/lux-gha/LICENSE"
   chmod 0755 "$work/bin" "$work/share" "$work/share/lux-gha" "$work/bin/lux-gha"
   chmod 0644 "$work/share/lux-gha/LICENSE"

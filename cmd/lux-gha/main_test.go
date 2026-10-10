@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,12 +127,19 @@ func writeConfig(t *testing.T, luxURL, githubURL string) string {
 	return path
 }
 
-// The release build's ldflags set the version --version prints, with exit 0
-// and nothing else read: there is no config at the default path here.
+// The release build's ldflags, taken from scripts/dist.sh so a wrong -X path
+// there fails here, set the version --version prints, with exit 0 and nothing
+// else read: there is no config at the default path here.
 func TestVersionFlagPrintsLinkedVersion(t *testing.T) {
+	printFlags := exec.Command("bash", filepath.Join("..", "..", "scripts", "dist.sh"), "--print-ldflags")
+	printFlags.Env = append(os.Environ(), "VERSION=v9.8.7")
+	ldflags, err := printFlags.Output()
+	if err != nil {
+		t.Fatalf("dist.sh --print-ldflags: %v", err)
+	}
 	bin := filepath.Join(t.TempDir(), "lux-gha")
-	build := exec.Command("go", "build", "-o", bin,
-		"-ldflags", "-X github.com/marcioapm/lux-gha/internal/version.Version=v9.8.7", ".")
+	build := exec.Command("go", "build", "-trimpath", "-o", bin,
+		"-ldflags", strings.TrimSpace(string(ldflags)), ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
