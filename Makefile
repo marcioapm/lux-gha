@@ -30,6 +30,8 @@ entrypoint-test:
 image:
 	docker buildx build --load -t $(IMAGE_TAG) -f images/runner/Containerfile images/runner
 
-# Release tarballs and SHA256SUMS in dist/ (README "Releases").
+# Release tarballs and SHA256SUMS in dist/ (README "Releases"). VERSION reaches
+# dist.sh through the environment Make exports, never through the recipe line:
+# a tag name may contain shell metacharacters.
 dist:
-	VERSION=$(VERSION) ./scripts/dist.sh
+	./scripts/dist.sh

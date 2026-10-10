@@ -25,8 +25,11 @@ jobs:
       - name: make test
         run: make test
 
+      # The tag goes through env only: dist.sh rejects anything but vX.Y.Z.
       - name: make dist
-        run: make dist VERSION=${{ github.ref_name }}
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
