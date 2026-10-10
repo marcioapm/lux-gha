@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same PR cancels the run for the older one.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # gofmt, go vet, the licence copy check and every Go test.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make lint
+        run: make lint
+
+      - name: make test
+        run: make test
+
+      # No test has a reason to skip in CI: a skip is a broken setup.
+      - name: No test skipped
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./... 2>&1 | tee test.log
+          ! grep -E -- '--- SKIP' test.log
+
+  # The runner image's shell: lint, parse, and the entrypoint lifecycle test.
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck images/runner/*.sh scripts/*.sh scripts/pre-commit
+
+      - name: sh -n
+        run: |
+          for f in images/runner/*.sh scripts/check-license.sh scripts/pre-commit; do
+            sh -n "$f"
+          done
+          bash -n scripts/dist.sh
+
+      - name: make entrypoint-test
+        run: make entrypoint-test
+
+  # Builds the runner image for linux/arm64 and runs the unprivileged smoke
+  # test against it. Always run: the image pins apt package versions that
+  # Docker's repository can drop, and this catches that before a tag does.
+  image:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: smoke.sh (builds the image, then tests it)
+        run: images/runner/smoke.sh
