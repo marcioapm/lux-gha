@@ -19,6 +19,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
 LDFLAGS="-s -w -X github.com/marcioapm/lux-gha/internal/version.Version=$VERSION"
 MTIME="$(git -C "$ROOT" log -1 --format=%cI)"
+# The runner image ships images/runner/LICENSE: a release must not differ.
+sh "$ROOT/scripts/check-license.sh"
 
 TAR=tar
 if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
@@ -41,7 +43,8 @@ for arch in arm64 amd64; do
   cp "$ROOT/LICENSE" "$work/share/lux-gha/LICENSE"
   chmod 0755 "$work/bin" "$work/share" "$work/share/lux-gha" "$work/bin/lux-gha"
   chmod 0644 "$work/share/lux-gha/LICENSE"
-  "$TAR" "${TAR_REPRO_FLAGS[@]}" -C "$work" -czf "$DIST/$name" bin share
+  # gzip -n: tar -z would let gzip stamp the header with the current time.
+  "$TAR" "${TAR_REPRO_FLAGS[@]}" -C "$work" -cf - bin share | gzip -9 -n >"$DIST/$name"
   rm -rf "$work"
 
   # Check the tarball itself, not the tree it was made from.
