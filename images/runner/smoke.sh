@@ -53,6 +53,7 @@ $keep || trap 'docker image rm "$TAG" >/dev/null 2>&1 || true' EXIT
 runner_version=$(docker image inspect "$TAG" --format '{{index .Config.Labels "io.github.actions.runner.version"}}')
 
 echo "== tools"
+# shellcheck disable=SC2016 # the script expands inside the container
 run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
 	v=$(cd "$RUNNER_DIR" && ./config.sh --version)
 	echo "runner $v"
@@ -75,6 +76,7 @@ run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
 echo "== licence"
 [ "$(docker image inspect "$TAG" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = Elastic-2.0 ] ||
 	fail "image lacks the org.opencontainers.image.licenses=Elastic-2.0 label"
+# shellcheck disable=SC2016 # the script expands inside the container
 run --entrypoint sh "$TAG" -euc '
 	f=/usr/share/lux-gha/LICENSE
 	[ -f "$f" ] || { echo "$f missing" >&2; exit 1; }
@@ -133,6 +135,7 @@ if $privileged; then
 	marker=smoke-marker-$$-$(date +%s)
 	# The store gets its own volume, as Lux mounts one there: overlay on
 	# top of the container's overlay root fails to mount BuildKit's layers.
+	# shellcheck disable=SC2016 # the script expands inside the container
 	run --privileged -v /home/runner/.local/share/docker -e MARKER="$marker" --entrypoint sh "$TAG" -euc '
 		mkdir -p "$XDG_RUNTIME_DIR"
 		setsid dockerd-rootless.sh --host "$DOCKER_HOST" </dev/null >/tmp/dockerd.log 2>&1 &

@@ -9,6 +9,10 @@
 # installed entrypoint.
 #
 # Usage: sh entrypoint_test.sh [path/to/entrypoint]
+#
+# SC2016: the supervisor script and every check condition are single-quoted
+# so they expand when run (sh -c, eval in check), after each case sets d, rc.
+# shellcheck disable=SC2016
 set -eu
 
 ep=${1:-$(cd "$(dirname "$0")" && pwd)/entrypoint.sh}
