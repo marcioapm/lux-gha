@@ -3,3 +3,4 @@ set -e
 unformatted=$(gofmt -l .)
 [ -z "$unformatted" ] || { echo "gofmt needed: $unformatted"; exit 1; }
 go vet ./...
+sh scripts/check-license.sh >/dev/null
