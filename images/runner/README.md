@@ -24,7 +24,7 @@ If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the
 logs to `/tmp/dockerd.log`. It waits up to 60 s in total for `docker info`, each probe bounded to 5 s, and
 stops early if the daemon exits. If the engine does not come up, the entrypoint prints the log's last 20
 lines and exits 1. Set `LUXGHA_DOCKER=optional` in the Run's env to continue without Docker instead.
-`LUXGHA_DOCKER_WAIT` (seconds, default 60) changes the deadline; it exists for `entrypoint_test.sh`, and a
+`LUXGHA_DOCKER_WAIT` (whole seconds, no leading zero, default 60) changes the deadline; it exists for `entrypoint_test.sh`, and a
 Run should not need it.
 
 ## Build and smoke test

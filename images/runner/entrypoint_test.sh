@@ -176,6 +176,13 @@ check "runner reached" "$reached"
 check "waited for readiness" '[ "$elapsed" -ge 2 ] && [ "$elapsed" -le 6 ]'
 check_no_leak
 
+for bad in 08 010 0 x5; do
+	run_case "bad-wait-${bad:-empty}" LUXGHA_DOCKER_WAIT="$bad"
+	check "exits 1" '[ "$rc" = 1 ]'
+	check "runner not reached" "$not_reached"
+	check "says why" 'grep -q "LUXGHA_DOCKER_WAIT must be" "$d/err"'
+done
+
 if [ "$failures" -ne 0 ]; then
 	echo "entrypoint_test: $failures failed"
 	exit 1

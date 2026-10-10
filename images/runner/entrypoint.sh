@@ -26,7 +26,8 @@ start_docker() {
 	[ "$(id -u)" -ne 0 ] || return 0
 	# Seconds for the whole wait, probes included. Tests shorten it.
 	wait_s=${LUXGHA_DOCKER_WAIT:-60}
-	case $wait_s in '' | *[!0-9]* | 0) echo "lux-gha-runner: LUXGHA_DOCKER_WAIT must be a positive integer" >&2; exit 1 ;; esac
+	# Decimal digits, no leading zero: sh arithmetic reads 08 as bad octal.
+	case $wait_s in '' | *[!0-9]* | 0*) echo "lux-gha-runner: LUXGHA_DOCKER_WAIT must be a positive integer without a leading zero" >&2; exit 1 ;; esac
 	log=/tmp/dockerd.log
 	mkdir -p "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
 	chmod 700 "$XDG_RUNTIME_DIR"
