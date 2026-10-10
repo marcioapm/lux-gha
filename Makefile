@@ -1,6 +1,12 @@
-.PHONY: check fmt license test vet
+.PHONY: check lint fmt vet license test entrypoint-test image dist
 
-check: fmt vet license test
+# The runner image's pinned base, read from its Containerfile.
+RUNNER_BASE := $(shell sed -n 's/^FROM //p' images/runner/Containerfile)
+IMAGE_TAG ?= lux-gha-runner:dev
+
+check: lint test
+
+lint: fmt vet license
 
 fmt:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -12,4 +18,18 @@ license:
 	@sh scripts/check-license.sh
 
 test:
-	go test -race ./...
+	go test -race -count=1 ./...
+
+# entrypoint_test.sh against the working tree's entrypoint.sh, as uid 1000 in
+# the runner's base image: the invocation smoke.sh uses inside the built image.
+entrypoint-test:
+	docker run --rm -i --user 1000:1000 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
+		$(RUNNER_BASE) -s /src/entrypoint.sh <images/runner/entrypoint_test.sh
+
+# The runner image for the host's architecture, loaded into the local Docker.
+image:
+	docker buildx build --load -t $(IMAGE_TAG) -f images/runner/Containerfile images/runner
+
+# Release tarballs and SHA256SUMS in dist/ (README "Releases").
+dist:
+	VERSION=$(VERSION) ./scripts/dist.sh
