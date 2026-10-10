@@ -84,9 +84,14 @@ if out=$(run -e LUXGHA_JITCONFIG_FILE=/dev/null "$TAG" 2>&1); then fail "entrypo
 echo "$out"
 echo "$out" | grep -q "JIT config file is empty" || fail "unexpected message"
 
-echo "== entrypoint when dockerd cannot start (unprivileged container), Docker required"
 secret=not-a-real-jitconfig-$$
-if out=$(run --entrypoint sh "$TAG" -c "printf %s $secret > /tmp/jit; LUXGHA_JITCONFIG_FILE=/tmp/jit exec lux-gha-runner" 2>&1); then
+# run_with_config [docker run options...]: the entrypoint with $secret as its JIT config file.
+run_with_config() {
+	run "$@" --entrypoint sh "$TAG" -c "printf %s $secret > /tmp/jit; LUXGHA_JITCONFIG_FILE=/tmp/jit exec lux-gha-runner"
+}
+
+echo "== entrypoint when dockerd cannot start (unprivileged container), Docker required"
+if out=$(run_with_config 2>&1); then
 	fail "entrypoint succeeded without a working dockerd"
 fi
 echo "$out" | tail -n 3
@@ -97,7 +102,7 @@ echo "$out" | grep -q "$secret" && fail "JIT config leaked into output"
 # with invalid input. Exec and exit propagation are covered by the lifecycle
 # test above.
 echo "== entrypoint when dockerd cannot start, LUXGHA_DOCKER=optional"
-out=$(run -e LUXGHA_DOCKER=optional --entrypoint sh "$TAG" -c "printf %s $secret > /tmp/jit; LUXGHA_JITCONFIG_FILE=/tmp/jit exec lux-gha-runner" 2>&1) || true
+out=$(run_with_config -e LUXGHA_DOCKER=optional 2>&1) || true
 echo "$out" | tail -n 4
 echo "$out" | grep -q "continuing without Docker" || fail "did not continue without Docker"
 echo "$out" | grep -q "Base-64" || fail "run.sh was not reached"
@@ -105,7 +110,7 @@ echo "$out" | grep -q "$secret" && fail "JIT config leaked into output"
 
 if $privileged; then
 	echo "== APPROXIMATION (--privileged, not the Lux nested contract): entrypoint starts rootless dockerd"
-	out=$(run --privileged --entrypoint sh "$TAG" -c "printf %s $secret > /tmp/jit; LUXGHA_JITCONFIG_FILE=/tmp/jit exec lux-gha-runner" 2>&1) || true
+	out=$(run_with_config --privileged 2>&1) || true
 	echo "$out" | tail -n 3
 	echo "$out" | grep -q "did not come up" && fail "dockerd did not come up under --privileged"
 	echo "$out" | grep -q "Base-64" || fail "run.sh was not reached"
