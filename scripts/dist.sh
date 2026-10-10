@@ -42,12 +42,15 @@ WANT_MEMBERS=$'bin/\nbin/lux-gha\nshare/\nshare/lux-gha/\nshare/lux-gha/LICENSE'
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
+# -buildvcs=false below: in a git checkout Go would stamp the tag (or a
+# v0.0.0-<time>-<hash> pseudo-version) into the build info, which satisfies
+# the VERSION check whatever -X did.
 for arch in arm64 amd64; do
   name="lux-gha_${VERSION}_linux_${arch}.tar.gz"
   work="$DIST/work-linux-$arch"
   mkdir -p "$work/bin" "$work/share/lux-gha"
   echo "building lux-gha for linux/$arch"
-  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -C "$ROOT" -trimpath -ldflags "$LDFLAGS" \
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -C "$ROOT" -buildvcs=false -trimpath -ldflags "$LDFLAGS" \
     -o "$work/bin/lux-gha" ./cmd/lux-gha
   # -trimpath keeps -ldflags out of the build info, so the version string is in
   # the binary only if -X set it. Assert that premise rather than assume it.

@@ -51,6 +51,12 @@ jobs:
       - name: shellcheck
         run: shellcheck images/runner/*.sh scripts/*.sh scripts/pre-commit
 
+      # An expression inside run: is pasted into the script unescaped (a tag name may
+      # hold ; | ` $( ' "): pass such values through env: instead.
+      - name: No expressions inside run
+        run: |
+          awk '/\$\{\{/ && (!/^[[:space:]]*(- )?[A-Za-z0-9_-]+:[[:space:]]/ || /^[[:space:]]*(- )?run:/) { print FILENAME ":" FNR ": " $0; bad = 1 } END { exit bad }' .github/workflows/*.yml
+
       - name: sh -n
         run: |
           for f in images/runner/*.sh scripts/check-license.sh scripts/pre-commit; do
