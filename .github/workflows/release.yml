@@ -71,7 +71,9 @@ jobs:
           IMAGE: ${{ steps.name.outputs.image }}
         run: |
           docker push "$IMAGE"
-          ref=$(docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 "^${IMAGE%:*}@sha256:")
+          # Read back from the registry: the digest a Lux host will pull.
+          digest=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
+          ref="${IMAGE%:*}@$digest"
           {
             echo "### Runner image"
             echo
