@@ -23,7 +23,7 @@ failures=0
 
 stop_daemons() {
 	for f in "$root"/*/dockerd.pid; do
-		[ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true
+		if [ -f "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi
 		rm -f "$f"
 	done
 }
