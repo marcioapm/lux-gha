@@ -67,7 +67,7 @@ RUN case "$TARGETARCH" in \
     apt-get update; \
     ./bin/installdependencies.sh; \
     rm -rf /var/lib/apt/lists/*; \
-    install -d -o runner -g runner /home/runner/.local /home/runner/.local/share /home/runner/.local/share/docker; \
+    mkdir -p /home/runner/.local/share/docker; \
     chown -R runner:runner /home/runner
 
 # Lux runs nested workloads without no-new-privileges, so any setuid or
