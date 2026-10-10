@@ -27,16 +27,20 @@ jobs:
       - name: make lint
         run: make lint
 
-      - name: make test
-        run: make test
-
-      # No test has a reason to skip in CI: a skip is a broken setup.
-      - name: No test skipped
+      # One race-enabled verbose run. No test has a reason to skip in CI: a
+      # skip is a broken setup. shell: bash runs with -eo pipefail, so a test
+      # failure fails the step through tee.
+      - name: go test, none skipped
         shell: bash
         run: |
-          set -o pipefail
-          go test -count=1 -v ./... 2>&1 | tee test.log
-          ! grep -E -- '--- SKIP' test.log
+          go test -race -count=1 -v ./... 2>&1 | tee test.log
+          ! grep -E -- '^\s*--- SKIP' test.log
+
+      # The release tarballs, so a broken dist.sh fails here and not on a tag.
+      - name: make dist
+        run: |
+          make dist VERSION=v0.0.0
+          rm -rf dist
 
   # The runner image's shell: lint, parse, and the entrypoint lifecycle test.
   shell:
