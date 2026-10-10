@@ -17,6 +17,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
@@ -38,6 +40,7 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
+          fail_on_unmatched_files: true
 
   # The runner image, linux/arm64 only: built and smoke-tested locally, and
   # only that tested image is pushed to GHCR under the release tag.
@@ -49,6 +52,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Image name
         id: name
