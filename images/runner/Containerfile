@@ -79,6 +79,8 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} +; \
     setcap cap_setgid=ep /usr/bin/newgidmap; \
     [ -z "$(find / -xdev -type f -perm /6000)" ]
 
+# COPY --chmod would also apply 0644 to a parent directory it creates.
+RUN install -d -m 0755 /usr/share/lux-gha
 COPY --chmod=644 LICENSE /usr/share/lux-gha/LICENSE
 COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
 
