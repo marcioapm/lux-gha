@@ -4,3 +4,4 @@
 *.key
 *.secret
 .env
+/dist/
