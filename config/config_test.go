@@ -58,37 +58,36 @@ func TestParseValid(t *testing.T) {
 
 func TestParseRejectsInvalidInputs(t *testing.T) {
 	cases := map[string][]byte{
-		"empty":                  []byte(`{}`),
-		"unknown field":          mutate(`"listen"`, `"secret": "x", "listen"`),
-		"bad duration":           mutate(`"90m"`, `"ninety"`),
-		"zero timeout":           mutate(`"90m"`, `"0s"`),
-		"http lux":               mutate(`https://lux.example.com`, `http://lux.example.com`),
-		"lux url creds":          mutate(`https://lux.example.com`, `https://u:p@lux.example.com`),
-		"bad repo":               mutate(`"acme/widgets"`, `"acme"`),
-		"dotdot repo":            mutate(`"acme/widgets"`, `"acme/.."`),
-		"duplicate repo":         mutate(`"acme/widgets"`, `"acme/widgets", "ACME/Widgets"`),
-		"no installation":        mutate(`"installationID": 42`, `"installationID": 0`),
-		"no runner group":        mutate(`"runnerGroupID": 1`, `"runnerGroupID": 0`),
-		"duplicate name":         mutate(`"name": "docker"`, `"name": "default"`),
-		"identical labels":       mutate(`"lux-docker"`, `"lux"`),
-		"subset labels":          mutate(`"self-hosted", "linux", "lux-docker"`, `"self-hosted", "linux"`),
-		"duplicate label":        mutate(`"lux-docker"`, `"LINUX"`),
-		"no pool":                mutate(`"lux-docker"], "pool": "gha"`, `"lux-docker"], "pool": ""`),
-		"trailing data":          []byte(validConfig + `{}`),
-		"trailing brace":         []byte(validConfig + "\n}"),
-		"trailing bracket":       []byte(validConfig + "]"),
-		"trailing garbage":       []byte(validConfig + " x"),
-		"negative resource":      mutate(`"cpus": 2`, `"cpus": -1`),
-		"no instance":            mutate(`"instance": "prod-1",`, ``),
-		"uppercase instance":     mutate(`"prod-1"`, `"Prod"`),
-		"long instance":          mutate(`"prod-1"`, `"abcdefghijklmnopqrstu"`),
-		"trailing dash":          mutate(`"prod-1"`, `"prod-"`),
-		"no maxRunners":          mutate(`"maxRunners": 10,`, ``),
-		"negative route cap":     mutate(`"maxRunners": 3`, `"maxRunners": -1`),
-		"empty command":          mutate(`["/opt/runner/start"]`, `[""]`),
-		"negative interval":      mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"interval": "-1s"},`),
-		"negative gens":          mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"maxGensPerJob": -1},`),
-		"unrestricted and hosts": mutate(`"egressHosts": [`, `"unrestrictedEgress": true, "egressHosts": [`),
+		"empty":              []byte(`{}`),
+		"unknown field":      mutate(`"listen"`, `"secret": "x", "listen"`),
+		"bad duration":       mutate(`"90m"`, `"ninety"`),
+		"zero timeout":       mutate(`"90m"`, `"0s"`),
+		"http lux":           mutate(`https://lux.example.com`, `http://lux.example.com`),
+		"lux url creds":      mutate(`https://lux.example.com`, `https://u:p@lux.example.com`),
+		"bad repo":           mutate(`"acme/widgets"`, `"acme"`),
+		"dotdot repo":        mutate(`"acme/widgets"`, `"acme/.."`),
+		"duplicate repo":     mutate(`"acme/widgets"`, `"acme/widgets", "ACME/Widgets"`),
+		"no installation":    mutate(`"installationID": 42`, `"installationID": 0`),
+		"no runner group":    mutate(`"runnerGroupID": 1`, `"runnerGroupID": 0`),
+		"duplicate name":     mutate(`"name": "docker"`, `"name": "default"`),
+		"identical labels":   mutate(`"lux-docker"`, `"lux"`),
+		"subset labels":      mutate(`"self-hosted", "linux", "lux-docker"`, `"self-hosted", "linux"`),
+		"duplicate label":    mutate(`"lux-docker"`, `"LINUX"`),
+		"no pool":            mutate(`"lux-docker"], "pool": "gha"`, `"lux-docker"], "pool": ""`),
+		"trailing data":      []byte(validConfig + `{}`),
+		"trailing brace":     []byte(validConfig + "\n}"),
+		"trailing bracket":   []byte(validConfig + "]"),
+		"trailing garbage":   []byte(validConfig + " x"),
+		"negative resource":  mutate(`"cpus": 2`, `"cpus": -1`),
+		"no instance":        mutate(`"instance": "prod-1",`, ``),
+		"uppercase instance": mutate(`"prod-1"`, `"Prod"`),
+		"long instance":      mutate(`"prod-1"`, `"abcdefghijklmnopqrstu"`),
+		"trailing dash":      mutate(`"prod-1"`, `"prod-"`),
+		"no maxRunners":      mutate(`"maxRunners": 10,`, ``),
+		"negative route cap": mutate(`"maxRunners": 3`, `"maxRunners": -1`),
+		"empty command":      mutate(`["/opt/runner/start"]`, `[""]`),
+		"negative interval":  mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"interval": "-1s"},`),
+		"negative gens":      mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"maxGensPerJob": -1},`),
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -96,6 +95,14 @@ func TestParseRejectsInvalidInputs(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestParseRejectsUnrestrictedEgressWithHosts(t *testing.T) {
+	_, err := Parse(mutate(`"egressHosts": [`, `"unrestrictedEgress": true, "egressHosts": [`))
+	want := `route "default": unrestrictedEgress and egressHosts are mutually exclusive`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %v, want it to contain %q", err, want)
 	}
 }
 
@@ -114,6 +121,11 @@ func TestParseEgressModes(t *testing.T) {
 	}
 	if _, err := Parse(mutate(`"egressHosts": [`, `"unrestrictedEgress": false, "egressHosts": [`)); err != nil {
 		t.Fatalf("unrestrictedEgress false with hosts rejected: %v", err)
+	}
+	// An empty host list is no hosts: compatible with unrestricted.
+	c, err = Parse(mutate(`"nestedContainers": true,`, `"nestedContainers": true, "unrestrictedEgress": true, "egressHosts": [],`))
+	if err != nil || !c.Routes[1].UnrestrictedEgress || len(c.Routes[1].EgressHosts) != 0 {
+		t.Fatalf("unrestrictedEgress with empty egressHosts: %+v err=%v", c.Routes[1], err)
 	}
 }
 
