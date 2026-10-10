@@ -178,6 +178,31 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 	}
 }
 
+func TestUnrestrictedEgressRouteSubmitsUnrestrictedNetwork(t *testing.T) {
+	e := newEnv(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`, `"unrestrictedEgress": true`))
+	e.gh.queue(7, "queued", "self-hosted", "lux")
+	e.gh.queue(8, "queued", "lux-big")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 2 {
+		t.Fatalf("status %+v", st)
+	}
+	network := map[string]string{}
+	for _, r := range e.lux.all() {
+		wire, err := json.Marshal(r.spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var w struct{ Network json.RawMessage }
+		if err := json.Unmarshal(wire, &w); err != nil {
+			t.Fatal(err)
+		}
+		network[r.run.Labels[LabelRoute]] = string(w.Network)
+	}
+	// "big" sets neither field: default deny with no rules, so no network.
+	if network["default"] != `{"unrestricted":true}` || network["big"] != `{}` {
+		t.Fatalf("network per route %v", network)
+	}
+}
+
 func mapsEqual(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

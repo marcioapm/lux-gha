@@ -78,6 +78,9 @@ type Route struct {
 	MaxRunners int `json:"maxRunners"`
 	// Command overrides DefaultCommand, the runner image's entrypoint.
 	Command []string `json:"command"`
+	// UnrestrictedEgress turns Lux's egress filtering off for the route's
+	// Runs. Without it, a Run reaches only EgressHosts, and nothing if empty.
+	UnrestrictedEgress bool `json:"unrestrictedEgress"`
 }
 
 var DefaultCommand = []string{"/usr/local/bin/lux-gha-runner"}
@@ -260,6 +263,9 @@ func (c *Config) validate() error {
 			if h == "" || strings.ContainsAny(h, " /:") {
 				add("route %q: invalid egress host %q", r.Name, h)
 			}
+		}
+		if r.UnrestrictedEgress && len(r.EgressHosts) > 0 {
+			add("route %q: unrestrictedEgress and egressHosts are mutually exclusive", r.Name)
 		}
 	}
 	// A job requesting the smaller set would satisfy both routes.

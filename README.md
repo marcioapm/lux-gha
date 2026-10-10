@@ -171,6 +171,7 @@ also starts rootless Docker first when the image has it.
 - **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
 - **`reconcile`**: optional; the values shown are the defaults.
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
+- **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.
 - **`runnerGroupID`**: required by `generate-jitconfig`. Read the repository's runner group ID from GitHub rather than assuming `1`.
 - **`apiURL`**: optional. It defaults to `https://api.github.com` and must be HTTPS. Plain HTTP is accepted only for loopback test servers. The API host never comes from webhook payloads.

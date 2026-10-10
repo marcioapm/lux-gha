@@ -62,6 +62,8 @@ privileged. Only a real nested Run proves that Docker works under Lux.
   entrypoint exits 1 because dockerd cannot start.
 - Docker's store sits on the ephemeral volume Lux mounts at `~/.local/share/docker`, so `diskGiB` must
   also hold the job's images and build cache.
+- `egressHosts` or `unrestrictedEgress: true`, never both. With neither, the Run has no network and the
+  runner cannot reach GitHub. For the pilot, see [Pilot egress](#pilot-egress).
 
 ### Egress
 
@@ -110,8 +112,11 @@ The table covers the runner and the tools named above. The first pilot workflow'
 - `builds.dotnet.microsoft.com`;
 - the Maven and Gradle plugin repositories and PyPI hosts its build resolves from.
 
-These come from reading the build, not from observing it. Start the pilot pool with unrestricted egress.
-Then tighten `egressHosts` from the DNS names Lux records for real Runs.
+These come from reading the build, not from observing it. Start the pilot route with
+`"unrestrictedEgress": true` and no `egressHosts` (see [Configuration](../../README.md#configuration)).
+An unrestricted Run uses the host's resolvers, not Lux's DNS stub, so Lux records no `dns` events for it.
+To tighten, run a route with `egressHosts` from the table above plus the list here, and add the refused
+names Lux records as `dns` events for its Runs.
 
 ### BuildKit driver
 

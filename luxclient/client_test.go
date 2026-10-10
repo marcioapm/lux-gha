@@ -139,6 +139,36 @@ func TestCreateMinimalSpecOmitsOptionalFields(t *testing.T) {
 	}
 }
 
+func TestCreateNetworkWire(t *testing.T) {
+	cases := map[string]struct {
+		spec RunSpec
+		want string
+	}{
+		"host rules": {
+			RunSpec{ImageRef: "img", Command: []string{"run"}, Egress: []EgressRule{{Host: "github.com"}}},
+			`{"image":{"ref":"img"},"workload":{"adapter":"generic","command":["run"]},
+				"resources":{},"placement":{},"network":{"egress":[{"host":"github.com"}]},"sandbox":{},"resumePolicy":"never"}`,
+		},
+		"unrestricted": {
+			RunSpec{ImageRef: "img", Command: []string{"run"}, UnrestrictedEgress: true},
+			`{"image":{"ref":"img"},"workload":{"adapter":"generic","command":["run"]},
+				"resources":{},"placement":{},"network":{"unrestricted":true},"sandbox":{},"resumePolicy":"never"}`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				jsonEqual(t, body, tc.want)
+				writeJSON(w, http.StatusCreated, createdRun)
+			})
+			if _, err := c.Create(context.Background(), "k", tc.spec); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCreateIdempotentReplayIsAccepted(t *testing.T) {
 	keys := map[string]int{}
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +290,7 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 		"secret in name":      {"k", leak(func(s *RunSpec) { s.Name = "JITCONFIG-SECRET-VALUE" })},
 		"egress both":         {"k", leak(func(s *RunSpec) { s.Egress = []EgressRule{{Host: "a", CIDR: "1.2.3.0/24"}} })},
 		"egress bad cidr":     {"k", leak(func(s *RunSpec) { s.Egress = []EgressRule{{CIDR: "nope"}} })},
+		"egress unrestricted": {"k", leak(func(s *RunSpec) { s.UnrestrictedEgress = true })},
 		"negative resources":  {"k", leak(func(s *RunSpec) { s.Resources.CPUs = -1 })},
 		"reserved env":        {"k", leak(func(s *RunSpec) { s.Env["LUX_X"] = "1" })},
 	}

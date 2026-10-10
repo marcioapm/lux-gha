@@ -741,6 +741,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		Pool:      route.Pool,
 		Sandbox:   luxclient.Sandbox{NestedContainers: route.NestedContainers},
 	}
+	spec.UnrestrictedEgress = route.UnrestrictedEgress
 	for _, h := range route.EgressHosts {
 		spec.Egress = append(spec.Egress, luxclient.EgressRule{Host: h})
 	}

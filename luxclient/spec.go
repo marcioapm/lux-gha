@@ -51,7 +51,10 @@ type RunSpec struct {
 	Timeout time.Duration
 	Pool    string
 	Egress  []EgressRule
-	Sandbox Sandbox
+	// UnrestrictedEgress sends network.unrestricted: Lux stops filtering the
+	// Run's egress (its hard blocks still apply). Exclusive with Egress.
+	UnrestrictedEgress bool
+	Sandbox            Sandbox
 }
 
 // FileSecret is delivered by Lux on a tmpfs linked at Path ("as": "file").
@@ -119,7 +122,8 @@ type wirePlacement struct {
 }
 
 type wireNetwork struct {
-	Egress []EgressRule `json:"egress,omitempty"`
+	Egress       []EgressRule `json:"egress,omitempty"`
+	Unrestricted bool         `json:"unrestricted,omitempty"`
 }
 
 func (s RunSpec) MarshalJSON() ([]byte, error) {
@@ -134,7 +138,7 @@ func (s RunSpec) MarshalJSON() ([]byte, error) {
 		Env:          s.Env,
 		Resources:    s.Resources,
 		Placement:    wirePlacement{Pool: s.Pool},
-		Network:      wireNetwork{Egress: s.Egress},
+		Network:      wireNetwork{Egress: s.Egress, Unrestricted: s.UnrestrictedEgress},
 		Sandbox:      s.Sandbox,
 		ResumePolicy: ResumePolicyNever,
 	}
@@ -177,6 +181,9 @@ func (s RunSpec) Validate() error {
 		if strings.HasPrefix(k, "LUX_") {
 			fail("env %q: the LUX_ prefix is reserved", k)
 		}
+	}
+	if s.UnrestrictedEgress && len(s.Egress) > 0 {
+		fail("egress rules and unrestricted egress are mutually exclusive")
 	}
 	for i, e := range s.Egress {
 		switch {
