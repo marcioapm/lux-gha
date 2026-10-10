@@ -53,6 +53,8 @@ jobs:
 
       # An expression inside run: is pasted into the script unescaped (a tag name may
       # hold ; | ` $( ' "): pass such values through env: instead.
+      # A line heuristic: a key-shaped line inside a run: block slips through, and
+      # an expression in a with:/env: block scalar or a comment fails it.
       - name: No expressions inside run
         run: |
           awk '/\$\{\{/ && (!/^[[:space:]]*(- )?[A-Za-z0-9_-]+:[[:space:]]/ || /^[[:space:]]*(- )?run:/) { print FILENAME ":" FNR ": " $0; bad = 1 } END { exit bad }' .github/workflows/*.yml
