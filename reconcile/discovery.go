@@ -86,8 +86,11 @@ func (r *Reconciler) NoteQueued(fullName string, jobID int64) {
 	r.disc.mu.Unlock()
 }
 
-// noteUnlisted makes the next woken pass read a repository a delivery
-// named before the set listed it, once a refresh lists it.
+// noteUnlisted makes the next pass read a repository a delivery named
+// before the set listed it, once a refresh lists it: that read makes it known,
+// so requireKnown stops blocking woken passes without waiting for a tick. A
+// matching queued delivery already does this through NoteQueued; this covers
+// any other workflow_job from the repository.
 func (r *Reconciler) noteUnlisted(fullName string) {
 	r.disc.mu.Lock()
 	r.disc.delivered[strings.ToLower(fullName)] = true

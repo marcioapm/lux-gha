@@ -193,7 +193,8 @@ loop. The startup pass reads every repository once, at about 3 requests each
 
 Hot reads happen once per tick: `hot × ~4 requests × 60` per hour. A woken
 pass costs about `K × 4` requests, K being the repositories with a delivery
-since the previous pass, whatever the hot set; so wakes, at most every 5 s,
+since the previous pass, whatever the hot set (plus one listing page when an
+installation event asked for a refresh); so wakes, at most every 5 s,
 add about 4 requests per delivered repository rather than a hot-set read.
 During a burst the hot set is bounded by free capacity, not by the
 installation: repositories with live Runs (at most `maxRunners`), demand only
@@ -250,7 +251,14 @@ read.
   Run is created by any pass, tick or woken, while a repository in the set
   has not been read successfully since startup and was not read in that pass.
   The first tick pass selects every such repository; a woken pass before it
-  reads only its delivered repositories and so creates nothing.
+  reads only its delivered repositories and so creates nothing. The same holds
+  for a repository just added to the installation: woken passes create
+  nothing until the next tick pass reads it, at most one `interval` later.
+- **Deliveries across a pause.** A delivery that arrives while passes are
+  paused (rate limit, Lux outage) is read by the first pass after the pause,
+  however long it was: a tick pass reads every repository delivered since the
+  last pass as well as every marked one, and a pass that selected a delivered
+  repository but did not read it hands it to the next.
 - **Adoption of late Runs.** A submission whose outcome was unknown commits
   into Lux; the next tick pass's Lux listing makes its repository hot, so it
   is read and its job adopts the Run as before. An adopted Run counts against
