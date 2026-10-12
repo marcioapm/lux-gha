@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -1037,5 +1038,233 @@ func TestColdSweepHoldsWhenTheColdSetShrinks(t *testing.T) {
 		if !readEarly[repo] && !readLate[repo] {
 			t.Fatalf("%s unread for over 10m", repo)
 		}
+	}
+}
+
+// newWokenEnv has 30 installed repositories after the startup pass, with a
+// live Run in each of acme/r00 .. acme/r02: one whose job was cancelled (an
+// idle surplus runner), one whose runner ran its job and deregistered, and
+// one plain busy runner. acme/r03 holds an offline orphan registration.
+func newWokenEnv(t *testing.T, edits ...func(string) string) *env {
+	e := newDiscoveryEnv(t, 30, edits...)
+	for i := range 3 {
+		e.gh.queueIn(repoName(i), 70+int64(i), 7+int64(i), "queued", lux3...)
+	}
+	orphan := runnerIn(repoID(3), 9, 0)
+	e.gh.addRunner(repoName(3), 77, orphan)
+	e.gh.setOnline(orphan, false)
+	if st := e.pass(); st.Provisioned != 3 {
+		t.Fatalf("startup: %+v", st)
+	}
+	e.gh.complete(7, "cancelled")
+	if err := e.gh.pick(runnerIn(repoID(1), 8, 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.complete(8, "success")
+	if err := e.gh.pick(runnerIn(repoID(2), 9, 0), 9); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.takeReads()
+	return e
+}
+
+func readSet(reads map[string]int) []string {
+	return slices.Sorted(maps.Keys(reads))
+}
+
+func TestWokenPassReadsOnlyDeliveredRepositories(t *testing.T) {
+	e := newWokenEnv(t)
+	e.gh.queueIn(repoName(7), 170, 17, "queued", lux3...)
+	e.deliver("workflow_job", queuedDelivery(42, repoName(7), 17))
+	e.clock.Add(5 * time.Second)
+	st := e.wake()
+	if got := readSet(e.gh.takeReads()); !slices.Equal(got, []string{repoName(7)}) {
+		t.Fatalf("woken pass read %v", got)
+	}
+	if st.Provisioned != 1 || !slices.Equal(e.liveIn(repoID(7)), []string{"17"}) {
+		t.Fatalf("status %+v, runs %v", st, e.liveIn(repoID(7)))
+	}
+	// No delivery since: the next woken pass reads nothing.
+	e.clock.Add(5 * time.Second)
+	e.wake()
+	if reads := e.gh.takeReads(); len(reads) != 0 {
+		t.Fatalf("woken pass with no delivery read %v", reads)
+	}
+}
+
+// Over idleGrace of woken passes, nothing in the live-Run repositories is
+// read, deleted or terminated; the first tick pass reads them and, their
+// timers having run through the woken passes, cleans up at once.
+func TestWokenPassLeavesUnreadRepositoriesAlone(t *testing.T) {
+	e := newWokenEnv(t)
+	// The tick that first sees the surplus, the missing runner and the orphan.
+	e.clock.Add(time.Minute)
+	if st := e.pass(); st.Deleted != 0 || st.Terminated != 0 {
+		t.Fatalf("tick: %+v", st)
+	}
+	e.gh.takeReads()
+	for i := range 36 {
+		job := 100 + int64(i)
+		e.gh.queueIn(repoName(10+i%10), 1000+job, job, "queued", lux3...)
+		e.gh.pickElsewhere(repoName(10+i%10), job, 9000+job, "elsewhere")
+		e.deliver("workflow_job", queuedDelivery(42, repoName(10+i%10), job))
+		e.clock.Add(5 * time.Second)
+		e.wake()
+		for repo := range e.gh.takeReads() {
+			if repo != repoName(10+i%10) {
+				t.Fatalf("woken pass %d read %s", i, repo)
+			}
+		}
+	}
+	if len(e.lux.terminatedIDs()) != 0 || len(e.gh.deletedNames()) != 0 || len(e.lux.live()) != 3 {
+		t.Fatalf("woken passes acted on unread repositories: terminated %v deleted %v", e.lux.terminatedIDs(), e.gh.deletedNames())
+	}
+	st := e.pass()
+	reads := e.gh.takeReads()
+	for i := range 4 {
+		if reads[repoName(i)] == 0 {
+			t.Fatalf("tick pass skipped hot %s: reads %v", repoName(i), readSet(reads))
+		}
+	}
+	// The surplus runner and the orphan deleted, the surplus Run and the
+	// Run whose runner left terminated.
+	if st.Deleted != 2 || st.Terminated != 2 || len(e.lux.live()) != 1 {
+		t.Fatalf("tick after idleGrace: %+v, deleted %v", st, e.gh.deletedNames())
+	}
+}
+
+// A tick pass reads every hot repository: live Runs, remembered runners and
+// marks.
+func TestTickPassReadsTheFullHotSet(t *testing.T) {
+	e := newWokenEnv(t)
+	e.deliver("workflow_job", queuedDelivery(42, repoName(7), 17))
+	e.clock.Add(time.Minute)
+	e.pass()
+	reads := e.gh.takeReads()
+	for _, i := range []int{0, 1, 2, 3, 7} {
+		if reads[repoName(i)] == 0 {
+			t.Fatalf("tick pass skipped hot %s: reads %v", repoName(i), readSet(reads))
+		}
+	}
+}
+
+// A woken pass holds a cap slot for a remembered registration in a
+// repository it does not read, whose submission is unresolved.
+func TestWokenPassHoldsSlotsOfUnreadRegistrations(t *testing.T) {
+	e := newDiscoveryEnv(t, 30, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	e.gh.queueIn(repoName(0), 70, 7, "queued", lux3...)
+	e.lux.failCreate = 1
+	if st := e.pass(); st.Error != ErrLux || e.gh.jitCount() != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	e.gh.takeReads()
+	e.gh.queueIn(repoName(1), 80, 8, "queued", lux3...)
+	e.deliver("workflow_job", queuedDelivery(42, repoName(1), 8))
+	e.clock.Add(5 * time.Second)
+	st := e.wake()
+	if reads := readSet(e.gh.takeReads()); !slices.Equal(reads, []string{repoName(1)}) {
+		t.Fatalf("woken pass read %v", reads)
+	}
+	if st.Provisioned != 0 || len(e.liveIn(repoID(1))) != 0 {
+		t.Fatalf("created past the cap while job 7's submission was unresolved: %+v", st)
+	}
+}
+
+// After a restart, a woken pass before any tick pass has read the whole set
+// reads only the delivered repository and creates nothing: a repository not
+// read since startup may hold a registration from before the restart whose
+// submission is unresolved, here acme/r17's, and nothing of it is
+// remembered to hold its slot.
+func TestWokenPassBeforeTheFirstTickPassCreatesNothing(t *testing.T) {
+	e := newDiscoveryEnv(t, 30, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	name := runnerIn(repoID(17), 9, 0)
+	e.gh.addRunner(repoName(17), 77, name)
+	e.gh.setOnline(name, false)
+	// The startup tick pass is rate-limited before it reads anything.
+	e.gh.rateLimitUntil = e.clock.Now().Add(30 * time.Second)
+	if st := e.pass(); st.Error != ErrRateLimited || len(e.gh.takeReads()) != 0 {
+		t.Fatalf("startup: %+v", st)
+	}
+	e.gh.queueIn(repoName(3), 30, 3, "queued", lux3...)
+	e.deliver("workflow_job", queuedDelivery(42, repoName(3), 3))
+	e.clock.Add(35 * time.Second)
+	st := e.wake()
+	if reads := readSet(e.gh.takeReads()); !slices.Equal(reads, []string{repoName(3)}) {
+		t.Fatalf("woken pass read %v", reads)
+	}
+	if st.Provisioned != 0 || e.lux.createCount() != 0 || e.gh.jitCount() != 0 {
+		t.Fatalf("created before acme/r17 was read: %+v", st)
+	}
+	// The next tick pass reads every repository; the registration holds the
+	// one slot until orphan cleanup deletes it.
+	e.clock.Add(25 * time.Second)
+	if st := e.pass(); st.Provisioned != 0 || e.gh.takeReads()[repoName(17)] == 0 {
+		t.Fatalf("tick: %+v", st)
+	}
+	for range 4 {
+		e.clock.Add(time.Minute)
+		if st := e.pass(); st.Provisioned == 1 {
+			if !slices.Contains(e.gh.deletedNames(), name) {
+				t.Fatalf("created while %s was unresolved", name)
+			}
+			return
+		}
+	}
+	t.Fatal("never created once acme/r17 was read")
+}
+
+// A tick buffered while Run waits out minGap for a wake makes that pass a
+// tick pass, which reads the hot set; without one the pass is woken.
+func TestFoldedTickMakesAWokenPassATickPass(t *testing.T) {
+	for _, folded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("folded=%v", folded), func(t *testing.T) {
+			e := newWokenEnv(t)
+			tick := make(chan time.Time, 1)
+			e.rec.ticker = func(time.Duration) (<-chan time.Time, func()) { return tick, func() {} }
+			l := e.startLoop()
+			l.pass()
+			e.gh.takeReads()
+			e.deliver("workflow_job", queuedDelivery(42, repoName(7), 17))
+			if d := l.gap(); d != 5*time.Second {
+				t.Fatalf("gap %v", d)
+			}
+			if folded {
+				tick <- e.clock.Now()
+			}
+			e.clock.Add(5 * time.Second)
+			l.fire <- e.clock.Now()
+			l.pass()
+			reads := e.gh.takeReads()
+			if reads[repoName(7)] == 0 {
+				t.Fatalf("the delivered repository was not read: %v", readSet(reads))
+			}
+			if hot := reads[repoName(0)] > 0 && reads[repoName(3)] > 0; hot != folded {
+				t.Fatalf("hot set read=%v with folded=%v: %v", hot, folded, readSet(reads))
+			}
+		})
+	}
+}
+
+// With an explicit list a woken pass reads every listed repository, as a
+// tick pass does.
+func TestExplicitListWokenPassReadsEveryRepository(t *testing.T) {
+	e := newEnv(t, twoRepos(10))
+	e.gh.addRepo("acme/gadgets", 1002)
+	e.gh.queueIn("acme/gadgets", 70, 7, "queued", lux3...)
+	e.pass()
+	e.gh.takeReads()
+	e.gh.queue(8, "queued", lux3...)
+	e.deliver("workflow_job", queuedDelivery(42, widgets, 8))
+	e.clock.Add(5 * time.Second)
+	woken := e.wake()
+	wokenReads := e.gh.takeReads()
+	e.clock.Add(time.Minute)
+	e.pass()
+	tickReads := e.gh.takeReads()
+	if !slices.Equal(readSet(wokenReads), []string{"acme/gadgets", widgets}) || wokenReads["acme/gadgets"] != tickReads["acme/gadgets"] {
+		t.Fatalf("woken reads %v, tick reads %v", wokenReads, tickReads)
+	}
+	if woken.Provisioned != 1 || len(e.liveIn(1001)) != 1 {
+		t.Fatalf("woken: %+v", woken)
 	}
 }
