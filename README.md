@@ -217,9 +217,7 @@ repositories, so it leaves more repositories unread than a tick pass; the
 rules need nothing more of it than they need of a tick pass with a failed
 read.
 
-- **Unread repositories.** Nothing is created, terminated or deleted for a
-  repository the pass did not read, and its live Runs count against both caps
-  through the Lux listing. A hot repository is read every tick pass, so a
+- **Unread repositories.** A hot repository is read every tick pass, so a
   repository a tick pass leaves unread has no live Run and no remembered
   runner, unless its read failed or it left the set; then its live Runs are
   kept and counted all the same. A woken pass leaves hot repositories unread
