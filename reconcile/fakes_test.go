@@ -81,6 +81,9 @@ type fakeGitHub struct {
 	perPage int
 	// endlessListing makes every installation repository page claim a next one.
 	endlessListing bool
+	// listTwice names a repository the installation listing returns twice,
+	// as offset paging does when the set changes between pages.
+	listTwice string
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
 }
@@ -290,6 +293,9 @@ func (f *fakeGitHub) ListInstallationRepositories(_ context.Context, installatio
 		r := f.repos[full]
 		if !r.uninstalled {
 			all = append(all, githubapp.InstallationRepository{ID: r.id, FullName: full, Archived: r.archived, Disabled: r.disabled})
+			if f.listTwice == full {
+				all = append(all, all[len(all)-1])
+			}
 		}
 	}
 	items, next := page(all, opts, f.perPage)

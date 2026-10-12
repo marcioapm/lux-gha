@@ -966,6 +966,20 @@ func TestUnservableDemandIsColdUntilASlotFrees(t *testing.T) {
 	}
 }
 
+// A repository listed on two pages is read, and acted on, once.
+func TestRepositoryListedTwiceIsReadOnce(t *testing.T) {
+	e := newDiscoveryEnv(t, 3)
+	e.gh.listTwice = repoName(1)
+	e.gh.queueIn(repoName(1), 70, 7, "queued", lux3...)
+	if st := e.pass(); st.Demand["default"] != 1 || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	// 2 run lists, 1 job list, 1 runner list, 1 JIT registration.
+	if reads := e.gh.takeReads(); reads[repoName(1)] != 5 {
+		t.Fatalf("reads %v", reads)
+	}
+}
+
 // The listing stops at its page bound.
 func TestInstallationListingStopsAtItsPageBound(t *testing.T) {
 	e := newDiscoveryEnv(t, 1)
