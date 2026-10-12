@@ -5,7 +5,9 @@
 // supply (live Lux Runs) level with demand (queued jobs) and removes runners
 // nobody needs. All state it acts on is re-read every pass from GitHub and
 // from Lux Run labels; the in-memory timers only delay cleanup after a
-// restart, they never cause an action on their own.
+// restart, they never cause an action on their own. A repository not read
+// in a pass is unknown to it: nothing is created or removed there, and its
+// live Runs still count against the caps.
 package reconcile
 
 import (
@@ -61,6 +63,7 @@ type GitHub interface {
 	ListRepoRunners(context.Context, githubapp.Repository, githubapp.RunnerListOptions) (githubapp.RunnerPage, error)
 	GenerateRepoJITConfig(context.Context, githubapp.Repository, githubapp.JITConfigRequest) (githubapp.JITConfig, error)
 	DeleteRepoRunner(context.Context, githubapp.Repository, int64) error
+	ListInstallationRepositories(context.Context, int64, githubapp.PageOptions) (githubapp.InstallationRepositoryPage, error)
 }
 
 type Lux interface {
@@ -124,6 +127,7 @@ type Reconciler struct {
 	surplusSince     map[string]time.Time // runner name: idle while its trigger job is not queued
 	missingSince     map[string]time.Time // Run id: live Run whose runner is not registered
 	offlineSince     map[string]time.Time // runner name: registered runner with no live Run
+	disc             *discovery           // nil with an explicit repository list
 
 	mu     sync.Mutex
 	status Status
@@ -142,14 +146,18 @@ func New(o Options) (*Reconciler, error) {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Reconciler{
+	r := &Reconciler{
 		cfg: o.Config, gh: o.GitHub, lux: o.Lux, host: o.Host, now: o.Now, after: o.After, log: o.Log,
 		wake:         make(chan struct{}, 1),
 		repoIDs:      map[string]int64{},
 		surplusSince: map[string]time.Time{},
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
-	}, nil
+	}
+	if o.Config.DiscoverRepositories() {
+		r.disc = newDiscovery()
+	}
+	return r, nil
 }
 
 // Wake requests a pass without blocking; wakes before the next pass coalesce.
@@ -305,12 +313,36 @@ func (p *pass) rateLimited(err error) bool {
 }
 
 func (p *pass) run() error {
-	if err := p.readGitHub(); err != nil {
+	if p.r.disc != nil {
+		return p.runDiscovered()
+	}
+	if err := p.readGitHub(p.r.cfg.Repositories); err != nil {
 		return err
 	}
 	if err := p.readLux(); err != nil {
 		return err
 	}
+	return p.act()
+}
+
+// runDiscovered reads Lux before GitHub: the live Runs decide which
+// repositories are hot and must be read.
+func (p *pass) runDiscovered() error {
+	defer p.recordReads()
+	if err := p.refreshRepositories(); err != nil {
+		return err
+	}
+	p.forgetRemoved()
+	if err := p.readLux(); err != nil {
+		return err
+	}
+	if err := p.readGitHub(p.selectRepositories()); err != nil {
+		return err
+	}
+	return p.act()
+}
+
+func (p *pass) act() error {
 	if err := p.provision(); err != nil {
 		return err
 	}
@@ -320,9 +352,11 @@ func (p *pass) run() error {
 	return p.cleanUp()
 }
 
-func (p *pass) readGitHub() error {
+// readGitHub reads each named repository. Every later step acts only on
+// repositories read successfully here; any other is unknown this pass.
+func (p *pass) readGitHub(repositories []string) error {
 	budget := p.r.cfg.Reconcile.MaxJobsPerPass
-	for _, full := range p.r.cfg.Repositories {
+	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
 			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}}
@@ -330,6 +364,7 @@ func (p *pass) readGitHub() error {
 		if p.rateLimited(err) {
 			return errAbort
 		}
+		p.noteRead(full, err == nil)
 		if err != nil {
 			// A partial view could hide registered runners; act on none of it.
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
@@ -495,6 +530,7 @@ func (p *pass) provision() error {
 	if err := p.classifyRegistrations(classified); err != nil {
 		return err
 	}
+	p.holdUnreadRegistrations()
 	if p.unread && len(todo) > 0 {
 		// Its registrations, and so its unresolved submissions, are unknown:
 		// any creation could exceed a cap once they commit.

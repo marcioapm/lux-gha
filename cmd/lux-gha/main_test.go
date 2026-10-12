@@ -56,10 +56,21 @@ func fakeLux(t *testing.T, version string) string {
 // runs or runners, and sends on passes each time a reconciler pass lists the
 // repository's runners, its last GitHub read.
 func fakeGitHub(t *testing.T) (string, chan struct{}) {
+	url, passes, _ := fakeInstallation(t)
+	return url, passes
+}
+
+// fakeInstallation is fakeGitHub that also lists acme/widgets as the
+// installation's one repository, sending on listings each time.
+func fakeInstallation(t *testing.T) (string, chan struct{}, chan struct{}) {
 	t.Helper()
 	passes := make(chan struct{}, 16)
+	listings := make(chan struct{}, 16)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
+			io.WriteString(w, `{"total_count":1,"repositories":[{"id":1001,"full_name":"acme/widgets"}]}`)
+			listings <- struct{}{}
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
 			w.WriteHeader(http.StatusCreated)
 			fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339))
@@ -76,7 +87,7 @@ func fakeGitHub(t *testing.T) (string, chan struct{}) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL, passes
+	return srv.URL, passes, listings
 }
 
 // closedGitHub is a loopback URL nothing listens on: every pass fails at GitHub.
@@ -84,7 +95,7 @@ const closedGitHub = "http://127.0.0.1:1"
 
 // writeConfig writes a valid configuration and its secret files to a temp
 // directory.
-func writeConfig(t *testing.T, luxURL, githubURL string) string {
+func writeConfig(t *testing.T, luxURL, githubURL string, edits ...func(map[string]any)) string {
 	t.Helper()
 	dir := t.TempDir()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -115,6 +126,9 @@ func writeConfig(t *testing.T, luxURL, githubURL string) string {
 			"name": "default", "labels": []string{"self-hosted", "linux", "lux"}, "pool": "gha",
 			"image": "ghcr.io/acme/runner@sha256:abc", "timeout": "90m",
 		}},
+	}
+	for _, edit := range edits {
+		edit(cfg)
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -276,6 +290,57 @@ func TestRunReconcilesAtStartupAndOnMatchingQueuedJobs(t *testing.T) {
 	postSigned(t, client, base, workflowJob("queued", `["self-hosted","lux"]`), http.StatusAccepted)
 	awaitPass(t, passes, "after a queued matching job")
 
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown err=%v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after cancellation")
+	}
+}
+
+// Without a repository list the installation's repositories are listed at
+// startup, and an installation_repositories delivery leads to a new listing.
+func TestRunDiscoversRepositoriesAndRefreshesOnInstallationChanges(t *testing.T) {
+	githubURL, passes, listings := fakeInstallation(t)
+	path := writeConfig(t, fakeLux(t, "v0.1.14"), githubURL, func(c map[string]any) { delete(c, "repositories") })
+	served := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, path, slog.New(servingHandler{served})) }()
+	var base string
+	select {
+	case addr := <-served:
+		base = "http://" + addr
+	case err := <-done:
+		t.Fatalf("run returned before serving: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not start serving")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	awaitPass(t, listings, "listing at startup")
+	awaitPass(t, passes, "reading the listed repository")
+
+	body := []byte(`{"action":"added","installation":{"id":42},"repositories_added":[{"id":1002,"full_name":"acme/gadgets"}]}`)
+	m := hmac.New(sha256.New, []byte(webhookSecret))
+	m.Write(body)
+	req, _ := http.NewRequest(http.MethodPost, base+"/webhook", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", "installation_repositories")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(m.Sum(nil)))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("installation_repositories status %d", resp.StatusCode)
+	}
+	// The refresh comes with the woken pass, within the 5 s minimum gap.
+	awaitPass(t, listings, "after installation_repositories")
 	cancel()
 	select {
 	case err := <-done:

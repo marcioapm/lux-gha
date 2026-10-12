@@ -40,6 +40,9 @@ type fakeRepo struct {
 	// unlisted runners exist but are missing from unfiltered listings, as a
 	// lagging listing would leave them.
 	unlisted map[string]bool
+	// archived, disabled and uninstalled shape GET /installation/repositories;
+	// an uninstalled repository is still readable, as a stale set would see it.
+	archived, disabled, uninstalled bool
 }
 
 // Fake GitHub operations, for fail.
@@ -49,6 +52,7 @@ const (
 	opRunners = "runners"
 	opJIT     = "jit"
 	opDelete  = "delete"
+	opInstall = "installation"
 )
 
 // fakeGitHub models one installation's repositories: workflow jobs with
@@ -63,6 +67,10 @@ type fakeGitHub struct {
 	jitSecret map[string]string // runner name -> issued JIT config
 	deleted   []string
 	calls     int
+	// installCalls counts GET /installation/repositories pages; reads counts
+	// calls per repository.
+	installCalls int
+	reads        map[string]int
 	// rateLimitUntil answers every call 429 until this time.
 	rateLimitUntil time.Time
 	// fail, when set, may fail an operation on a repository and page (0 for
@@ -77,7 +85,7 @@ type fakeGitHub struct {
 const widgets = "acme/widgets"
 
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
-	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2}
+	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2, reads: map[string]int{}}
 	f.addRepo(widgets, 1001)
 	return f
 }
@@ -90,10 +98,11 @@ func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
 
 func (f *fakeGitHub) gate(op string, repo githubapp.Repository, page int) (*fakeRepo, error) {
 	f.calls++
+	full := repo.Owner + "/" + repo.Name
+	f.reads[full]++
 	if f.clock.Now().Before(f.rateLimitUntil) {
 		return nil, &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: f.rateLimitUntil}
 	}
-	full := repo.Owner + "/" + repo.Name
 	if f.fail != nil {
 		if err := f.fail(op, full, page); err != nil {
 			return nil, err
@@ -255,6 +264,35 @@ func (f *fakeGitHub) GenerateRepoJITConfig(_ context.Context, repo githubapp.Rep
 	return githubapp.JITConfig{Runner: *rn, EncodedJITConfig: secret}, nil
 }
 
+// ListInstallationRepositories pages the installed repositories in name
+// order. fail sees the operation with an empty repository name.
+func (f *fakeGitHub) ListInstallationRepositories(_ context.Context, installationID int64, opts githubapp.PageOptions) (githubapp.InstallationRepositoryPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.installCalls++
+	if f.clock.Now().Before(f.rateLimitUntil) {
+		return githubapp.InstallationRepositoryPage{}, &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: f.rateLimitUntil}
+	}
+	if f.fail != nil {
+		if err := f.fail(opInstall, "", opts.Page); err != nil {
+			return githubapp.InstallationRepositoryPage{}, err
+		}
+	}
+	if installationID != 42 || opts.PerPage != 100 {
+		return githubapp.InstallationRepositoryPage{}, &githubapp.APIError{StatusCode: 400}
+	}
+	var all []githubapp.InstallationRepository
+	for _, full := range sortedKeys(f.repos) {
+		r := f.repos[full]
+		if !r.uninstalled {
+			all = append(all, githubapp.InstallationRepository{ID: r.id, FullName: full, Archived: r.archived, Disabled: r.disabled})
+		}
+	}
+	items, next := page(all, opts, f.perPage)
+	return githubapp.InstallationRepositoryPage{TotalCount: len(all), Repositories: items, HasNext: next}, nil
+}
+
 // DeleteRepoRunner answers 422 for a busy runner, as GitHub does ("Runner
 // ... is still running a job"; see the README).
 func (f *fakeGitHub) DeleteRepoRunner(_ context.Context, repo githubapp.Repository, id int64) error {
@@ -394,6 +432,15 @@ func (f *fakeGitHub) runnerNames() []string {
 
 func (f *fakeGitHub) jitCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return len(f.jit) }
 func (f *fakeGitHub) callCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.calls }
+
+// takeReads returns the per-repository call counts since the last call.
+func (f *fakeGitHub) takeReads() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.reads
+	f.reads = map[string]int{}
+	return out
+}
 func (f *fakeGitHub) deletedNames() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
