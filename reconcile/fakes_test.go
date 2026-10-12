@@ -79,7 +79,8 @@ type fakeGitHub struct {
 	fail func(op, repo string, page int) error
 	// perPage bounds page sizes to exercise paging.
 	perPage int
-	// endlessListing makes every installation repository page claim a next one.
+	// endlessListing makes installation repository pages claim a next one
+	// up to page 150, past the reconciler's bound.
 	endlessListing bool
 	// listTwice names a repository the installation listing returns twice,
 	// as offset paging does when the set changes between pages.
@@ -299,7 +300,7 @@ func (f *fakeGitHub) ListInstallationRepositories(_ context.Context, installatio
 		}
 	}
 	items, next := page(all, opts, f.perPage)
-	return githubapp.InstallationRepositoryPage{TotalCount: len(all), Repositories: items, HasNext: next || f.endlessListing}, nil
+	return githubapp.InstallationRepositoryPage{TotalCount: len(all), Repositories: items, HasNext: next || f.endlessListing && opts.Page < 150}, nil
 }
 
 // DeleteRepoRunner answers 422 for a busy runner, as GitHub does ("Runner
