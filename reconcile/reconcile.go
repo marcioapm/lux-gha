@@ -279,6 +279,9 @@ type repoView struct {
 }
 
 type pass struct {
+	// delivered: discovery mode, the delivered repositories this pass
+	// selected; recordReads returns the unread ones for the next pass.
+	delivered map[string]bool
 	r         *Reconciler
 	ctx       context.Context
 	woken     bool

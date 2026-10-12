@@ -70,8 +70,8 @@ func (r *Reconciler) AllowsRepository(fullName string) bool {
 }
 
 // NoteQueued records a queued delivery for a job a route serves; with
-// discovery the repository is then read every pass until a read lists the
-// job, for at most hotWindow after its last delivery.
+// discovery the repository is then read every tick pass until a read lists
+// the job, for at most hotWindow after its last delivery.
 func (r *Reconciler) NoteQueued(fullName string, jobID int64) {
 	if r.disc == nil {
 		return
@@ -234,10 +234,13 @@ func (p *pass) selectRepositories() []string {
 	for name := range d.marks {
 		marked[name] = true
 	}
-	// A tick pass reads every marked repository, which covers these too.
+	// A tick pass reads every delivered repository as well as every marked
+	// one: a pause (rate limit, Lux outage) can outlast hotWindow and prune
+	// the mark while the delivery is still unread.
 	delivered := d.delivered
 	d.delivered = map[string]bool{}
 	d.mu.Unlock()
+	p.delivered = delivered
 
 	if p.woken {
 		return p.selectDelivered(delivered)
@@ -247,7 +250,7 @@ func (p *pass) selectRepositories() []string {
 	hot, fresh := 0, 0
 	for _, repo := range d.repos {
 		switch {
-		case liveRepo[strconv.FormatInt(repo.id, 10)] || len(d.runners[repo.id]) > 0 || p.servable(d.demand[repo.id]) || marked[strings.ToLower(repo.full)]:
+		case liveRepo[strconv.FormatInt(repo.id, 10)] || len(d.runners[repo.id]) > 0 || p.servable(d.demand[repo.id]) || marked[strings.ToLower(repo.full)] || delivered[strings.ToLower(repo.full)]:
 			hot++
 			selected = append(selected, repo.full)
 		case !d.known[repo.id]:
@@ -414,6 +417,19 @@ func (p *pass) noteRead(full string, err error) {
 // pass, aborted or not.
 func (p *pass) recordReads() {
 	d := p.r.disc
+	if len(p.delivered) > 0 {
+		read := make(map[string]bool, len(p.repos))
+		for _, v := range p.repos {
+			read[strings.ToLower(v.full)] = true
+		}
+		d.mu.Lock()
+		for name := range p.delivered {
+			if !read[name] {
+				d.delivered[name] = true
+			}
+		}
+		d.mu.Unlock()
+	}
 	for _, v := range p.repos {
 		key := strings.ToLower(v.full)
 		d.mu.Lock()
@@ -452,8 +468,8 @@ func (p *pass) recordReads() {
 // holdUnreadRegistrations holds a cap slot, against the global cap and each
 // route its labels carry, for every managed runner remembered in a
 // repository not read this pass whose name no live Run carries: its
-// submission may still commit. Hot repositories are read every pass, so
-// this covers one whose read failed or that left the installation.
+// submission may still commit. Hot repositories are read every tick pass,
+// so this covers one whose read failed or that left the installation.
 func (p *pass) holdUnreadRegistrations() {
 	d := p.r.disc
 	if d == nil {

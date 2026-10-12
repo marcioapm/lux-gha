@@ -1268,3 +1268,27 @@ func TestExplicitListWokenPassReadsEveryRepository(t *testing.T) {
 		t.Fatalf("woken: %+v", woken)
 	}
 }
+
+// A delivery whose repository no pass read before hotWindow ran out (a
+// rate-limit pause longer than hotWindow) is still read by the next tick
+// pass, not left to the cold rotation.
+func TestDeliveryOutlastingHotWindowIsReadByTheNextTickPass(t *testing.T) {
+	for _, pause := range []time.Duration{90 * time.Second, 3 * time.Minute} {
+		t.Run(pause.String(), func(t *testing.T) {
+			e := newDiscoveryEnv(t, 30)
+			e.pass()
+			e.gh.takeReads()
+			e.gh.rateLimitUntil = e.clock.Now().Add(pause)
+			e.deliver("workflow_job", queuedDelivery(42, repoName(27), 27))
+			if st := e.pass(); st.Error != ErrRateLimited {
+				t.Fatalf("status %+v", st)
+			}
+			e.gh.takeReads()
+			e.clock.Add(pause + time.Second)
+			e.pass()
+			if e.gh.takeReads()[repoName(27)] == 0 {
+				t.Fatalf("acme/r27 delivered during a %s pause was not read by the first tick pass after it", pause)
+			}
+		})
+	}
+}
