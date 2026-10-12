@@ -340,9 +340,21 @@ func TestInstallationEventsAreSignedSignals(t *testing.T) {
 			}
 		})
 	}
-	// Without OnInstallation the events are ignored as before.
 	installs := &installRecorder{}
 	body := installationBody("added", 42)
+	// A signed delivery that is not JSON is refused before any callback.
+	withInstall := newHandler(t, (&recorder{}).on, nil)
+	withInstall.OnInstallation = installs.on
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-GitHub-Event", "installation_repositories")
+	req.Header.Set("X-Hub-Signature-256", sign(body))
+	w := httptest.NewRecorder()
+	withInstall.ServeHTTP(w, req)
+	if w.Code != http.StatusUnsupportedMediaType || len(installs.events) != 0 {
+		t.Fatalf("form-encoded: status %d, callbacks %d", w.Code, len(installs.events))
+	}
+	// Without OnInstallation the events are ignored as before.
 	if w := deliver(newHandler(t, (&recorder{}).on, nil), "installation_repositories", body, sign(body)); w.Code != http.StatusNoContent {
 		t.Fatalf("no callback: status %d", w.Code)
 	}
