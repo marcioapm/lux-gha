@@ -612,16 +612,53 @@ func TestUnresolvedRegistrationInAnUnreadRepositoryHoldsASlot(t *testing.T) {
 	e.deliver("installation_repositories", installationDelivery("removed", 42))
 	e.gh.queueIn(repoName(1), 80, 8, "queued", lux3...)
 	e.deliver("workflow_job", queuedDelivery(42, repoName(1), 8))
-	e.clock.Add(time.Minute)
-	e.pass()
-	e.clock.Add(time.Minute - time.Second)
-	if st := e.pass(); st.Provisioned != 0 || e.gh.takeReads()[repoName(1)] == 0 {
-		t.Fatalf("created past the cap while job 7's submission was unresolved: %+v", st)
+	for _, step := range []time.Duration{time.Minute, time.Minute - time.Second} {
+		e.clock.Add(step)
+		st := e.pass()
+		if e.gh.takeReads()[repoName(1)] == 0 || st.Demand["default"] != 1 || len(e.liveIn(repoID(1))) != 0 {
+			t.Fatalf("created past the cap while job 7's submission was unresolved: %+v", st)
+		}
 	}
 	// idleGrace after the repository left, its registration is forgotten.
 	e.clock.Add(2 * time.Minute)
 	e.pass()
 	if len(e.liveIn(repoID(1))) != 1 {
 		t.Fatalf("runs %v", e.liveIn(repoID(1)))
+	}
+}
+
+// Cold repositories read early in a sweep turning hot leave the unread ones
+// paced over a smaller set; each is still read within coldSweep.
+func TestColdSweepHoldsWhenTheColdSetShrinks(t *testing.T) {
+	e := newDiscoveryEnv(t, 39)
+	e.pass()
+	start := e.clock.Now()
+	e.gh.takeReads()
+	readEarly := map[string]bool{}
+	for range 5 {
+		e.clock.Add(time.Minute)
+		e.pass()
+		for repo := range e.gh.takeReads() {
+			readEarly[repo] = true
+		}
+	}
+	if len(readEarly) == 0 || len(readEarly) >= 40 {
+		t.Fatalf("%d read in 5 minutes", len(readEarly))
+	}
+	for repo := range readEarly {
+		e.deliver("workflow_job", queuedDelivery(42, repo, 1))
+	}
+	readLate := map[string]bool{}
+	for e.clock.Now().Sub(start) < 10*time.Minute {
+		e.clock.Add(time.Minute)
+		e.pass()
+		for repo := range e.gh.takeReads() {
+			readLate[repo] = true
+		}
+	}
+	for repo := range e.gh.repos {
+		if !readEarly[repo] && !readLate[repo] {
+			t.Fatalf("%s unread for over 10m", repo)
+		}
 	}
 }
