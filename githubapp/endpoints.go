@@ -242,10 +242,14 @@ func (c *Client) list(ctx context.Context, repo Repository, suffix string, q url
 	if err != nil {
 		return false, err
 	}
+	return c.listPath(ctx, repo.InstallationID, path, q, out)
+}
+
+func (c *Client) listPath(ctx context.Context, installationID int64, path string, q url.Values, out any) (bool, error) {
 	if encoded := q.Encode(); encoded != "" {
 		path += "?" + encoded
 	}
-	header, err := c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, out)
+	header, err := c.installationRequest(ctx, installationID, http.MethodGet, path, nil, http.StatusOK, out)
 	if err != nil {
 		return false, err
 	}
@@ -255,6 +259,44 @@ func (c *Client) list(ctx context.Context, repo Repository, suffix string, q url
 		}
 	}
 	return false, nil
+}
+
+// InstallationRepository is the subset of a repository in
+// GET /installation/repositories the bridge reads.
+type InstallationRepository struct {
+	ID       int64  `json:"id"`
+	FullName string `json:"full_name"`
+	Archived bool   `json:"archived"`
+	Disabled bool   `json:"disabled"`
+}
+
+type InstallationRepositoryPage struct {
+	TotalCount   int                      `json:"total_count"`
+	Repositories []InstallationRepository `json:"repositories"`
+	HasNext      bool                     `json:"-"`
+}
+
+// ListInstallationRepositories lists one page of the repositories the
+// installation can access, with the installation's own token.
+func (c *Client) ListInstallationRepositories(ctx context.Context, installationID int64, opts PageOptions) (InstallationRepositoryPage, error) {
+	var out InstallationRepositoryPage
+	if installationID <= 0 {
+		return out, errors.New("githubapp: installation ID must be positive")
+	}
+	q, err := opts.query()
+	if err != nil {
+		return out, err
+	}
+	out.HasNext, err = c.listPath(ctx, installationID, "/installation/repositories", q, &out)
+	if err != nil {
+		return InstallationRepositoryPage{}, err
+	}
+	for _, r := range out.Repositories {
+		if r.ID <= 0 || r.FullName == "" {
+			return InstallationRepositoryPage{}, errors.New("githubapp: invalid installation repository response")
+		}
+	}
+	return out, nil
 }
 
 func (o PageOptions) query() (url.Values, error) {

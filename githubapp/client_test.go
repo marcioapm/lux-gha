@@ -485,6 +485,45 @@ func TestListAndDeleteRunners(t *testing.T) {
 	}
 }
 
+func TestListInstallationRepositoriesPages(t *testing.T) {
+	var body atomic.Value
+	body.Store(`{"total_count":3,"repositories":[{"id":1,"full_name":"acme/widgets","archived":false,"disabled":false},{"id":2,"full_name":"acme/old","archived":true}]}`)
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/installation/repositories" || !requireInstallationToken(w, r, "ghs_token1") {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query()
+		if q.Get("per_page") != "100" {
+			http.Error(w, "query", 400)
+			return
+		}
+		if q.Get("page") == "1" {
+			w.Header().Set("Link", `<https://api.github.com/installation/repositories?page=2>; rel="next", <https://api.github.com/installation/repositories?page=2>; rel="last"`)
+			w.Write([]byte(body.Load().(string)))
+			return
+		}
+		w.Header().Set("Link", `<https://api.github.com/installation/repositories?page=1>; rel="first"`)
+		w.Write([]byte(`{"total_count":3,"repositories":[{"id":3,"full_name":"acme/gadgets","disabled":true}]}`))
+	})
+	first, err := c.ListInstallationRepositories(context.Background(), 42, PageOptions{Page: 1, PerPage: 100})
+	if err != nil || !first.HasNext || len(first.Repositories) != 2 || first.Repositories[0].FullName != "acme/widgets" ||
+		first.Repositories[0].Archived || !first.Repositories[1].Archived {
+		t.Fatalf("page 1 %+v err=%v", first, err)
+	}
+	second, err := c.ListInstallationRepositories(context.Background(), 42, PageOptions{Page: 2, PerPage: 100})
+	if err != nil || second.HasNext || len(second.Repositories) != 1 || !second.Repositories[0].Disabled || second.Repositories[0].ID != 3 {
+		t.Fatalf("page 2 %+v err=%v", second, err)
+	}
+	body.Store(`{"total_count":1,"repositories":[{"full_name":"acme/widgets"}]}`)
+	if _, err := c.ListInstallationRepositories(context.Background(), 42, PageOptions{Page: 1, PerPage: 100}); err == nil {
+		t.Fatal("accepted a repository without id")
+	}
+	if _, err := c.ListInstallationRepositories(context.Background(), 0, PageOptions{}); err == nil {
+		t.Fatal("accepted installation 0")
+	}
+}
+
 func TestListWorkflowRunsAndJobs(t *testing.T) {
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
