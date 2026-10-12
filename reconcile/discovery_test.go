@@ -218,7 +218,6 @@ func TestWorkflowJobOutsideTheSetRefreshesAndIsServedOnceListed(t *testing.T) {
 func TestFailedRefreshKeepsTheLastSetAndRetries(t *testing.T) {
 	e := newDiscoveryEnv(t, 2)
 	e.pass()
-	e.gh.repo(repoName(1)).uninstalled = true
 	e.gh.fail = func(op, _ string, _ int) error {
 		if op == opInstall {
 			return &githubapp.APIError{StatusCode: 502}
@@ -242,6 +241,7 @@ func TestFailedRefreshKeepsTheLastSetAndRetries(t *testing.T) {
 	if e.installCalls() != calls+1 {
 		t.Fatal("a failed refresh was not retried on the next pass")
 	}
+	e.gh.repo(repoName(1)).uninstalled = true
 	e.gh.fail = nil
 	e.clock.Add(time.Minute)
 	if st := e.pass(); st.Error != "" || e.rec.AllowsRepository(repoName(1)) {
@@ -335,13 +335,24 @@ func TestLiveRunMakesARepositoryHot(t *testing.T) {
 	}
 }
 
+// withReconcile sets reconcile durations on the test configuration.
+func withReconcile(fields string) func(string) string {
+	return replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {`+fields+`}`)
+}
+
+// The job of a queued delivery is not yet listed by the runs API, so the
+// mark alone keeps its repository hot, for hotWindow after the latest
+// delivery.
 func TestQueuedDeliveryMakesARepositoryHotForHotWindow(t *testing.T) {
-	e := newDiscoveryEnv(t, 30)
+	e := newDiscoveryEnv(t, 30, withReconcile(`"hotWindow": "15m"`))
 	e.pass()
 	e.gh.takeReads()
 	if code := e.deliver("workflow_job", queuedDelivery(42, repoName(7), 7)); code != http.StatusAccepted {
 		t.Fatalf("status %d", code)
 	}
+	e.readEveryPass(repoName(7), 10*time.Minute)
+	// Delivered again (a re-run): hot until 15m after this delivery.
+	e.deliver("workflow_job", queuedDelivery(42, repoName(7), 7))
 	e.readEveryPass(repoName(7), 14*time.Minute)
 	// Past hotWindow it is cold again: some passes skip it.
 	skipped := 0
@@ -371,10 +382,45 @@ func TestQueuedDeliveryMakesARepositoryHotForHotWindow(t *testing.T) {
 	}
 }
 
+// A read that lists the delivered job ends its mark: here the job was
+// already picked elsewhere, so the repository has nothing to serve.
+func TestReadThatListsTheDeliveredJobEndsItsMark(t *testing.T) {
+	e := newDiscoveryEnv(t, 30, withReconcile(`"hotWindow": "15m"`))
+	e.pass()
+	e.gh.takeReads()
+	e.gh.queueIn(repoName(7), 70, 7, "queued", lux3...)
+	e.gh.pickElsewhere(repoName(7), 7, 900, "elsewhere")
+	// A second job whose delivery arrived before the runs API lists it.
+	e.deliver("workflow_job", queuedDelivery(42, repoName(7), 7))
+	e.deliver("workflow_job", queuedDelivery(42, repoName(8), 8))
+	e.clock.Add(time.Minute)
+	e.pass()
+	if reads := e.gh.takeReads(); reads[repoName(7)] == 0 || reads[repoName(8)] == 0 {
+		t.Fatalf("reads %v", reads)
+	}
+	// Job 8 is still not listed, so its mark holds for hotWindow; job 7's
+	// mark is gone.
+	skipped := 0
+	for range 10 {
+		e.clock.Add(time.Minute)
+		e.pass()
+		reads := e.gh.takeReads()
+		if reads[repoName(8)] == 0 {
+			t.Fatal("acme/r08 not read while its job is unlisted")
+		}
+		if reads[repoName(7)] == 0 {
+			skipped++
+		}
+	}
+	if skipped == 0 {
+		t.Fatal("still read every pass after a read listed its job")
+	}
+}
+
 // sweep runs passes a minute apart for d, with a woken pass every 5 s for the
 // first wakeFor, and returns, per repository, the longest gap between reads
-// and, per pass, the GitHub calls it made.
-func (e *env) sweep(d, wakeFor time.Duration, hot []string) (map[string]time.Duration, []int) {
+// and, per pass, the GitHub calls it made. Each hook runs ahead of pass i.
+func (e *env) sweep(d, wakeFor time.Duration, hot []string, hooks ...func(i int)) (map[string]time.Duration, []int) {
 	e.t.Helper()
 	last := map[string]time.Time{}
 	gaps := map[string]time.Duration{}
@@ -390,6 +436,9 @@ func (e *env) sweep(d, wakeFor time.Duration, hot []string) (map[string]time.Dur
 		}
 		e.clock.Add(step)
 		elapsed += step
+		for _, f := range hooks {
+			f(len(calls))
+		}
 		before := e.gh.callCount()
 		e.pass()
 		calls = append(calls, e.gh.callCount()-before)
@@ -418,13 +467,26 @@ func newBudgetEnv(t *testing.T) (*env, []string) {
 	e.gh.perPage = 100
 	e.gh.queueIn(repoName(10), 100, 1, "queued", lux3...)
 	e.gh.queueIn(repoName(20), 200, 2, "queued", lux3...)
+	runnerLists := map[string]int{}
+	e.gh.fail = func(op, repo string, _ int) error {
+		if op == opRunners {
+			runnerLists[repo]++
+		}
+		return nil
+	}
 	startup := e.gh.callCount()
 	e.pass()
 	startup = e.gh.callCount() - startup
+	e.gh.fail = nil
 	// Every repository is read once at startup: 3 calls each, plus the
 	// listing, the two jobs read and the two JIT registrations.
-	if startup > 68*3+10 {
-		t.Fatalf("startup pass made %d calls", startup)
+	if startup > 68*3+10 || len(runnerLists) != 68 {
+		t.Fatalf("startup pass made %d calls, read %d repositories", startup, len(runnerLists))
+	}
+	for repo, n := range runnerLists {
+		if n != 1 {
+			t.Fatalf("startup pass read %s %d times", repo, n)
+		}
 	}
 	for i, job := range map[int]int64{10: 1, 20: 2} {
 		if err := e.gh.pick(runnerIn(repoID(i), job, 0), job); err != nil {
@@ -465,6 +527,70 @@ func TestAPIBudgetWith68RepositoriesAnd2Hot(t *testing.T) {
 		t.Fatalf("%d calls in an hour", total)
 	}
 	t.Logf("%d passes, %d calls in the hour, max %d per pass", len(calls), total, slices.Max(calls))
+}
+
+// A burst across the installation: a matching queued delivery for each of
+// 67 of the 68 repositories. Demand the caps keep unserved does not keep its
+// repository hot, and a read that lists a delivered job ends its mark, so
+// the hot set is the repositories with live Runs (at most maxRunners) plus
+// those with a delivery not yet listed. A woken pass reads that whole set:
+// with a backlog and 15 minutes of 5 s wakes, ~4 calls × maxRunners × 180
+// passes has to fit, which holds for maxRunners 4 and not for 10.
+func TestAPIBudgetUnderABurst(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		backlog    bool // the jobs stay queued past maxRunners; else served at once
+		wakeFor    time.Duration
+		maxRunners int
+	}{
+		{"served at once, ticks", false, 0, 10},
+		{"served at once, 5s wakes for 15m", false, 15 * time.Minute, 10},
+		{"backlog above maxRunners, ticks", true, 0, 10},
+		{"backlog above maxRunners, 5s wakes for 15m", true, 15 * time.Minute, 4},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e, hot := newBudgetEnv(t)
+			e.cfg.MaxRunners = c.maxRunners
+			var burst []string
+			for repo := range e.gh.repos {
+				if repo != hot[0] {
+					burst = append(burst, repo)
+				}
+			}
+			slices.Sort(burst)
+			for i, repo := range burst {
+				if c.backlog {
+					e.gh.queueIn(repo, 1000+int64(i), 100+int64(i), "queued", lux3...)
+				}
+			}
+			// The deliveries arrive one per woken pass, or all before the
+			// first ticked pass. A job served at once is picked by a runner
+			// outside the bridge before the next pass.
+			_, calls := e.sweep(time.Hour, c.wakeFor, hot, func(i int) {
+				for j, repo := range burst {
+					if c.wakeFor == 0 && i == 0 || c.wakeFor > 0 && i == j {
+						job := 100 + int64(j)
+						if !c.backlog {
+							e.gh.queueIn(repo, 1000+int64(j), job, "queued", lux3...)
+							e.gh.pickElsewhere(repo, job, 9000+job, "elsewhere")
+						}
+						e.deliver("workflow_job", queuedDelivery(42, repo, job))
+					}
+				}
+			})
+			total := 0
+			for _, n := range calls {
+				total += n
+			}
+			if live := len(e.lux.live()); c.backlog && live != c.maxRunners {
+				t.Fatalf("%d live Runs, want the cap %d", live, c.maxRunners)
+			}
+			if total >= 5000 {
+				t.Fatalf("%d calls in the hour over %d passes", total, len(calls))
+			}
+			t.Logf("%d passes, %d calls in the hour, max %d per pass", len(calls), total, slices.Max(calls))
+		})
+	}
 }
 
 // A repository not read this pass, here because it left the installation,
@@ -599,31 +725,256 @@ func TestOrphanRunnerInAColdRepositoryIsDeletedAfterItsSweep(t *testing.T) {
 	}
 }
 
-// A registration whose submission is unresolved holds a cap slot while its
-// repository cannot be read, here because it left the installation.
+// A registration whose submission is unresolved holds a cap slot, global
+// and per route, while its repository cannot be read, here because it left
+// the installation.
 func TestUnresolvedRegistrationInAnUnreadRepositoryHoldsASlot(t *testing.T) {
-	e := newDiscoveryEnv(t, 2, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	for _, c := range []struct {
+		name   string
+		edit   func(string) string
+		labels []string
+	}{
+		{"global cap", replace(`"maxRunners": 10`, `"maxRunners": 1`), lux3},
+		{"route cap", func(s string) string { return s }, []string{"self-hosted", "linux", "lux-big"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newDiscoveryEnv(t, 2, c.edit)
+			e.gh.queueIn(repoName(0), 70, 7, "queued", c.labels...)
+			e.lux.failCreate = 1
+			if st := e.pass(); st.Error != ErrLux || e.gh.jitCount() != 1 {
+				t.Fatalf("status %+v", st)
+			}
+			e.gh.repo(repoName(0)).uninstalled = true
+			e.deliver("installation_repositories", installationDelivery("removed", 42))
+			e.gh.queueIn(repoName(1), 80, 8, "queued", c.labels...)
+			e.deliver("workflow_job", queuedDelivery(42, repoName(1), 8))
+			for _, step := range []time.Duration{time.Minute, time.Minute - time.Second} {
+				e.clock.Add(step)
+				st := e.pass()
+				if e.gh.takeReads()[repoName(1)] == 0 || sumDemand(st) != 1 || len(e.liveIn(repoID(1))) != 0 {
+					t.Fatalf("created past the cap while job 7's submission was unresolved: %+v", st)
+				}
+			}
+			// idleGrace after the repository left, its registration is forgotten.
+			e.clock.Add(2 * time.Minute)
+			e.pass()
+			if len(e.liveIn(repoID(1))) != 1 {
+				t.Fatalf("runs %v", e.liveIn(repoID(1)))
+			}
+		})
+	}
+}
+
+func sumDemand(st Status) int {
+	n := 0
+	for _, v := range st.Demand {
+		n += v
+	}
+	return n
+}
+
+// A remembered registration whose Run is live is counted once, through the
+// Lux listing, not again as unresolved.
+func TestRegistrationWithALiveRunInAnUnreadRepositoryIsCountedOnce(t *testing.T) {
+	e := newDiscoveryEnv(t, 2, replace(`"maxRunners": 10`, `"maxRunners": 2`))
 	e.gh.queueIn(repoName(0), 70, 7, "queued", lux3...)
-	e.lux.failCreate = 1
-	if st := e.pass(); st.Error != ErrLux || e.gh.jitCount() != 1 {
-		t.Fatalf("status %+v", st)
+	e.pass()
+	if len(e.liveIn(repoID(0))) != 1 {
+		t.Fatalf("runs %v", e.liveIn(repoID(0)))
 	}
 	e.gh.repo(repoName(0)).uninstalled = true
 	e.deliver("installation_repositories", installationDelivery("removed", 42))
 	e.gh.queueIn(repoName(1), 80, 8, "queued", lux3...)
 	e.deliver("workflow_job", queuedDelivery(42, repoName(1), 8))
-	for _, step := range []time.Duration{time.Minute, time.Minute - time.Second} {
-		e.clock.Add(step)
+	e.clock.Add(time.Minute)
+	if st := e.pass(); st.Provisioned != 1 || len(e.liveIn(repoID(1))) != 1 {
+		t.Fatalf("one live Run of two slots, yet nothing created: %+v", st)
+	}
+}
+
+// After a restart nothing is remembered, so a registration left by the
+// previous process in a repository whose first read fails is unknown; it
+// may still have a submission in flight. No Run is created until that
+// repository has been read and the registration resolved.
+func TestPreRestartRegistrationInAnUnreadRepositoryBlocksCreation(t *testing.T) {
+	e := newDiscoveryEnv(t, 30, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	name := runnerIn(repoID(17), 9, 0)
+	e.gh.addRunner(repoName(17), 77, name)
+	e.gh.setOnline(name, false)
+	e.gh.queueIn(repoName(3), 30, 3, "queued", lux3...)
+	failed := false
+	e.gh.fail = func(op, repo string, _ int) error {
+		if op == opRunners && repo == repoName(17) && !failed {
+			failed = true
+			return &githubapp.APIError{StatusCode: 500}
+		}
+		return nil
+	}
+	if st := e.pass(); st.Provisioned != 0 || e.lux.createCount() != 0 {
+		t.Fatalf("created while acme/r17 had never been read: %+v", st)
+	}
+	readOK := false
+	for range 6 {
+		e.clock.Add(time.Minute)
 		st := e.pass()
-		if e.gh.takeReads()[repoName(1)] == 0 || st.Demand["default"] != 1 || len(e.liveIn(repoID(1))) != 0 {
-			t.Fatalf("created past the cap while job 7's submission was unresolved: %+v", st)
+		if e.gh.takeReads()[repoName(17)] > 0 {
+			readOK = true
+		}
+		if !readOK {
+			t.Fatal("acme/r17 not read after its first read failed")
+		}
+		if e.lux.createCount() > 0 {
+			// The registration was resolved (deleted as an orphan) first.
+			if !slices.Contains(e.gh.deletedNames(), name) || st.Provisioned != 1 {
+				t.Fatalf("created while %s was unresolved: %+v deleted %v", name, st, e.gh.deletedNames())
+			}
+			return
 		}
 	}
-	// idleGrace after the repository left, its registration is forgotten.
-	e.clock.Add(2 * time.Minute)
+	t.Fatal("never created once acme/r17 was read")
+}
+
+// A repository whose first read fails is not yet known: it stays selected
+// every pass until a read succeeds, then goes cold.
+func TestRepositoryWhoseFirstReadFailsIsReadUntilItSucceeds(t *testing.T) {
+	e := newDiscoveryEnv(t, 30)
+	e.gh.fail = func(op, repo string, _ int) error {
+		if op == opRunners && repo == repoName(5) {
+			return &githubapp.APIError{StatusCode: 500}
+		}
+		return nil
+	}
 	e.pass()
-	if len(e.liveIn(repoID(1))) != 1 {
-		t.Fatalf("runs %v", e.liveIn(repoID(1)))
+	e.gh.takeReads()
+	e.readEveryPass(repoName(5), 3*time.Minute)
+	e.gh.fail = nil
+	e.clock.Add(time.Minute)
+	e.pass()
+	if e.gh.takeReads()[repoName(5)] == 0 {
+		t.Fatal("not read once its reads recover")
+	}
+	if e.skippedIn(repoName(5), 5) == 0 {
+		t.Fatal("still read every pass after a successful read")
+	}
+}
+
+// skippedIn runs n passes a minute apart and counts those that did not read repo.
+func (e *env) skippedIn(repo string, n int) int {
+	e.t.Helper()
+	skipped := 0
+	for range n {
+		e.clock.Add(time.Minute)
+		e.pass()
+		if e.gh.takeReads()[repo] == 0 {
+			skipped++
+		}
+	}
+	return skipped
+}
+
+// A hot repository leaves the installation and its installation_repositories
+// delivery is lost. Its reads answer 404, which re-lists the installation on
+// the next pass instead of after repositoryRefresh.
+func TestRemovedRepositoryWithALostDeliveryBlocksCreationBriefly(t *testing.T) {
+	e := newDiscoveryEnv(t, 3)
+	e.gh.queueIn(repoName(0), 70, 7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.repo(repoName(0)).uninstalled = true
+	e.gh.queueIn(repoName(1), 80, 8, "queued", lux3...)
+	e.deliver("workflow_job", queuedDelivery(42, repoName(1), 8))
+	blocked := 0
+	for range 10 {
+		e.clock.Add(time.Minute)
+		st := e.pass()
+		if len(e.liveIn(repoID(1))) == 1 {
+			break
+		}
+		if st.Error != ErrGitHub {
+			t.Fatalf("not created and no read error: %+v", st)
+		}
+		blocked++
+	}
+	if blocked > 2 || len(e.liveIn(repoID(1))) != 1 {
+		t.Fatalf("creation blocked for %d passes", blocked)
+	}
+	if e.rec.AllowsRepository(repoName(0)) {
+		t.Fatal("acme/r00 still in the set")
+	}
+	e.clock.Add(time.Minute)
+	e.gh.takeReads()
+	e.pass()
+	if reads := e.gh.takeReads(); reads[repoName(0)] != 0 {
+		t.Fatalf("acme/r00 still read: %v", reads)
+	}
+	if len(e.lux.terminatedIDs()) != 0 || len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("terminated %v; Run %s", e.lux.terminatedIDs(), id)
+	}
+}
+
+// A refresh requested while GitHub rate-limits the listing runs on the
+// first pass after the limit.
+func TestRefreshRequestedDuringARateLimitRunsAfterIt(t *testing.T) {
+	e := newDiscoveryEnv(t, 1)
+	e.gh.repo(repoName(0)).uninstalled = true
+	e.pass()
+	e.gh.repo(repoName(0)).uninstalled = false
+	e.deliver("installation_repositories", installationDelivery("added", 42))
+	e.gh.rateLimitUntil = e.clock.Now().Add(30 * time.Second)
+	if st := e.pass(); st.Error != ErrRateLimited {
+		t.Fatalf("status %+v", st)
+	}
+	e.clock.Add(time.Minute)
+	e.pass()
+	if !e.rec.AllowsRepository(repoName(0)) {
+		t.Fatal("the refresh requested during the rate limit was lost")
+	}
+}
+
+// Demand the caps cannot serve does not keep its repository hot; a pass
+// after a slot frees reads it again.
+func TestUnservableDemandIsColdUntilASlotFrees(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		edit   func(string) string
+		labels []string
+	}{
+		{"global cap", replace(`"maxRunners": 10`, `"maxRunners": 1`), lux3},
+		{"route cap", func(s string) string { return s }, []string{"self-hosted", "linux", "lux-big"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newDiscoveryEnv(t, 30, c.edit)
+			e.gh.queueIn(repoName(0), 70, 7, "queued", c.labels...)
+			e.gh.queueIn(repoName(9), 90, 9, "queued", c.labels...)
+			e.pass()
+			e.gh.takeReads()
+			id := e.runID("7")
+			if len(e.liveIn(repoID(9))) != 0 {
+				t.Fatal("created past the cap")
+			}
+			if e.skippedIn(repoName(9), 5) == 0 {
+				t.Fatal("demand the cap cannot serve kept acme/r09 hot")
+			}
+			e.lux.end(id, "timeout")
+			e.gh.complete(7, "success")
+			e.clock.Add(time.Minute)
+			e.pass()
+			if e.gh.takeReads()[repoName(9)] == 0 || len(e.liveIn(repoID(9))) != 1 {
+				t.Fatalf("not read and served once a slot freed: runs %v", e.liveIn(repoID(9)))
+			}
+		})
+	}
+}
+
+// The listing stops at its page bound.
+func TestInstallationListingStopsAtItsPageBound(t *testing.T) {
+	e := newDiscoveryEnv(t, 1)
+	e.gh.endlessListing = true
+	if st := e.pass(); st.Error != ErrGitHub || e.installCalls() != maxInstallationRepoPages {
+		t.Fatalf("status %+v after %d pages", st, e.installCalls())
+	}
+	if reads := e.gh.takeReads(); len(reads) != 0 || e.rec.AllowsRepository(repoName(0)) {
+		t.Fatalf("reads %v", reads)
 	}
 }
 

@@ -257,6 +257,7 @@ type repoView struct {
 	id      int64
 	demand  map[int64]*config.Route
 	runners map[string]githubapp.Runner // managed runners by name
+	seen    map[int64]bool              // every job id listed, any status
 }
 
 type pass struct {
@@ -359,12 +360,12 @@ func (p *pass) readGitHub(repositories []string) error {
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
-			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}}
+			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{}}
 		err := p.readRepo(v, &budget)
 		if p.rateLimited(err) {
 			return errAbort
 		}
-		p.noteRead(full, err == nil)
+		p.noteRead(full, err)
 		if err != nil {
 			// A partial view could hide registered runners; act on none of it.
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
@@ -452,6 +453,7 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 			return err
 		}
 		for _, j := range jobs.Jobs {
+			v.seen[j.ID] = true
 			// waiting (environment approval) and every other status are not demand.
 			if j.Status != "queued" {
 				continue

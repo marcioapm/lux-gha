@@ -142,9 +142,11 @@ checks the installation ID exactly as with a list.
 **Hot and cold.** Reading all of a large installation every pass would exceed
 its rate limit, so each pass reads:
 
-- every **hot** repository: one with a live managed Run in Lux, one whose last
-  read found a managed runner or a queued job a route serves, and one that had
-  a `queued` delivery for such a job within `reconcile.hotWindow`;
+- every **hot** repository: one with a live managed Run in Lux; one whose
+  last read found a managed runner; one whose last read found a queued job a
+  route serves, while the global cap and that job's route cap have room; and
+  one with a `queued` delivery for such a job that no read has listed yet,
+  for at most `reconcile.hotWindow` after the latest such delivery;
 - every repository not yet read successfully since startup;
 - a round-robin slice of the other, **cold**, repositories, least recently
   selected first. Each pass takes its elapsed time's share of the cold set
@@ -156,12 +158,17 @@ its rate limit, so each pass reads:
 
 The per-pass counts (known, hot, new, cold, read, skipped) are logged at debug.
 A pass lists Lux's live Runs before it selects repositories, so a Run that
-appeared since the last pass makes its repository hot at once.
+appeared since the last pass makes its repository hot at once. Demand the
+caps keep unserved goes cold; the pass after a slot frees reads every
+repository whose last read found demand again.
 
 A repository that leaves the set (removed from the installation, archived or
 disabled) is no longer read. Its live Runs are neither adopted nor
 terminated; they count against the caps until they end on their own (the
-runner exits, or the route's `timeout`). Its runners stay registered.
+runner exits, or the route's `timeout`). Its runners stay registered. A read
+that answers 404 or 403 re-lists the installation on the next pass, so a
+removal whose `installation_repositories` delivery was lost blocks creation
+for a pass or two, not `repositoryRefresh`.
 
 **Rate-limit arithmetic.** With the defaults (`interval` 60 s, `coldSweep`
 10 m) and 68 repositories of which 2 are hot, a ticked pass reads the 2 hot
@@ -171,13 +178,21 @@ page every 10 minutes: about 30 requests per pass, about 1,800 per hour.
 The cold share is paced by time, not by passes, so it stays near
 `66 × 3 × 60 / 9 ≈ 1,320` requests per hour however often webhooks wake the
 loop; woken passes add only hot reads. The startup pass reads every
-repository once (about `68 × 3`). An installation's limit is 5,000 requests
-per hour (more for large organisations), so this leaves well over half of it
-free. Each extra hot repository costs at least 3 requests per pass. Hot reads
-are what a sustained stream of matching `queued` deliveries multiplies, as
-with a `repositories` list: at the 5 s minimum gap between woken passes, 720
-passes an hour, two hot repositories alone cost about 5,800 requests per
-hour, and a rate limit then pauses passes until GitHub's reset time.
+repository once, at about 3 requests each (about `68 × 3 ≈ 204`). An
+installation's limit is 5,000 requests per hour (more for large
+organisations), so this leaves well over half of it free.
+
+Hot reads are what passes multiply: the worst case is
+`hot × ~4 requests × passes per hour`, where woken passes come at most every
+5 s (720 per hour). During a burst the hot set is bounded by free capacity,
+not by the installation: repositories with live Runs (at most `maxRunners`),
+demand only while a slot is free for it, and deliveries whose job no read has
+listed yet. With `maxRunners` 10 and every slot used by a different
+repository, an hour of ticks costs about `10 × 4 × 60 = 2,400` hot requests
+on top of the cold share, but 15 minutes of 5 s wakes cost about
+`10 × 4 × 180 = 7,200`. A sustained stream of matching `queued` deliveries
+with many live Runs can therefore exceed the limit, as with a `repositories`
+list; a rate limit then pauses passes until GitHub's reset time.
 
 ### Lifecycle safety with partial reads
 
@@ -195,7 +210,10 @@ repository is unknown, as above.
   failing blocks creation only on the passes that select it (its rotation slot
   moves on). A hot one, or one not yet read successfully since startup, is
   selected every pass and so blocks creation until it reads: it may hold a
-  registration whose submission is unresolved.
+  registration whose submission is unresolved. A repository that stays in the
+  listing but always fails to read therefore blocks creation in every
+  repository; it is logged at `WARN` with its name, and without
+  `repositories` the fix is to remove it from the installation.
 - **Unresolved submissions.** A registered runner with no Run may still have a
   submission in flight, so it holds a cap slot. In a repository read this pass
   it is classified as before. A repository with a remembered managed runner is
@@ -272,7 +290,7 @@ also starts rootless Docker first when the image has it.
   "instance": "prod",
   "maxRunners": 20,
   "reconcile": {"interval": "60s", "idleGrace": "2m", "maxJobsPerPass": 200, "maxGensPerJob": 5,
-                "repositoryRefresh": "10m", "hotWindow": "15m", "coldSweep": "10m"},
+                "repositoryRefresh": "10m", "hotWindow": "2m", "coldSweep": "10m"},
   "github": {
     "appID": "Iv1.0123456789abcdef",
     "installationID": 12345678,
@@ -292,7 +310,7 @@ also starts rootless Docker first when the image has it.
 
 - **`instance`**: required, 1-20 of `a-z`, `0-9` and `-`. It names this bridge in Run labels and runner names; two bridges sharing a GitHub repository or Lux tenant need different instances.
 - **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
-- **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every pass, and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass.
+- **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every pass while the runs API does not yet list its job (GitHub's lag between delivery and API), and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass.
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
 - **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.

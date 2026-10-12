@@ -49,7 +49,7 @@ const (
 	DefaultMaxJobsPerPass    = 200
 	DefaultMaxGensPerJob     = 5
 	DefaultRepositoryRefresh = 10 * time.Minute
-	DefaultHotWindow         = 15 * time.Minute
+	DefaultHotWindow         = 2 * time.Minute
 	DefaultColdSweep         = 10 * time.Minute
 )
 

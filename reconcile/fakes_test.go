@@ -41,7 +41,8 @@ type fakeRepo struct {
 	// lagging listing would leave them.
 	unlisted map[string]bool
 	// archived, disabled and uninstalled shape GET /installation/repositories;
-	// an uninstalled repository is still readable, as a stale set would see it.
+	// an uninstalled repository answers 404 to the installation token, as
+	// GitHub does once it leaves the installation.
 	archived, disabled, uninstalled bool
 }
 
@@ -78,6 +79,8 @@ type fakeGitHub struct {
 	fail func(op, repo string, page int) error
 	// perPage bounds page sizes to exercise paging.
 	perPage int
+	// endlessListing makes every installation repository page claim a next one.
+	endlessListing bool
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
 }
@@ -109,7 +112,7 @@ func (f *fakeGitHub) gate(op string, repo githubapp.Repository, page int) (*fake
 		}
 	}
 	r, ok := f.repos[full]
-	if !ok {
+	if !ok || r.uninstalled {
 		return nil, &githubapp.APIError{StatusCode: 404}
 	}
 	return r, nil
@@ -290,7 +293,7 @@ func (f *fakeGitHub) ListInstallationRepositories(_ context.Context, installatio
 		}
 	}
 	items, next := page(all, opts, f.perPage)
-	return githubapp.InstallationRepositoryPage{TotalCount: len(all), Repositories: items, HasNext: next}, nil
+	return githubapp.InstallationRepositoryPage{TotalCount: len(all), Repositories: items, HasNext: next || f.endlessListing}, nil
 }
 
 // DeleteRepoRunner answers 422 for a busy runner, as GitHub does ("Runner
