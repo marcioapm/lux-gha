@@ -103,10 +103,14 @@ func (r *Reconciler) RequestRepositoryRefresh() {
 	if r.disc == nil {
 		return
 	}
-	r.disc.mu.Lock()
-	r.disc.requested = true
-	r.disc.mu.Unlock()
+	r.disc.requestRefresh()
 	r.Wake()
+}
+
+func (d *discovery) requestRefresh() {
+	d.mu.Lock()
+	d.requested = true
+	d.mu.Unlock()
 }
 
 // refreshRepositories re-lists the installation's repositories when the
@@ -123,11 +127,6 @@ func (p *pass) refreshRepositories() error {
 	if !requested && !d.refreshed.IsZero() && now.Sub(d.refreshed) < r.cfg.Reconcile.RepositoryRefresh.Duration {
 		return nil
 	}
-	retry := func() {
-		d.mu.Lock()
-		d.requested = true
-		d.mu.Unlock()
-	}
 	var repos []discovered
 	// Offset paging can return a repository twice if the set changes
 	// between pages.
@@ -139,13 +138,13 @@ func (p *pass) refreshRepositories() error {
 			rp, err = r.gh.ListInstallationRepositories(p.ctx, r.cfg.GitHub.InstallationID, githubapp.PageOptions{Page: page, PerPage: pageSize})
 		}
 		if p.rateLimited(err) {
-			retry()
+			d.requestRefresh()
 			return errAbort
 		}
 		if err != nil {
 			r.log.Error("listing the installation's repositories failed; keeping the last set", "repositories", len(d.repos), "error", err)
 			p.setError(ErrGitHub)
-			retry()
+			d.requestRefresh()
 			return nil
 		}
 		for _, repo := range rp.Repositories {
@@ -337,10 +336,7 @@ func (p *pass) selectDelivered(delivered map[string]bool) []string {
 // trips it; a woken pass reads only delivered repositories.
 func (p *pass) requireKnown() {
 	d := p.r.disc
-	read := map[int64]bool{}
-	for _, v := range p.repos {
-		read[v.id] = true
-	}
+	read := p.readIDs()
 	for _, repo := range d.repos {
 		if !d.known[repo.id] && !read[repo.id] {
 			p.r.log.Debug("not provisioning: a repository has not been read since startup", "repository", repo.full)
@@ -348,6 +344,15 @@ func (p *pass) requireKnown() {
 			return
 		}
 	}
+}
+
+// readIDs returns the ids of the repositories read successfully this pass.
+func (p *pass) readIDs() map[int64]bool {
+	read := make(map[int64]bool, len(p.repos))
+	for _, v := range p.repos {
+		read[v.id] = true
+	}
+	return read
 }
 
 // pruneTimers drops m's entries absent from keep. On a woken discovery pass
@@ -398,8 +403,7 @@ func (p *pass) noteRead(full string, err error) {
 	id := p.r.repoIDs[full]
 	_, before := d.attempted[id]
 	d.attempted[id] = p.r.now()
-	ok := err == nil
-	if ok {
+	if err == nil {
 		d.known[id] = true
 		return
 	}
@@ -408,9 +412,7 @@ func (p *pass) noteRead(full string, err error) {
 	}
 	var apiErr *githubapp.APIError
 	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusForbidden) {
-		d.mu.Lock()
-		d.requested = true
-		d.mu.Unlock()
+		d.requestRefresh()
 	}
 }
 
@@ -478,10 +480,7 @@ func (p *pass) holdUnreadRegistrations() {
 	if d == nil {
 		return
 	}
-	read := map[int64]bool{}
-	for _, v := range p.repos {
-		read[v.id] = true
-	}
+	read := p.readIDs()
 	liveRunner := map[string]bool{}
 	for _, run := range p.live {
 		liveRunner[run.Labels[LabelRunner]] = true
