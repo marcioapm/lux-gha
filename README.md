@@ -6,10 +6,11 @@ process.
 
 ## Packages
 
-- `config`: JSON configuration, validated before serving. It has an explicit installation ID, a runner group ID, allowed repositories, routes keyed by label set, and reconciler settings.
+- `config`: JSON configuration, validated before serving. It has an explicit installation ID, a runner group ID, optional allowed repositories (absent: every repository of the installation), routes keyed by label set, and reconciler settings.
 - `githubapp`: GitHub App client:
   - RS256 app JWT
   - cached installation tokens
+  - the installation's repositories
   - repository lookup (numeric ID)
   - repository JIT config
   - workflow job and run reads
@@ -17,7 +18,7 @@ process.
 - `luxclient`: thin HTTP client for Lux Runs:
   - create (with `Idempotency-Key`), get, paged list and terminate
   - a startup compatibility check
-- `webhook`: signed `workflow_job` ingress that calls an injected function.
+- `webhook`: signed `workflow_job` ingress that calls an injected function, and optionally `installation` and `installation_repositories` ingress.
 - `reconcile`: the single reconciler that provisions and removes runners.
 - `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
@@ -40,19 +41,23 @@ by the woken pass. The loop does not tick during the wait, so with
 event's contents are not trusted beyond that, because every pass re-reads job
 state from GitHub.
 
-A pass costs `2 + active workflow runs + ⌈runners/100⌉` GitHub requests per
-repository (active = `queued` or `in_progress`, including runs with only
-GitHub-hosted jobs), plus one per provisioned runner; size `interval` against
-the installation's hourly limit and the number of repositories. There is no database: the only persistent
+A repository read costs `2 + active workflow runs + ⌈runners/100⌉` GitHub
+requests (active = `queued` or `in_progress`, including runs with only
+GitHub-hosted jobs), plus one per provisioned runner. With a `repositories`
+list every listed repository is read every pass; size `interval` against the
+installation's hourly limit and the number of repositories. Without one, a
+pass reads a bounded subset ([Repository discovery](#repository-discovery)).
+There is no database: the only persistent
 state is Lux Run labels and GitHub's own records.
 
 The bridge keeps **one live Run per queued matching job**. A pass:
 
-1. **Demand.** For each repository, lists workflow runs with status `queued`
+1. **Demand.** For each repository read this pass, lists workflow runs with status `queued`
    and `in_progress` and their latest-attempt jobs. A job is demand when its
    status is `queued` and its labels match a route. `waiting` jobs
    (environment approval) are not demand. At most `reconcile.maxJobsPerPass`
-   jobs are read per pass, in configuration order, so a backlog over that
+   jobs are read per pass, in configuration order (name order when
+   discovered), so a backlog over that
    bound in one repository can delay the others.
 2. **Supply.** Lists the instance's live Lux Runs (`submitted`, `scheduled`,
    `provisioning`, `starting`, `running`, `stopping`, `resuming`) and the
@@ -82,8 +87,9 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    picked by another runner, or beyond `maxJobsPerPass`) is checked too: a
    live Run is counted, and a runner with no Run holds a slot against the
    global cap and every route whose labels it carries (GitHub adds its
-   default labels, so more than one can match). If any repository could not
-   be read, its submissions are unknown and no Run is created that pass.
+   default labels, so more than one can match). If any repository selected
+   this pass could not be read, its submissions are unknown and no Run is
+   created that pass.
 4. **Surplus.** An idle (not busy) runner whose Run is live, whose triggering
    job has not been queued for `reconcile.idleGrace`, and which exceeds its
    repository and route's queued demand, is deleted from GitHub and then its
@@ -100,6 +106,123 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    pickup, or a submission whose outcome stayed unknown) is deleted `idleGrace` after it was
    first seen. A Run lost mid-job is left alone: GitHub fails the job and
    nothing reruns it.
+
+Steps 3 to 5 act only on repositories read successfully this pass. A
+repository not read this pass, because it was not selected, its read
+failed, or it left the set, is **unknown**: no Run is created,
+terminated or adopted for it, none of its runners is deleted, and its live
+Runs still count against the global and route caps (they are in the
+instance's Lux listing, whichever repository they belong to).
+
+### Repository discovery
+
+Without `repositories`, the bridge serves every repository the App
+installation can access. Installing the App on a repository (with
+"Only select repositories") is the on switch; a workflow job still opts in
+through `runs-on` labels that match a route.
+
+**The set.** `GET /installation/repositories` (installation token,
+`per_page=100`, following `Link`) is listed at startup, every
+`reconcile.repositoryRefresh`, and on the next pass after a signed delivery
+for this installation of:
+
+- `installation_repositories` (`added`, `removed`);
+- `installation` (`deleted`, `suspend`, `unsuspend`, `new_permissions_accepted`);
+- `workflow_job` from a repository outside the current set (it may have just
+  been added).
+
+GitHub sends the first two to every App without a subscription. A delivery
+only marks the set stale and wakes the loop; the listing happens in the pass.
+Archived and disabled repositories are left out. A failed listing keeps the
+last good set, is logged, and is retried on the next pass; before the first
+success the set is empty, so no repository is read and no Run is created. The
+webhook accepts `workflow_job` deliveries for repositories in the set and
+checks the installation ID exactly as with a list.
+
+**Hot and cold.** Reading all of a large installation every pass would exceed
+its rate limit, so each pass reads:
+
+- every **hot** repository: one with a live managed Run in Lux, one whose last
+  read found a managed runner or a queued job a route serves, and one that had
+  a `queued` delivery for such a job within `reconcile.hotWindow`;
+- every repository not yet read successfully since startup;
+- a round-robin slice of the other, **cold**, repositories, least recently
+  selected first. Each pass takes its elapsed time's share of the cold set
+  over `coldSweep − interval` (the fraction carries to the next pass, so woken
+  passes add no reads), and also takes any cold repository that would
+  otherwise go unread past `coldSweep` before the next tick. A selected
+  repository moves to the back of the rotation whether its read succeeded or
+  not.
+
+The per-pass counts (known, hot, new, cold, read, skipped) are logged at debug.
+A pass lists Lux's live Runs before it selects repositories, so a Run that
+appeared since the last pass makes its repository hot at once.
+
+A repository that leaves the set (removed from the installation, archived or
+disabled) is no longer read. Its live Runs are neither adopted nor
+terminated; they count against the caps until they end on their own (the
+runner exits, or the route's `timeout`). Its runners stay registered.
+
+**Rate-limit arithmetic.** With the defaults (`interval` 60 s, `coldSweep`
+10 m) and 68 repositories of which 2 are hot, a ticked pass reads the 2 hot
+repositories (`2 × (3 + their active runs)`, 8 with one active run each)
+and about `66 / 9 ≈ 7.3` cold ones at 3 requests each (22), plus one listing
+page every 10 minutes: about 30 requests per pass, about 1,800 per hour.
+The cold share is paced by time, not by passes, so it stays near
+`66 × 3 × 60 / 9 ≈ 1,320` requests per hour however often webhooks wake the
+loop; woken passes add only hot reads. The startup pass reads every
+repository once (about `68 × 3`). An installation's limit is 5,000 requests
+per hour (more for large organisations), so this leaves well over half of it
+free. Each extra hot repository costs at least 3 requests per pass. Hot reads
+are what a sustained stream of matching `queued` deliveries multiplies, as
+with a `repositories` list: at the 5 s minimum gap between woken passes, 720
+passes an hour, two hot repositories alone cost about 5,800 requests per
+hour, and a rate limit then pauses passes until GitHub's reset time.
+
+### Lifecycle safety with partial reads
+
+Every rule below holds per pass for the repositories read in it; an unread
+repository is unknown, as above.
+
+- **Unread repositories.** Nothing is created, terminated or deleted for a
+  repository the pass did not read, and its live Runs count against both caps
+  through the Lux listing. A hot repository is read every pass, so a
+  repository left unread has no live Run and no remembered runner, unless its
+  read failed or it left the set; then its live Runs are kept and
+  counted all the same.
+- **Read failure.** If any repository selected this pass fails to read, no Run
+  is created that pass, exactly as with a list. A cold repository that keeps
+  failing blocks creation only on the passes that select it (its rotation slot
+  moves on). A hot one, or one not yet read successfully since startup, is
+  selected every pass and so blocks creation until it reads: it may hold a
+  registration whose submission is unresolved.
+- **Unresolved submissions.** A registered runner with no Run may still have a
+  submission in flight, so it holds a cap slot. In a repository read this pass
+  it is classified as before. A repository with a remembered managed runner is
+  hot, so it is read every pass; if that read fails, creation is blocked. If it
+  left the set, its remembered runners without a live Run keep holding
+  slots for `idleGrace` after it left, the same delay orphan cleanup gives a
+  readable one. A repository first seen after a restart is read on the first
+  pass that lists it, so a registration from before the restart is found before
+  it can be outrun.
+- **Adoption of late Runs.** A submission whose outcome was unknown commits
+  into Lux; the next pass's Lux listing makes its repository hot, so it is read
+  and its job adopts the Run as before. An adopted Run counts against the caps
+  from the moment Lux lists it, read or not.
+- **Surplus deletion.** Deletes only idle runners whose repository was read
+  this pass, compares them with that repository's demand, and terminates a Run
+  only after its runner was deleted. No unread repository's Run is reached.
+- **Finished Runs.** A live Run whose runner is gone is terminated only when
+  its repository was read and lacked the runner, in two passes `idleGrace`
+  apart. Its live Run makes the repository hot, so it is read every pass.
+- **Orphans.** A cold repository has no Run Lux knows of. An orphaned runner
+  there (offline, no live Run) is seen when the repository is next read,
+  within `coldSweep`, which makes the repository hot; it is deleted
+  `idleGrace` later.
+- **Caps.** The global and route caps count every live Run of the instance
+  and every held slot, regardless of which repositories were read.
+
+`GET /status` reports `demand` for the repositories read in the pass.
 
 Run labels (no secrets ever go in labels):
 
@@ -148,7 +271,8 @@ also starts rootless Docker first when the image has it.
   "listen": "127.0.0.1:8080",
   "instance": "prod",
   "maxRunners": 20,
-  "reconcile": {"interval": "60s", "idleGrace": "2m", "maxJobsPerPass": 200, "maxGensPerJob": 5},
+  "reconcile": {"interval": "60s", "idleGrace": "2m", "maxJobsPerPass": 200, "maxGensPerJob": 5,
+                "repositoryRefresh": "10m", "hotWindow": "15m", "coldSweep": "10m"},
   "github": {
     "appID": "Iv1.0123456789abcdef",
     "installationID": 12345678,
@@ -157,7 +281,6 @@ also starts rootless Docker first when the image has it.
     "webhookSecretFile": "/etc/lux-gha/webhook-secret"
   },
   "lux": {"url": "https://lux.example.com", "apiKeyFile": "/etc/lux-gha/lux-api-key"},
-  "repositories": ["acme/widgets"],
   "routes": [
     {"name": "default", "labels": ["self-hosted", "linux", "lux"], "pool": "gha",
      "image": "ghcr.io/acme/gha-runner@sha256:...", "cpus": 2, "memoryMiB": 4096, "diskGiB": 20,
@@ -169,14 +292,14 @@ also starts rootless Docker first when the image has it.
 
 - **`instance`**: required, 1-20 of `a-z`, `0-9` and `-`. It names this bridge in Run labels and runner names; two bridges sharing a GitHub repository or Lux tenant need different instances.
 - **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
-- **`reconcile`**: optional; the values shown are the defaults.
+- **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every pass, and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass.
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
 - **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.
 - **`runnerGroupID`**: required by `generate-jitconfig`. Read the repository's runner group ID from GitHub rather than assuming `1`.
 - **`apiURL`**: optional. It defaults to `https://api.github.com` and must be HTTPS. Plain HTTP is accepted only for loopback test servers. The API host never comes from webhook payloads.
 - **Routing**: a job is routed only when **every** label it requests is in exactly one route's label set. Label comparison is case-insensitive. Configuration is rejected if one route's label set contains another's, because a job could then match both.
-- **Repositories**: runners are registered per repository. Organisation-level runners are not supported.
+- **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
 
 ## GitHub App permissions
@@ -187,13 +310,21 @@ Repository permissions, and nothing else:
 |---|---|---|
 | Administration | Read and write | `generate-jitconfig`, listing and deleting repository runners |
 | Actions | Read-only | `workflow_job` webhook events, reading workflow jobs and runs |
+| Metadata | Read-only | Granted to every App; `GET /installation/repositories` |
 
 Subscribe to the **Workflow job** webhook event. Actions write is not needed.
+
+Without `repositories`, install the App with **Only select repositories**:
+adding a repository to the installation is what enables the bridge for it,
+and removing it disables it. No further permission or subscription is
+needed: the repository listing uses the installation token and Metadata, and
+GitHub sends `installation` and `installation_repositories` events to every
+App.
 
 ## Webhook semantics
 
 - **Signature**: `X-Hub-Signature-256` is checked over the exact raw body with a constant-time comparison. This happens before any parsing.
-- **Ignored deliveries**: unsigned or invalid deliveries get `401`. Signed `ping`s, other events, unknown actions, and other installations or repositories get `204`, and no callback is made.
+- **Ignored deliveries**: unsigned or invalid deliveries get `401`. Signed `ping`s, other events, unknown actions, and other installations or repositories get `204`, and no callback is made. Without `repositories`, a `workflow_job` of this installation from a repository outside the discovered set gets `202` and only requests a refresh of the set; `installation` and `installation_repositories` deliveries of this installation with the actions listed in [Repository discovery](#repository-discovery) get `202` and do the same.
 - **Actions handled**: `queued`, `waiting`, `in_progress` and `completed`. Cancellation is `completed` with `conclusion: cancelled`; it is not a separate action.
 - **Callback budget**: the callback runs inline and must be a fast signal, not provisioning, because GitHub expects a response within 10 seconds. The callback gets an 8 s context.
 - **Callback failure**: returns `503`. **GitHub does not automatically redeliver failed or missed deliveries.** Recovery comes from the periodic reconciliation pass against the GitHub API, not from redelivery. There is no in-memory queue that claims durability.
