@@ -419,7 +419,9 @@ func TestReadThatListsTheDeliveredJobEndsItsMark(t *testing.T) {
 
 // sweep runs passes a minute apart for d, with a woken pass every 5 s for the
 // first wakeFor, and returns, per repository, the longest gap between reads
-// and, per pass, the GitHub calls it made. Each hook runs ahead of pass i.
+// and, per pass, the GitHub calls it made. A pass on a minute boundary is a
+// tick pass, and every hot repository must be read in it. Each hook runs
+// ahead of pass i.
 func (e *env) sweep(d, wakeFor time.Duration, hot []string, hooks ...func(i int)) (map[string]time.Duration, []int) {
 	e.t.Helper()
 	last := map[string]time.Time{}
@@ -439,12 +441,17 @@ func (e *env) sweep(d, wakeFor time.Duration, hot []string, hooks ...func(i int)
 		for _, f := range hooks {
 			f(len(calls))
 		}
+		tick := elapsed%time.Minute == 0
 		before := e.gh.callCount()
-		e.pass()
+		if tick {
+			e.pass()
+		} else {
+			e.wake()
+		}
 		calls = append(calls, e.gh.callCount()-before)
 		reads := e.gh.takeReads()
 		for _, h := range hot {
-			if reads[h] == 0 {
+			if tick && reads[h] == 0 {
 				e.t.Fatalf("hot %s skipped at %v", h, elapsed)
 			}
 		}
@@ -531,26 +538,23 @@ func TestAPIBudgetWith68RepositoriesAnd2Hot(t *testing.T) {
 
 // A burst across the installation: a matching queued delivery for each of
 // 67 of the 68 repositories. Demand the caps keep unserved does not keep its
-// repository hot, and a read that lists a delivered job ends its mark, so
-// the hot set is the repositories with live Runs (at most maxRunners) plus
-// those with a delivery not yet listed. A woken pass reads that whole set:
-// with a backlog and 15 minutes of 5 s wakes, ~4 calls × maxRunners × 180
-// passes has to fit, which holds for maxRunners 4 and not for 10.
+// repository hot, and a read that lists a delivered job ends its mark, so a
+// tick pass reads the repositories with live Runs (at most maxRunners) plus
+// those with a delivery not yet listed. A woken pass reads only the
+// repositories delivered since the previous pass, here one: ~4 calls.
 func TestAPIBudgetUnderABurst(t *testing.T) {
 	for _, c := range []struct {
-		name       string
-		backlog    bool // the jobs stay queued past maxRunners; else served at once
-		wakeFor    time.Duration
-		maxRunners int
+		name    string
+		backlog bool // the jobs stay queued past maxRunners; else served at once
+		wakeFor time.Duration
 	}{
-		{"served at once, ticks", false, 0, 10},
-		{"served at once, 5s wakes for 15m", false, 15 * time.Minute, 10},
-		{"backlog above maxRunners, ticks", true, 0, 10},
-		{"backlog above maxRunners, 5s wakes for 15m", true, 15 * time.Minute, 4},
+		{"served at once, ticks", false, 0},
+		{"served at once, 5s wakes for 15m", false, 15 * time.Minute},
+		{"backlog above maxRunners, ticks", true, 0},
+		{"backlog above maxRunners, 5s wakes for 15m", true, 15 * time.Minute},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e, hot := newBudgetEnv(t)
-			e.cfg.MaxRunners = c.maxRunners
 			var burst []string
 			for repo := range e.gh.repos {
 				if repo != hot[0] {
@@ -578,17 +582,25 @@ func TestAPIBudgetUnderABurst(t *testing.T) {
 					}
 				}
 			})
-			total := 0
-			for _, n := range calls {
+			total, wokenMax := 0, 0
+			for i, n := range calls {
 				total += n
+				if c.wakeFor > 0 && (i+1)%12 != 0 && i < 180 {
+					wokenMax = max(wokenMax, n)
+				}
 			}
-			if live := len(e.lux.live()); c.backlog && live != c.maxRunners {
-				t.Fatalf("%d live Runs, want the cap %d", live, c.maxRunners)
+			if live := len(e.lux.live()); c.backlog && live != e.cfg.MaxRunners {
+				t.Fatalf("%d live Runs, want the cap %d", live, e.cfg.MaxRunners)
+			}
+			// One delivered repository: 2 run lists, 1 job list, 1 runner
+			// list, and at most 1 JIT registration.
+			if wokenMax > 5 {
+				t.Fatalf("a woken pass made %d calls", wokenMax)
 			}
 			if total >= 5000 {
 				t.Fatalf("%d calls in the hour over %d passes", total, len(calls))
 			}
-			t.Logf("%d passes, %d calls in the hour, max %d per pass", len(calls), total, slices.Max(calls))
+			t.Logf("%d passes, %d calls in the hour, max %d per pass, max %d per woken pass", len(calls), total, slices.Max(calls), wokenMax)
 		})
 	}
 }

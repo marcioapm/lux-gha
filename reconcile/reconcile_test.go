@@ -87,6 +87,12 @@ func (e *env) pass() Status {
 	return e.rec.Pass(context.Background())
 }
 
+// wake runs one woken pass, as Run does for a wake with no tick due.
+func (e *env) wake() Status {
+	e.t.Helper()
+	return e.rec.runPass(context.Background(), true)
+}
+
 func replace(old, new string) func(string) string {
 	return func(s string) string { return strings.Replace(s, old, new, 1) }
 }

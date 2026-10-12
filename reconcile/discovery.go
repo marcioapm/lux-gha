@@ -27,7 +27,10 @@ type discovery struct {
 	// A mark bridges GitHub's lag between the delivery and the job showing
 	// in the runs API; a read that lists the job drops it.
 	marks map[string]map[int64]time.Time
-
+	// delivered: lower-case owner/name with a matching queued delivery, or
+	// an unlisted repository's delivery, since the last selection; a woken
+	// pass reads only these.
+	delivered map[string]bool
 	// Touched only by the pass goroutine.
 	repos     []discovered // sorted by owner/name
 	refreshed time.Time    // last successful refresh
@@ -50,7 +53,8 @@ type discovered struct {
 }
 
 func newDiscovery() *discovery {
-	return &discovery{members: map[string]bool{}, marks: map[string]map[int64]time.Time{}, attempted: map[int64]time.Time{}, known: map[int64]bool{},
+	return &discovery{members: map[string]bool{}, marks: map[string]map[int64]time.Time{}, delivered: map[string]bool{},
+		attempted: map[int64]time.Time{}, known: map[int64]bool{},
 		runners: map[int64][]githubapp.Runner{}, demand: map[int64][]*config.Route{}, gone: map[int64]time.Time{}}
 }
 
@@ -78,6 +82,15 @@ func (r *Reconciler) NoteQueued(fullName string, jobID int64) {
 		r.disc.marks[key] = map[int64]time.Time{}
 	}
 	r.disc.marks[key][jobID] = r.now()
+	r.disc.delivered[key] = true
+	r.disc.mu.Unlock()
+}
+
+// noteUnlisted makes the next woken pass read a repository a delivery
+// named before the set listed it, once a refresh lists it.
+func (r *Reconciler) noteUnlisted(fullName string) {
+	r.disc.mu.Lock()
+	r.disc.delivered[strings.ToLower(fullName)] = true
 	r.disc.mu.Unlock()
 }
 
@@ -194,10 +207,10 @@ func (p *pass) forgetRemoved() {
 	}
 }
 
-// selectRepositories returns this pass's reads: every hot repository, every
-// repository not yet read successfully since startup, and the cold
-// repositories selected longest ago, as many as keep each read at least
-// once per coldSweep.
+// selectRepositories returns this pass's reads. A tick pass reads every hot
+// repository, every repository not yet read successfully since startup, and
+// the cold repositories selected longest ago, as many as keep each read at
+// least once per coldSweep. A woken pass reads only selectDelivered's.
 func (p *pass) selectRepositories() []string {
 	r, d := p.r, p.r.disc
 	rc := r.cfg.Reconcile
@@ -221,8 +234,14 @@ func (p *pass) selectRepositories() []string {
 	for name := range d.marks {
 		marked[name] = true
 	}
+	// A tick pass reads every marked repository, which covers these too.
+	delivered := d.delivered
+	d.delivered = map[string]bool{}
 	d.mu.Unlock()
 
+	if p.woken {
+		return p.selectDelivered(delivered)
+	}
 	var selected []string
 	var cold []discovered
 	hot, fresh := 0, 0
@@ -285,6 +304,79 @@ func (p *pass) servable(routes []*config.Route) bool {
 		}
 	}
 	return false
+}
+
+// selectDelivered returns, for a woken pass, the repositories in the set
+// delivered since the previous pass's selection. Every other repository is
+// unread this pass: nothing is created or removed in it, its live Runs count
+// through p.live, its remembered registrations hold slots, and requireKnown
+// blocks creation while one has never been read. The cold rotation's pace is
+// left to tick passes.
+func (p *pass) selectDelivered(delivered map[string]bool) []string {
+	var selected []string
+	for _, repo := range p.r.disc.repos {
+		if delivered[strings.ToLower(repo.full)] {
+			selected = append(selected, repo.full)
+		}
+	}
+	p.r.log.Debug("repositories selected for this woken pass", "known", len(p.r.disc.repos), "delivered", len(selected))
+	return selected
+}
+
+// requireKnown blocks creation this pass while a repository in the set has
+// not been read successfully since startup and was not read now: it may hold
+// a registration from before a restart whose submission is unresolved, which
+// holdUnreadRegistrations cannot hold because nothing of it is remembered.
+// A tick pass selects every such repository, so there only a failed read
+// trips it; a woken pass reads only delivered repositories.
+func (p *pass) requireKnown() {
+	d := p.r.disc
+	read := map[int64]bool{}
+	for _, v := range p.repos {
+		read[v.id] = true
+	}
+	for _, repo := range d.repos {
+		if !d.known[repo.id] && !read[repo.id] {
+			p.r.log.Debug("not provisioning: a repository has not been read since startup", "repository", repo.full)
+			p.unread = true
+			return
+		}
+	}
+}
+
+// pruneTimers drops m's entries absent from keep. On a woken discovery pass
+// only entries of repositories read this pass are dropped: the others were
+// not observed, and their grace periods continue until a pass reads them.
+func (p *pass) pruneTimers(m map[string]time.Time, keep map[string]bool, runIDs bool) {
+	if !p.woken || p.r.disc == nil {
+		prune(m, keep)
+		return
+	}
+	read := map[string]bool{}
+	var prefixes []string
+	for _, v := range p.repos {
+		read[strconv.FormatInt(v.id, 10)] = true
+		prefixes = append(prefixes, p.r.runnerPrefix(v.id))
+	}
+	runRepo := map[string]string{}
+	for _, run := range p.live {
+		runRepo[run.ID] = run.Labels[LabelRepo]
+	}
+	for k := range m {
+		if keep[k] {
+			continue
+		}
+		var observed bool
+		if runIDs {
+			repo, live := runRepo[k]
+			observed = !live || read[repo]
+		} else {
+			observed = slices.ContainsFunc(prefixes, func(prefix string) bool { return strings.HasPrefix(k, prefix) })
+		}
+		if observed {
+			delete(m, k)
+		}
+	}
 }
 
 // noteRead moves a selected repository to the back of the cold rotation,

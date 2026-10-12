@@ -32,6 +32,7 @@ func (r *Reconciler) Webhook(secret []byte) (*webhook.Handler, error) {
 		if queuedMatching(ev) {
 			r.NoteQueued(ev.Repository, ev.JobID)
 		}
+		r.noteUnlisted(ev.Repository)
 		r.RequestRepositoryRefresh()
 		return nil
 	}

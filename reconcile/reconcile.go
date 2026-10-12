@@ -120,6 +120,8 @@ type Reconciler struct {
 	wake  chan struct{}
 	// passHook, set only by tests, observes Run entering and leaving a pass.
 	passHook func(enter bool)
+	// ticker starts Run's interval timer; tests replace it.
+	ticker func(time.Duration) (<-chan time.Time, func())
 
 	// Touched only by the pass goroutine.
 	repoIDs          map[string]int64
@@ -153,6 +155,10 @@ func New(o Options) (*Reconciler, error) {
 		surplusSince: map[string]time.Time{},
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
+		ticker: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTicker(d)
+			return t.C, t.Stop
+		},
 	}
 	if o.Config.DiscoverRepositories() {
 		r.disc = newDiscovery()
@@ -169,14 +175,16 @@ func (r *Reconciler) Wake() {
 }
 
 // Run passes once immediately, then on every tick or wake until ctx ends. It
-// is the only caller of Pass, which keeps passes serialized. A wake starts a
-// pass no sooner than minGap after the previous pass started, which bounds
-// the GitHub requests a stream of webhook deliveries can cause.
+// is the only caller of runPass, which keeps passes serialized. A wake starts
+// a pass no sooner than minGap after the previous pass started, which bounds
+// the GitHub requests a stream of webhook deliveries can cause. The first
+// pass is a tick pass, and so is a woken pass with a tick due when it starts.
 func (r *Reconciler) Run(ctx context.Context) {
 	interval := r.cfg.Reconcile.Interval.Duration
 	minGap := max(5*time.Second, interval/12)
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	tick, stop := r.ticker(interval)
+	defer stop()
+	woken := false
 	for {
 		start := r.now()
 		// A wake that arrived before this pass starts is served by it; left
@@ -186,24 +194,27 @@ func (r *Reconciler) Run(ctx context.Context) {
 		default:
 		}
 		r.observe(true)
-		r.Pass(ctx)
+		r.runPass(ctx, woken)
 		r.observe(false)
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-tick:
+			woken = false
 		case <-r.wake:
+			woken = true
 			if wait := start.Add(minGap).Sub(r.now()); wait > 0 {
 				select {
 				case <-ctx.Done():
 					return
 				case <-r.after(wait):
 				}
-				// The woken pass serves a tick buffered during the wait.
-				select {
-				case <-t.C:
-				default:
-				}
+			}
+			// A tick buffered by now is served by this pass, as a tick.
+			select {
+			case <-tick:
+				woken = false
+			default:
 			}
 		}
 	}
@@ -227,10 +238,17 @@ func (r *Reconciler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(st)
 }
 
-// Pass runs one reconciliation. It must not run concurrently with itself.
+// Pass runs one tick pass. It must not run concurrently with itself.
 func (r *Reconciler) Pass(ctx context.Context) Status {
+	return r.runPass(ctx, false)
+}
+
+// runPass runs one reconciliation. With discovery, a woken pass reads only
+// the repositories with a delivery since the previous pass; with an explicit
+// list, woken and tick passes are the same.
+func (r *Reconciler) runPass(ctx context.Context, woken bool) Status {
 	start := r.now()
-	p := &pass{r: r, ctx: ctx, ended: map[string]bool{}, st: Status{Time: start, Demand: map[string]int{}, Live: map[string]int{}}}
+	p := &pass{r: r, ctx: ctx, woken: woken, ended: map[string]bool{}, st: Status{Time: start, Demand: map[string]int{}, Live: map[string]int{}}}
 	if start.Before(r.rateLimitedUntil) {
 		p.st.Error = ErrRateLimited
 	} else if err := p.run(); err != nil {
@@ -263,11 +281,13 @@ type repoView struct {
 type pass struct {
 	r         *Reconciler
 	ctx       context.Context
+	woken     bool
 	st        Status
 	repos     []*repoView
 	truncated bool
-	// unread: a configured repository could not be read this pass, so its
-	// unresolved submissions are unknown and no Run may be created.
+	// unread: a repository's registrations are unknown this pass (its read
+	// failed, or it has not been read since startup), so its unresolved
+	// submissions are unknown and no Run may be created.
 	unread    bool
 	live      []luxclient.Run
 	ended     map[string]bool // Run ids terminated this pass
@@ -340,6 +360,7 @@ func (p *pass) runDiscovered() error {
 	if err := p.readGitHub(p.selectRepositories()); err != nil {
 		return err
 	}
+	p.requireKnown()
 	return p.act()
 }
 
@@ -940,7 +961,7 @@ func (p *pass) removeSurplus() error {
 			r.log.Info("removed surplus runner", "runner", c.runner.Name, "run", c.run.ID)
 		}
 	}
-	prune(r.surplusSince, seen)
+	p.pruneTimers(r.surplusSince, seen, false)
 	return nil
 }
 
@@ -1008,8 +1029,8 @@ func (p *pass) cleanUp() error {
 			r.log.Info("deleted orphan runner", "runner", name)
 		}
 	}
-	prune(r.missingSince, missing)
-	prune(r.offlineSince, offline)
+	p.pruneTimers(r.missingSince, missing, true)
+	p.pruneTimers(r.offlineSince, offline, false)
 	return nil
 }
 
