@@ -140,7 +140,8 @@ webhook accepts `workflow_job` deliveries for repositories in the set and
 checks the installation ID exactly as with a list.
 
 **Hot and cold.** Reading all of a large installation every pass would exceed
-its rate limit, so each pass reads:
+its rate limit, so each **tick pass** (the first pass, and every `interval`)
+reads:
 
 - every **hot** repository: one with a live managed Run in Lux; one whose
   last read found a managed runner; one whose last read found a queued job a
@@ -159,8 +160,17 @@ its rate limit, so each pass reads:
 The per-pass counts (known, hot, new, cold, read, skipped) are logged at debug.
 A pass lists Lux's live Runs before it selects repositories, so a Run that
 appeared since the last pass makes its repository hot at once. Demand the
-caps keep unserved goes cold; the pass after a slot frees reads every
+caps keep unserved goes cold; the tick pass after a slot frees reads every
 repository whose last read found demand again.
+
+A **woken pass** (a matching `queued` delivery woke the loop, and no tick is
+due) reads only the repositories with such a delivery, or a `workflow_job`
+delivery from outside the set, since the previous pass selected its
+repositories; a refresh an installation event requested still lists the
+installation first. Every other repository is unread in that pass, under the
+rules below. A tick that comes due while a wake waits out the minimum gap
+makes that pass a tick pass. With `repositories`, woken and tick passes both
+read every listed repository.
 
 A repository that leaves the set (removed from the installation, archived or
 disabled) is no longer read. Its live Runs are neither adopted nor
@@ -171,72 +181,90 @@ removal whose `installation_repositories` delivery was lost blocks creation
 for a pass or two, not `repositoryRefresh`.
 
 **Rate-limit arithmetic.** With the defaults (`interval` 60 s, `coldSweep`
-10 m) and 68 repositories of which 2 are hot, a ticked pass reads the 2 hot
+10 m) and 68 repositories of which 2 are hot, a tick pass reads the 2 hot
 repositories (`2 × (3 + their active runs)`, 8 with one active run each)
 and about `66 / 9 ≈ 7.3` cold ones at 3 requests each (22), plus one listing
 page every 10 minutes: about 30 requests per pass, about 1,800 per hour.
 The cold share is paced by time, not by passes, so it stays near
 `66 × 3 × 60 / 9 ≈ 1,320` requests per hour however often webhooks wake the
-loop; woken passes add only hot reads. The startup pass reads every
-repository once, at about 3 requests each (about `68 × 3 ≈ 204`). An
-installation's limit is 5,000 requests per hour (more for large
-organisations), so this leaves well over half of it free.
+loop. The startup pass reads every repository once, at about 3 requests each
+(about `68 × 3 ≈ 204`). An installation's limit is 5,000 requests per hour
+(more for large organisations), so this leaves well over half of it free.
 
-Hot reads are what passes multiply: the worst case is
-`hot × ~4 requests × passes per hour`, where woken passes come at most every
-5 s (720 per hour). During a burst the hot set is bounded by free capacity,
-not by the installation: repositories with live Runs (at most `maxRunners`),
-demand only while a slot is free for it, and deliveries whose job no read has
-listed yet. With `maxRunners` 10 and every slot used by a different
-repository, an hour of ticks costs about `10 × 4 × 60 = 2,400` hot requests
-on top of the cold share, but 15 minutes of 5 s wakes cost about
-`10 × 4 × 180 = 7,200`. A sustained stream of matching `queued` deliveries
-with many live Runs can therefore exceed the limit, as with a `repositories`
-list; a rate limit then pauses passes until GitHub's reset time.
+Hot reads happen once per tick: `hot × ~4 requests × 60` per hour. A woken
+pass costs about `K × 4` requests, K being the repositories with a delivery
+since the previous pass, whatever the hot set; so wakes, at most every 5 s,
+add about 4 requests per delivered repository rather than a hot-set read.
+During a burst the hot set is bounded by free capacity, not by the
+installation: repositories with live Runs (at most `maxRunners`), demand only
+while a slot is free for it, and deliveries whose job no read has listed yet.
+The burst worst case is therefore about
+`hot × 4 × 60 + deliveries × 4` per hour on top of the cold share. With
+`maxRunners` 10, every slot used by a different repository, and a backlog of
+67 matching `queued` deliveries arriving one per 5 s wake over 15 minutes,
+that is `10 × 4 × 60 + 67 × 4 ≈ 2,700`; the test suite measures 4,287
+requests in that hour with the cold share and the first tick's reads of
+every delivered repository, and 1,803 for 2 hot repositories with 10
+minutes of wakes. Past that, a rate limit pauses passes until GitHub's reset
+time.
 
 ### Lifecycle safety with partial reads
 
 Every rule below holds per pass for the repositories read in it; an unread
-repository is unknown, as above.
+repository is unknown, as above. A woken pass reads only its delivered
+repositories, so it leaves more repositories unread than a tick pass; the
+rules need nothing more of it than they need of a tick pass with a failed
+read.
 
 - **Unread repositories.** Nothing is created, terminated or deleted for a
   repository the pass did not read, and its live Runs count against both caps
-  through the Lux listing. A hot repository is read every pass, so a
-  repository left unread has no live Run and no remembered runner, unless its
-  read failed or it left the set; then its live Runs are kept and
-  counted all the same.
+  through the Lux listing. A hot repository is read every tick pass, so a
+  repository a tick pass leaves unread has no live Run and no remembered
+  runner, unless its read failed or it left the set; then its live Runs are
+  kept and counted all the same. A woken pass leaves hot repositories unread
+  too, with their live Runs counted the same way. The grace timers of
+  unread repositories (`idleGrace` for surplus, finished and orphaned
+  runners) keep running across woken passes; only a pass that reads the
+  repository resets or acts on them.
 - **Read failure.** If any repository selected this pass fails to read, no Run
   is created that pass, exactly as with a list. A cold repository that keeps
   failing blocks creation only on the passes that select it (its rotation slot
   moves on). A hot one, or one not yet read successfully since startup, is
-  selected every pass and so blocks creation until it reads: it may hold a
-  registration whose submission is unresolved. A repository that stays in the
-  listing but always fails to read therefore blocks creation in every
+  selected every tick pass and so blocks creation until it reads: it may hold
+  a registration whose submission is unresolved. A repository that stays in
+  the listing but always fails to read therefore blocks creation in every
   repository; it is logged at `WARN` with its name, and without
   `repositories` the fix is to remove it from the installation.
 - **Unresolved submissions.** A registered runner with no Run may still have a
   submission in flight, so it holds a cap slot. In a repository read this pass
-  it is classified as before. A repository with a remembered managed runner is
-  hot, so it is read every pass; if that read fails, creation is blocked. If it
-  left the set, its remembered runners without a live Run keep holding
-  slots for `idleGrace` after it left, the same delay orphan cleanup gives a
-  readable one. A repository first seen after a restart is read on the first
-  pass that lists it, so a registration from before the restart is found before
-  it can be outrun.
+  it is classified as before. In any other repository, a remembered managed
+  runner whose name no live Run carries holds a slot, against the global cap
+  and each route its labels match; a remembered runner is what its last
+  successful read found, plus the runners this process registered. A
+  repository with a remembered managed runner is hot, so every tick pass reads
+  it; if that read fails, creation is blocked. If it left the set, its
+  remembered runners without a live Run keep holding slots for `idleGrace`
+  after it left, the same delay orphan cleanup gives a readable one.
+- **Restart.** After a restart nothing is remembered, so a registration left
+  by the previous process cannot hold a slot until its repository is read. No
+  Run is created by any pass, tick or woken, while a repository in the set
+  has not been read successfully since startup and was not read in that pass.
+  The first tick pass selects every such repository; a woken pass before it
+  reads only its delivered repositories and so creates nothing.
 - **Adoption of late Runs.** A submission whose outcome was unknown commits
-  into Lux; the next pass's Lux listing makes its repository hot, so it is read
-  and its job adopts the Run as before. An adopted Run counts against the caps
-  from the moment Lux lists it, read or not.
+  into Lux; the next tick pass's Lux listing makes its repository hot, so it
+  is read and its job adopts the Run as before. An adopted Run counts against
+  the caps from the moment Lux lists it, read or not.
 - **Surplus deletion.** Deletes only idle runners whose repository was read
   this pass, compares them with that repository's demand, and terminates a Run
   only after its runner was deleted. No unread repository's Run is reached.
 - **Finished Runs.** A live Run whose runner is gone is terminated only when
   its repository was read and lacked the runner, in two passes `idleGrace`
-  apart. Its live Run makes the repository hot, so it is read every pass.
+  apart. Its live Run makes the repository hot, so every tick pass reads it.
 - **Orphans.** A cold repository has no Run Lux knows of. An orphaned runner
   there (offline, no live Run) is seen when the repository is next read,
   within `coldSweep`, which makes the repository hot; it is deleted
-  `idleGrace` later.
+  `idleGrace` later, by a pass that reads it.
 - **Caps.** The global and route caps count every live Run of the instance
   and every held slot, regardless of which repositories were read.
 
