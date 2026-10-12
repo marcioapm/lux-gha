@@ -158,6 +158,36 @@ func TestAllowsRepositoryIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestRepositoriesAreOptional(t *testing.T) {
+	explicit, err := Parse([]byte(validConfig))
+	if err != nil || explicit.DiscoverRepositories() {
+		t.Fatalf("explicit list: discover=%v err=%v", explicit.DiscoverRepositories(), err)
+	}
+	discovered, err := Parse(mutate(`"repositories": ["acme/widgets"],`, ``))
+	if err != nil || !discovered.DiscoverRepositories() || discovered.AllowsRepository("acme/widgets") {
+		t.Fatalf("absent list: discover=%v err=%v", discovered.DiscoverRepositories(), err)
+	}
+	rc := discovered.Reconcile
+	if rc.RepositoryRefresh.Duration != DefaultRepositoryRefresh || rc.HotWindow.Duration != DefaultHotWindow || rc.ColdSweep.Duration != DefaultColdSweep {
+		t.Fatalf("discovery defaults not applied: %+v", rc)
+	}
+	tuned, err := Parse(mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"repositoryRefresh": "5m", "hotWindow": "30m", "coldSweep": "20m"},`))
+	if err != nil || tuned.Reconcile.RepositoryRefresh.Duration != 5*time.Minute || tuned.Reconcile.HotWindow.Duration != 30*time.Minute ||
+		tuned.Reconcile.ColdSweep.Duration != 20*time.Minute {
+		t.Fatalf("discovery overrides: %+v err=%v", tuned, err)
+	}
+	for name, input := range map[string][]byte{
+		"empty list":                 mutate(`["acme/widgets"]`, `[]`),
+		"negative repositoryRefresh": mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"repositoryRefresh": "-1m"},`),
+		"negative hotWindow":         mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"hotWindow": "-1m"},`),
+		"negative coldSweep":         mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"coldSweep": "-1m"},`),
+	} {
+		if _, err := Parse(input); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}
+
 func TestLoadSecretsTrimsNewlineAndRedacts(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, v string) string {

@@ -20,13 +20,15 @@ import (
 type Config struct {
 	Listen string `json:"listen"`
 	// Instance names this bridge in Run labels and runner names.
-	Instance     string    `json:"instance"`
-	MaxRunners   int       `json:"maxRunners"`
-	Reconcile    Reconcile `json:"reconcile"`
-	GitHub       GitHub    `json:"github"`
-	Lux          Lux       `json:"lux"`
-	Repositories []string  `json:"repositories"`
-	Routes       []Route   `json:"routes"`
+	Instance   string    `json:"instance"`
+	MaxRunners int       `json:"maxRunners"`
+	Reconcile  Reconcile `json:"reconcile"`
+	GitHub     GitHub    `json:"github"`
+	Lux        Lux       `json:"lux"`
+	// Repositories is nil when the field is absent: the repositories are
+	// then discovered from the installation.
+	Repositories []string `json:"repositories"`
+	Routes       []Route  `json:"routes"`
 }
 
 // Reconcile tunes the reconciler; zero fields take the defaults below.
@@ -35,13 +37,20 @@ type Reconcile struct {
 	IdleGrace      Duration `json:"idleGrace"`
 	MaxJobsPerPass int      `json:"maxJobsPerPass"`
 	MaxGensPerJob  int      `json:"maxGensPerJob"`
+	// The three below apply only when repositories are discovered.
+	RepositoryRefresh Duration `json:"repositoryRefresh"`
+	HotWindow         Duration `json:"hotWindow"`
+	ColdSweep         Duration `json:"coldSweep"`
 }
 
 const (
-	DefaultInterval       = 60 * time.Second
-	DefaultIdleGrace      = 2 * time.Minute
-	DefaultMaxJobsPerPass = 200
-	DefaultMaxGensPerJob  = 5
+	DefaultInterval          = 60 * time.Second
+	DefaultIdleGrace         = 2 * time.Minute
+	DefaultMaxJobsPerPass    = 200
+	DefaultMaxGensPerJob     = 5
+	DefaultRepositoryRefresh = 10 * time.Minute
+	DefaultHotWindow         = 15 * time.Minute
+	DefaultColdSweep         = 10 * time.Minute
 )
 
 type GitHub struct {
@@ -160,8 +169,18 @@ func (c *Config) validate() error {
 		add("maxRunners must be positive")
 	}
 	rc := &c.Reconcile
-	if rc.Interval.Duration < 0 || rc.IdleGrace.Duration < 0 || rc.MaxJobsPerPass < 0 || rc.MaxGensPerJob < 0 {
+	if rc.Interval.Duration < 0 || rc.IdleGrace.Duration < 0 || rc.MaxJobsPerPass < 0 || rc.MaxGensPerJob < 0 ||
+		rc.RepositoryRefresh.Duration < 0 || rc.HotWindow.Duration < 0 || rc.ColdSweep.Duration < 0 {
 		add("reconcile: values must not be negative")
+	}
+	if rc.RepositoryRefresh.Duration == 0 {
+		rc.RepositoryRefresh.Duration = DefaultRepositoryRefresh
+	}
+	if rc.HotWindow.Duration == 0 {
+		rc.HotWindow.Duration = DefaultHotWindow
+	}
+	if rc.ColdSweep.Duration == 0 {
+		rc.ColdSweep.Duration = DefaultColdSweep
 	}
 	if rc.Interval.Duration == 0 {
 		rc.Interval.Duration = DefaultInterval
@@ -200,8 +219,10 @@ func (c *Config) validate() error {
 		add("lux.apiKeyFile is required")
 	}
 
-	if len(c.Repositories) == 0 {
-		add("repositories: at least one owner/name is required")
+	// An absent field means discovery; an empty list is more likely a
+	// mistake than a request for every repository.
+	if c.Repositories != nil && len(c.Repositories) == 0 {
+		add("repositories: list at least one owner/name, or omit the field to serve every repository of the installation")
 	}
 	seenRepo := map[string]bool{}
 	for _, r := range c.Repositories {
@@ -279,6 +300,10 @@ func (c *Config) validate() error {
 	}
 	return errors.Join(errs...)
 }
+
+// DiscoverRepositories reports whether the repository set comes from the
+// installation rather than from Repositories.
+func (c *Config) DiscoverRepositories() bool { return c.Repositories == nil }
 
 // AllowsRepository reports whether owner/name is configured (case-insensitive).
 func (c *Config) AllowsRepository(fullName string) bool {
