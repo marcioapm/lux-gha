@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="1024" height="1024">
+  <title>lux-gha</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1d4f94"/>
+      <stop offset="1" stop-color="#0d2a52"/>
+    </linearGradient>
+    <radialGradient id="lux-core" cx="128" cy="128" r="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".35" stop-color="#fff4cc"/>
+      <stop offset=".7" stop-color="#ffd166" stop-opacity=".6"/>
+      <stop offset="1" stop-color="#ffd166" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="lux-head" x1="84" y1="84" x2="172" y2="172" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff4cc"/>
+      <stop offset=".5" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#ff9f43"/>
+    </linearGradient>
+    <clipPath id="lux-star"><path d="M128 16Q137 119 240 128Q137 137 128 240Q119 137 16 128Q119 119 128 16Z"/></clipPath>
+    <filter id="lux-soft" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="10"/></filter>
+  </defs>
+
+  <!-- tile -->
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+
+  <!-- Lux's star (docs/brand/lux.svg, unchanged), centred and scaled -->
+  <g transform="translate(74 66) scale(1.42)">
+    <circle cx="128" cy="128" r="80" fill="#ffd166" opacity=".4" filter="url(#lux-soft)"/>
+    <g clip-path="url(#lux-star)">
+      <rect width="256" height="256" fill="url(#lux-head)"/>
+      <path d="M128 16L99 99L128 128Z" fill="#fffbe6"/>
+      <path d="M16 128L99 99L128 128Z" fill="#fff4cc"/>
+      <path d="M128 16L157 99L128 128Z" fill="#ffe08a"/>
+      <path d="M16 128L99 157L128 128Z" fill="#ffd166"/>
+      <path d="M240 128L157 99L128 128Z" fill="#ffc247"/>
+      <path d="M128 240L99 157L128 128Z" fill="#ffb347"/>
+      <path d="M240 128L157 157L128 128Z" fill="#ff9f43"/>
+      <path d="M128 240L157 157L128 128Z" fill="#f2812e"/>
+      <circle cx="128" cy="128" r="58" fill="url(#lux-core)"/>
+      <path d="M121 40L114 96L90 110" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" opacity=".9"/>
+    </g>
+    <path d="M128 16Q137 119 240 128Q137 137 128 240Q119 137 16 128Q119 119 128 16Z" fill="none" stroke="#0d2a52" stroke-width="6" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Actions badge: a play mark in a circle, bottom right -->
+  <g transform="translate(384 384)">
+    <circle r="78" fill="#0d2a52"/>
+    <circle r="64" fill="#ffffff"/>
+    <circle r="64" fill="none" stroke="#2f81f7" stroke-width="10"/>
+    <path d="M-18 -30L34 0L-18 30Z" fill="#2f81f7" stroke="#2f81f7" stroke-width="8" stroke-linejoin="round"/>
+  </g>
+</svg>

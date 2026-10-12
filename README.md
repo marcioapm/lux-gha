@@ -1,4 +1,4 @@
-# lux-gha
+# <img src="docs/brand/lux-gha.svg" alt="" width="36" align="top"> lux-gha
 
 A bridge supplying one-shot, just-in-time GitHub Actions self-hosted runners
 as Lux generic Runs. GitHub remains the workflow engine; Lux runs the runner
