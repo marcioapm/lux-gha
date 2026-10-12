@@ -284,3 +284,107 @@ func TestNewRequiresAllInputs(t *testing.T) {
 		t.Fatal("nil callback accepted")
 	}
 }
+
+type installRecorder struct{ events []InstallationEvent }
+
+func (r *installRecorder) on(_ context.Context, e InstallationEvent) error {
+	r.events = append(r.events, e)
+	return nil
+}
+
+func installationBody(action string, installation int64) []byte {
+	return []byte(`{"action":"` + action + `","installation":{"id":` + strconv.FormatInt(installation, 10) + `},
+		"repositories_added":[{"id":1,"full_name":"acme/new"}],"repositories_removed":[]}`)
+}
+
+func TestInstallationEventsAreSignedSignals(t *testing.T) {
+	type tc struct {
+		event, action string
+		installation  int64
+		want          int
+	}
+	var cases []tc
+	for event, actions := range InstallationActions {
+		for action := range actions {
+			cases = append(cases, tc{event, action, 42, http.StatusAccepted}, tc{event, action, 7, http.StatusNoContent})
+		}
+	}
+	cases = append(cases,
+		tc{"installation", "created", 42, http.StatusNoContent},
+		tc{"installation_repositories", "renamed", 42, http.StatusNoContent},
+	)
+	for _, c := range cases {
+		t.Run(c.event+"/"+c.action+"/"+strconv.FormatInt(c.installation, 10), func(t *testing.T) {
+			jobs, installs := &recorder{}, &installRecorder{}
+			h := newHandler(t, jobs.on, nil)
+			h.OnInstallation = installs.on
+			body := installationBody(c.action, c.installation)
+			w := deliver(h, c.event, body, sign(body))
+			wantCalls := 0
+			if c.want == http.StatusAccepted {
+				wantCalls = 1
+			}
+			if w.Code != c.want || len(installs.events) != wantCalls || len(jobs.events) != 0 {
+				t.Fatalf("status %d, installation callbacks %d", w.Code, len(installs.events))
+			}
+			if wantCalls == 1 {
+				if got := installs.events[0]; got.Event != c.event || got.Action != c.action || got.InstallationID != 42 {
+					t.Fatalf("event %+v", got)
+				}
+			}
+			// The signature is checked before the event type is looked at.
+			for _, sig := range []string{"", "sha256=" + hex.EncodeToString(make([]byte, sha256.Size))} {
+				if w := deliver(h, c.event, body, sig); w.Code != http.StatusUnauthorized || len(installs.events) != wantCalls {
+					t.Fatalf("signature %q: status %d, callbacks %d", sig, w.Code, len(installs.events))
+				}
+			}
+		})
+	}
+	// Without OnInstallation the events are ignored as before.
+	installs := &installRecorder{}
+	body := installationBody("added", 42)
+	if w := deliver(newHandler(t, (&recorder{}).on, nil), "installation_repositories", body, sign(body)); w.Code != http.StatusNoContent {
+		t.Fatalf("no callback: status %d", w.Code)
+	}
+	h := newHandler(t, (&recorder{}).on, nil)
+	h.OnInstallation = func(context.Context, InstallationEvent) error { return errors.New("x") }
+	if w := deliver(h, "installation", installationBody("deleted", 42), sign(installationBody("deleted", 42))); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failing callback: status %d", w.Code)
+	}
+	for _, bad := range [][]byte{[]byte(`{"action":`), []byte(`{"action":"added"}`)} {
+		h.OnInstallation = installs.on
+		if w := deliver(h, "installation_repositories", bad, sign(bad)); w.Code != http.StatusBadRequest || len(installs.events) != 0 {
+			t.Fatalf("malformed %s: status %d", bad, w.Code)
+		}
+	}
+}
+
+func TestUnlistedRepositoryOfOurInstallationGoesToItsCallback(t *testing.T) {
+	queued := fixture(t, "workflow_job_queued.json")
+	otherRepo := bytes.Replace(queued, []byte(`"full_name": "acme/widgets"`), []byte(`"full_name": "acme/new"`), 1)
+	otherBoth := bytes.Replace(otherRepo, []byte(`"installation": {"id": 42}`), []byte(`"installation": {"id": 7}`), 1)
+	otherInstall := bytes.Replace(queued, []byte(`"installation": {"id": 42}`), []byte(`"installation": {"id": 7}`), 1)
+	for _, c := range []struct {
+		name               string
+		body               []byte
+		code, jobs, misses int
+	}{
+		{"in the set", queued, http.StatusAccepted, 1, 0},
+		{"outside the set", otherRepo, http.StatusAccepted, 0, 1},
+		{"other installation, outside the set", otherBoth, http.StatusNoContent, 0, 0},
+		{"other installation, in the set", otherInstall, http.StatusNoContent, 0, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			jobs, misses := &recorder{}, &recorder{}
+			h := newHandler(t, jobs.on, nil)
+			h.OnUnlistedRepository = misses.on
+			w := deliver(h, "workflow_job", c.body, sign(c.body))
+			if w.Code != c.code || len(jobs.events) != c.jobs || len(misses.events) != c.misses {
+				t.Fatalf("status %d, jobs %d, unlisted %d", w.Code, len(jobs.events), len(misses.events))
+			}
+			if c.misses == 1 && (misses.events[0].Repository != "acme/new" || misses.events[0].Action != "queued") {
+				t.Fatalf("unlisted event %+v", misses.events[0])
+			}
+		})
+	}
+}

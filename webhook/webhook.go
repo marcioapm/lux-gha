@@ -1,5 +1,6 @@
 // Package webhook verifies GitHub webhook deliveries and forwards
-// workflow_job events for allowed repositories to a callback.
+// workflow_job events for allowed repositories, and optionally changes to
+// the installation's repositories, to callbacks.
 //
 // The callback runs inside the HTTP request and must be a fast signal: GitHub
 // abandons deliveries that take longer than 10 seconds. A callback error
@@ -52,6 +53,29 @@ type Handler struct {
 	AllowRepo      func(fullName string) bool
 	OnWorkflowJob  func(context.Context, WorkflowJobEvent) error
 	Log            *slog.Logger
+	// OnUnlistedRepository, when set, receives a workflow_job of
+	// InstallationID whose repository AllowRepo rejects; without it such a
+	// delivery is ignored.
+	OnUnlistedRepository func(context.Context, WorkflowJobEvent) error
+	// OnInstallation, when set, receives InstallationID's installation and
+	// installation_repositories deliveries with an action in
+	// InstallationActions; without it they are ignored.
+	OnInstallation func(context.Context, InstallationEvent) error
+}
+
+// InstallationEvent is a change to the repositories an installation can
+// access. Its payload is not read further: the receiver re-lists them.
+type InstallationEvent struct {
+	DeliveryID     string
+	Event          string // installation or installation_repositories
+	Action         string
+	InstallationID int64
+}
+
+// InstallationActions are the actions forwarded to OnInstallation, by event.
+var InstallationActions = map[string]map[string]bool{
+	"installation_repositories": {"added": true, "removed": true},
+	"installation":              {"deleted": true, "suspend": true, "unsuspend": true, "new_permissions_accepted": true},
 }
 
 var knownActions = map[string]bool{"queued": true, "waiting": true, "in_progress": true, "completed": true}
@@ -105,6 +129,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if _, ok := InstallationActions[event]; ok && h.OnInstallation != nil {
+		h.serveInstallation(w, r, body, event, delivery, log)
+		return
+	}
 	if event != "workflow_job" {
 		log.Debug("ignored event")
 		w.WriteHeader(http.StatusNoContent)
@@ -123,7 +151,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "incomplete workflow_job payload", http.StatusBadRequest)
 		return
 	}
-	if p.Installation.ID != h.InstallationID || !h.AllowRepo(p.Repository.FullName) {
+	unlisted := p.Installation.ID == h.InstallationID && h.OnUnlistedRepository != nil && !h.AllowRepo(p.Repository.FullName)
+	if !unlisted && (p.Installation.ID != h.InstallationID || !h.AllowRepo(p.Repository.FullName)) {
 		log.Warn("ignored workflow_job from unconfigured source", "installation", p.Installation.ID, "repository", p.Repository.FullName)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -155,11 +184,51 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if j.RunnerName != nil {
 		ev.RunnerName = *j.RunnerName
 	}
+	callback := h.OnWorkflowJob
+	if unlisted {
+		log.Info("workflow_job from a repository outside the current set", "repository", ev.Repository)
+		callback = h.OnUnlistedRepository
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), CallbackTimeout)
 	defer cancel()
-	if err := h.OnWorkflowJob(ctx, ev); err != nil {
+	if err := callback(ctx, ev); err != nil {
 		// The callback error is logged by type only so wrapped secrets never reach logs or GitHub.
 		log.Error("workflow_job callback failed", "job", ev.JobID, "action", ev.Action, "error_type", errorType(err))
+		http.Error(w, "temporarily unable to process delivery", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (h *Handler) serveInstallation(w http.ResponseWriter, r *http.Request, body []byte, event, delivery string, log *slog.Logger) {
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
+	var p struct {
+		Action       string `json:"action"`
+		Installation *struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil {
+		http.Error(w, "malformed payload", http.StatusBadRequest)
+		return
+	}
+	if p.Installation == nil {
+		http.Error(w, "incomplete "+event+" payload", http.StatusBadRequest)
+		return
+	}
+	if p.Installation.ID != h.InstallationID || !InstallationActions[event][p.Action] {
+		log.Debug("ignored installation change", "installation", p.Installation.ID, "action", p.Action)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), CallbackTimeout)
+	defer cancel()
+	ev := InstallationEvent{DeliveryID: delivery, Event: event, Action: p.Action, InstallationID: p.Installation.ID}
+	if err := h.OnInstallation(ctx, ev); err != nil {
+		log.Error("installation callback failed", "action", ev.Action, "error_type", errorType(err))
 		http.Error(w, "temporarily unable to process delivery", http.StatusServiceUnavailable)
 		return
 	}
