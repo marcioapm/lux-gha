@@ -99,6 +99,7 @@ type PullRequestBase struct {
 }
 
 type HeadRepository struct {
+	ID    int64 `json:"id"`
 	Owner struct {
 		Login string `json:"login"`
 	} `json:"owner"`

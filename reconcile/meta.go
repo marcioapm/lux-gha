@@ -71,9 +71,10 @@ func newJobMeta(repoID int64, run githubapp.WorkflowRun, j githubapp.WorkflowJob
 		m.branch = *run.HeadBranch
 	}
 	// A pull request from a fork lists none into this repository; its head
-	// branch is the fork's, so it is shown as owner:branch.
+	// branch is the fork's, so it is shown as owner:branch. A head in this
+	// repository is never a fork's, even when GitHub lists no pull request.
 	if n == 0 && m.branch != "" && strings.HasPrefix(run.Event, "pull_request") &&
-		run.HeadRepository != nil && run.HeadRepository.Owner.Login != "" {
+		run.HeadRepository != nil && run.HeadRepository.ID != repoID && run.HeadRepository.Owner.Login != "" {
 		m.branch = run.HeadRepository.Owner.Login + ":" + m.branch
 	}
 	if m.runID == 0 {
@@ -151,12 +152,12 @@ func labelValue(s string) string {
 	return cutRunes(cleanText(s), luxclient.MaxLabelValue)
 }
 
-// cleanText replaces control characters, line and paragraph separators and
-// invalid UTF-8 with spaces, then collapses runs of whitespace.
+// cleanText replaces control characters and invalid UTF-8 with spaces, then
+// collapses runs of whitespace, which includes line and paragraph separators.
 func cleanText(s string) string {
 	s = strings.ToValidUTF8(s, " ")
 	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) {
+		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
