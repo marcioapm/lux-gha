@@ -80,6 +80,13 @@ type WorkflowRun struct {
 	WorkflowID int64     `json:"workflow_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// PullRequests is empty for a pull request from a fork: GitHub fills it
+	// only with pull requests whose head is in this repository.
+	PullRequests []PullRequestRef `json:"pull_requests"`
+}
+
+type PullRequestRef struct {
+	Number int64 `json:"number"`
 }
 
 // Page and PerPage default to GitHub's 1 and 30 when zero; PerPage is capped by GitHub at 100.
@@ -207,7 +214,6 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, repo Repository, opts Wor
 	if opts.Status != "" {
 		q.Set("status", opts.Status)
 	}
-	q.Set("exclude_pull_requests", "true")
 	out.HasNext, err = c.list(ctx, repo, "/actions/runs", q, &out)
 	return out, err
 }

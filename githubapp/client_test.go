@@ -529,11 +529,12 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 		q := r.URL.Query()
 		switch r.URL.Path {
 		case "/repos/octo-org/app.repo/actions/runs":
-			if q.Get("status") != "queued" || q.Get("exclude_pull_requests") != "true" {
+			if q.Get("status") != "queued" || q.Has("exclude_pull_requests") {
 				http.Error(w, "query", 400)
 				return
 			}
-			w.Write([]byte(`{"total_count":1,"workflow_runs":[{"id":5,"run_attempt":2,"status":"queued","conclusion":null,"head_sha":"abc"}]}`))
+			w.Write([]byte(`{"total_count":1,"workflow_runs":[{"id":5,"run_attempt":2,"status":"queued","conclusion":null,"head_sha":"abc",` +
+				`"head_branch":"feature/x","run_number":12,"event":"pull_request","name":"CI","pull_requests":[{"id":900,"number":34,"url":"u"}]}]}`))
 		case "/repos/octo-org/app.repo/actions/runs/5/jobs":
 			if q.Get("filter") != "all" {
 				http.Error(w, "query", 400)
@@ -553,6 +554,10 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 	runs, err := c.ListWorkflowRuns(context.Background(), repo, WorkflowRunListOptions{Status: "queued"})
 	if err != nil || runs.HasNext || len(runs.Runs) != 1 || runs.Runs[0].RunAttempt != 2 || *runs.Runs[0].Status != "queued" || runs.Runs[0].Conclusion != nil {
 		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	if r := runs.Runs[0]; *r.HeadBranch != "feature/x" || r.RunNumber != 12 || r.Event != "pull_request" || *r.Name != "CI" ||
+		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 {
+		t.Fatalf("run metadata %+v", r)
 	}
 	all, err := c.ListWorkflowRunJobs(context.Background(), repo, 5, WorkflowJobListOptions{Filter: "all"})
 	if err != nil || len(all.Jobs) != 2 {
