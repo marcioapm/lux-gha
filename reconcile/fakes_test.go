@@ -32,6 +32,8 @@ type fakeJob struct {
 	runner     string
 	runnerID   int64
 	name       string // defaults to build-<id>
+	workflow   string // workflow_name; empty sends null
+	attempt    int64
 }
 
 // fakeRepo is one repository's Actions state.
@@ -39,6 +41,9 @@ type fakeRepo struct {
 	id      int64
 	jobs    map[int64]*fakeJob
 	runners map[int64]*githubapp.Runner
+	// runs holds what the runs listing reports of a workflow run besides its
+	// id and status (name, branch, number, pull requests).
+	runs map[int64]githubapp.WorkflowRun
 	// unlisted runners exist but are missing from unfiltered listings, as a
 	// lagging listing would leave them.
 	unlisted map[string]bool
@@ -106,7 +111,7 @@ func newFakeGitHub(clock *fakeClock) *fakeGitHub {
 }
 
 func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
-	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, unlisted: map[string]bool{}}
+	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, runs: map[int64]githubapp.WorkflowRun{}, unlisted: map[string]bool{}}
 	f.repos[full] = r
 	return r
 }
@@ -192,7 +197,9 @@ func (f *fakeGitHub) ListWorkflowRuns(_ context.Context, repo githubapp.Reposito
 	var runs []githubapp.WorkflowRun
 	for _, id := range ids {
 		s := opts.Status
-		runs = append(runs, githubapp.WorkflowRun{ID: id, Status: &s})
+		run := r.runs[id]
+		run.ID, run.Status, run.HeadSHA = id, &s, fakeSHA(id)
+		runs = append(runs, run)
 	}
 	items, next := page(runs, opts.PageOptions, f.perPage)
 	return githubapp.WorkflowRunPage{TotalCount: len(runs), Runs: items, HasNext: next}, nil
@@ -215,7 +222,11 @@ func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repos
 			continue
 		}
 		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels,
-			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID)}
+			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID), RunAttempt: j.attempt}
+		if j.workflow != "" {
+			wf := j.workflow
+			out.WorkflowName = &wf
+		}
 		if j.conclusion != "" {
 			c := j.conclusion
 			out.Conclusion = &c
@@ -466,6 +477,13 @@ func (f *fakeGitHub) editJob(jobID int64, edit func(*fakeJob)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	edit(f.job(jobID))
+}
+
+// describeRun sets what acme/widgets' runs listing reports of a workflow run.
+func (f *fakeGitHub) describeRun(run githubapp.WorkflowRun) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos[widgets].runs[run.ID] = run
 }
 
 func (f *fakeGitHub) setOnline(name string, online bool) {

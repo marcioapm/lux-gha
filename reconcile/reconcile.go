@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -285,6 +286,7 @@ type repoView struct {
 	ref     githubapp.Repository
 	id      int64
 	demand  map[int64]*config.Route
+	meta    map[int64]jobMeta           // demand job id: what the listing said of it
 	runners map[string]githubapp.Runner // managed runners by name
 	seen    map[int64]bool              // every job id listed, any status
 	// stuck: in_progress jobs on this instance's runners, candidates for
@@ -422,7 +424,7 @@ func (p *pass) readGitHub(repositories []string) error {
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
-			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
+			demand: map[int64]*config.Route{}, meta: map[int64]jobMeta{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
 			runRunners: map[int64][]string{}, partial: map[int64]bool{}}
 		err := p.readRepo(v)
 		if p.rateLimited(err) {
@@ -495,7 +497,7 @@ func (p *pass) readDemand(v *repoView) error {
 			}
 			for _, run := range runs.Runs {
 				// Charged before the error check: a failed job page still spends it.
-				err := p.readRunJobs(v, run.ID)
+				err := p.readRunJobs(v, run)
 				p.statusBudget[i] = p.budget
 				if err != nil {
 					return err
@@ -512,7 +514,8 @@ func (p *pass) readDemand(v *repoView) error {
 	return nil
 }
 
-func (p *pass) readRunJobs(v *repoView, runID int64) error {
+func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
+	runID := run.ID
 	for page := 1; ; page++ {
 		if page > maxRunPages || p.budget <= 0 {
 			p.truncated = true
@@ -547,6 +550,7 @@ func (p *pass) readRunJobs(v *repoView, runID int64) error {
 				}
 				p.budget--
 				v.demand[j.ID] = route
+				v.meta[j.ID] = newJobMeta(run, j)
 			}
 		}
 		if !jobs.HasNext {
@@ -837,12 +841,16 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		return nil, nil
 	}
 	v.runners[name] = jit.Runner
+	meta := v.meta[j.jobID]
+	labels := metaLabels(v.full, meta)
+	// Set last: the identity labels are never shadowed by a descriptive one.
+	maps.Copy(labels, map[string]string{
+		LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelRoute: route.Name,
+		LabelJob: job, LabelGen: strconv.Itoa(gen), LabelRunner: name,
+	})
 	spec := luxclient.RunSpec{
-		Name: fmt.Sprintf("gha %s job %d", v.full, j.jobID),
-		Labels: map[string]string{
-			LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelRoute: route.Name,
-			LabelJob: job, LabelGen: strconv.Itoa(gen), LabelRunner: name,
-		},
+		Name:               runName(v.full, j.jobID, meta),
+		Labels:             labels,
 		ImageRef:           route.Image,
 		Command:            route.Command,
 		Env:                map[string]string{JITConfigEnv: JITConfigPath},

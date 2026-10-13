@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -113,6 +114,9 @@ func (e *env) runID(job string) string {
 func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 	e := newEnv(t)
 	e.gh.queue(7, "queued", "self-hosted", "lux")
+	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name, j.attempt = "Lib (Java)", "build", 2 })
+	branch := "lux/lib-on-lux"
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &branch, RunNumber: 12})
 	st := e.pass()
 	if st.Error != "" || st.Provisioned != 1 || st.Demand["default"] != 1 {
 		t.Fatalf("status %+v", st)
@@ -125,7 +129,11 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		t.Fatalf("JIT request %+v", req)
 	}
 	r := e.lux.all()[0]
-	wantLabels := map[string]string{LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "7", LabelGen: "0", LabelRunner: "lux-gha-t1-1001-7-0"}
+	identity := map[string]string{LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "7", LabelGen: "0", LabelRunner: "lux-gha-t1-1001-7-0"}
+	descriptive := map[string]string{LabelRepoName: "acme/widgets", LabelWorkflow: "Lib (Java)", LabelJobName: "build",
+		LabelRunID: "70", LabelRunAttempt: "2", LabelBranch: "lux/lib-on-lux", LabelSHA: "000000000000"}
+	wantLabels := maps.Clone(identity)
+	maps.Copy(wantLabels, descriptive)
 	if !mapsEqual(r.run.Labels, wantLabels) {
 		t.Fatalf("labels %v", r.run.Labels)
 	}
@@ -167,7 +175,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 	if err := json.Unmarshal(wire, &w); err != nil {
 		t.Fatal(err)
 	}
-	if w.Name != "gha acme/widgets job 7" || w.Image.Ref != "ghcr.io/acme/runner@sha256:abc" || w.Workload.Adapter != "generic" ||
+	if w.Name != "widgets · Lib (Java) / build · lux/lib-on-lux run 12" || w.Image.Ref != "ghcr.io/acme/runner@sha256:abc" || w.Workload.Adapter != "generic" ||
 		!slices.Equal(w.Workload.Command, []string{"/usr/local/bin/lux-gha-runner"}) || w.Workload.Grace != "1m0s" || w.Secrets[0].As != "file" ||
 		w.Resources.CPUs != 2 || w.Resources.Memory != 4096<<20 || w.Resources.Disk != 20<<30 || w.Timeout != "1h30m0s" ||
 		w.Placement.Pool != "gha" || len(w.Network.Egress) != 2 || w.Network.Egress[1].Host != "*.actions.githubusercontent.com" ||
@@ -289,6 +297,71 @@ func TestSwappedPickupKeepsBothBusyRunnersAndAddsNone(t *testing.T) {
 	e.pass()
 	if e.lux.createCount() != 2 || len(e.lux.terminatedIDs()) != 0 {
 		t.Fatalf("creates=%d terminated=%v", e.lux.createCount(), e.lux.terminatedIDs())
+	}
+}
+
+func TestListedJobWithHostileNamesIsProvisionedWithBoundedLabels(t *testing.T) {
+	e := newEnv(t)
+	long := hostile()
+	e.gh.queue(7, "queued", lux3...)
+	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name, j.attempt = long, long, 1 })
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &long, RunNumber: 4, PullRequests: []githubapp.PullRequestRef{{Number: 34}}})
+	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	r := e.lux.all()[0]
+	if err := r.spec.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.spec.Name) > maxRunName || !strings.HasSuffix(r.spec.Name, "… run 4") {
+		t.Fatalf("name %d bytes %q", len(r.spec.Name), r.spec.Name)
+	}
+	for _, k := range []string{LabelWorkflow, LabelJobName, LabelBranch} {
+		if v := r.run.Labels[k]; v == "" || len(v) > luxclient.MaxLabelValue || strings.ContainsAny(v, "\n\x00\x1b") {
+			t.Fatalf("%s = %q", k, v)
+		}
+	}
+	if r.run.Labels[LabelPR] != "34" || r.run.Labels[LabelRunner] != runner("7", 0) || r.run.Labels[LabelJob] != "7" || r.key != "api.github.com/t1/1001/7/0" {
+		t.Fatalf("labels %v key %q", r.run.Labels, r.key)
+	}
+}
+
+// A submission whose outcome was unknown is replayed with the same key after
+// the job's metadata changed; Lux answers with the first Run, whose name and
+// descriptive labels are the old ones. It is still this job's Run.
+func TestReplayAfterMetadataChangeStillCarries(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name = "CI", "build" })
+	old := "main"
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &old, RunNumber: 1})
+	e.lux.lateCommit = 1 << 20 // commits only when its key is submitted again
+	if st := e.pass(); st.Error != ErrLux || e.lux.createCount() != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	renamed := "release"
+	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name = "CI renamed", "build all" })
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &renamed, RunNumber: 1, PullRequests: []githubapp.PullRequestRef{{Number: 9}}})
+	// The runner never connects; orphan cleanup deletes it after idleGrace
+	// and the job is submitted again under the same key.
+	var st Status
+	for range 6 {
+		st = e.pass()
+		if st.Provisioned > 0 {
+			break
+		}
+		e.clock.Add(time.Minute)
+	}
+	if st.Error != "" || st.Provisioned != 1 || e.lux.createCount() != 1 {
+		t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
+	}
+	r := e.lux.all()[0]
+	if r.key != "api.github.com/t1/1001/7/0" || r.spec.Name != "widgets · CI / build · main run 1" ||
+		r.run.Labels[LabelBranch] != "main" || r.run.Labels[LabelPR] != "" || r.run.Labels[LabelGen] != "0" {
+		t.Fatalf("key %q name %q labels %v", r.key, r.spec.Name, r.run.Labels)
+	}
+	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("deleted=%v live=%v", e.gh.deletedNames(), e.lux.liveForJob("7"))
 	}
 }
 
