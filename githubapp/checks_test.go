@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -116,6 +117,9 @@ func TestForceCancelWorkflowRun(t *testing.T) {
 		case r.Method == "POST" && r.URL.Path == "/repos/octo-org/app.repo/actions/runs/7/force-cancel":
 			w.Header().Set("X-RateLimit-Remaining", "4999")
 			http.Error(w, `{"message":"Resource not accessible by integration"}`, 403)
+		case r.Method == "POST" && r.URL.Path == "/repos/octo-org/app.repo/actions/runs/8/force-cancel":
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			http.Error(w, `{"message":"API rate limit exceeded"}`, 403)
 		default:
 			http.NotFound(w, r)
 		}
@@ -130,7 +134,36 @@ func TestForceCancelWorkflowRun(t *testing.T) {
 	if err := c.ForceCancelWorkflowRun(context.Background(), repo, 7); !errors.As(err, &apiErr) || apiErr.StatusCode != 403 || apiErr.RateLimited {
 		t.Fatalf("missing permission: err=%v", err)
 	}
+	if err := c.ForceCancelWorkflowRun(context.Background(), repo, 8); !errors.As(err, &apiErr) || apiErr.StatusCode != 403 || !apiErr.RateLimited {
+		t.Fatalf("rate limit: err=%v", err)
+	}
 	if err := c.ForceCancelWorkflowRun(context.Background(), repo, 0); err == nil {
 		t.Fatal("accepted run 0")
+	}
+}
+
+func TestCheckRunEndpointsReturnAPIErrors(t *testing.T) {
+	for _, status := range []int{403, 422} {
+		for _, method := range []string{"GET", "POST"} {
+			t.Run(fmt.Sprintf("%s/%d", method, status), func(t *testing.T) {
+				c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != method {
+						t.Errorf("method %s", r.Method)
+					}
+					w.Header().Set("X-RateLimit-Remaining", "4999")
+					http.Error(w, `{"message":"refused"}`, status)
+				})
+				var err error
+				if method == "POST" {
+					_, err = c.CreateCheckRun(context.Background(), repo, checkRequest())
+				} else {
+					_, err = c.ListCheckRunsForRef(context.Background(), repo, sha, CheckRunListOptions{})
+				}
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != status || apiErr.RateLimited {
+					t.Fatalf("err=%v", err)
+				}
+			})
+		}
 	}
 }

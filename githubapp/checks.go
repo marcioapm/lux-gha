@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// CheckRunOutput is a check run's output. GitHub caps summary at 65535
-// characters.
+// CheckRunOutput is a check run's output, within MaxCheckTitle and
+// MaxCheckSummary.
 type CheckRunOutput struct {
 	Title   string `json:"title"`
 	Summary string `json:"summary"`
@@ -49,7 +49,12 @@ type CheckRunPage struct {
 	HasNext    bool       `json:"-"`
 }
 
-const maxCheckSummary = 65535
+// MaxCheckSummary is GitHub's limit on a check run's output summary, in
+// characters; MaxCheckTitle is this package's limit on its title, in bytes.
+const (
+	MaxCheckSummary = 65535
+	MaxCheckTitle   = 255
+)
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
@@ -61,8 +66,8 @@ func (c *Client) CreateCheckRun(ctx context.Context, repo Repository, req CheckR
 	if req.Name == "" || !shaRe.MatchString(req.HeadSHA) || req.Status != "completed" || req.Conclusion == "" || req.CompletedAt.IsZero() {
 		return out, errors.New("githubapp: check run requires name, head SHA, completed status, conclusion and completion time")
 	}
-	if req.Output.Title == "" || len(req.Output.Summary) > maxCheckSummary {
-		return out, errors.New("githubapp: check run output requires a title and a summary within 65535 characters")
+	if req.Output.Title == "" || len(req.Output.Title) > MaxCheckTitle || len(req.Output.Summary) > MaxCheckSummary {
+		return out, errors.New("githubapp: check run output requires a title within 255 bytes and a summary within 65535 characters")
 	}
 	path, err := repo.path("/check-runs")
 	if err != nil {

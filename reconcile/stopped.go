@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
@@ -24,36 +25,27 @@ const CheckName = "lux-gha"
 // diskGiB gets (an operator can change it on luxd).
 const luxDefaultDiskGiB = 20
 
-// closeStopped handles in_progress jobs, listed this pass, whose runner is
-// one of this instance's and whose Lux Run has ended: the runner died with
-// the job and may never report it. It posts one failed check run per Run
-// saying why Lux stopped it, and stuckJobGrace after the Run finished, if
-// the job is still in_progress, force-cancels its workflow run, unless a
-// job of that run holds a runner with a live Run or the run's jobs were not
-// all listed. Reading a job's Run costs one unit of maxJobsPerPass; an
-// ended Run is remembered, so a job costs it once. A 403 from either GitHub
-// call is a missing App permission: logged once per pass, recorded as
-// ErrPermission, and the pass goes on without it.
+// closeStopped runs last in a pass, on the in_progress jobs listed this
+// pass whose runner is this instance's and whose Lux Run has ended: it
+// posts a check run saying why, and force-cancels a job still stuck
+// stuckJobGrace after the Run finished.
 func (p *pass) closeStopped() error {
 	r := p.r
-	liveRunner := map[string]bool{}
-	for _, run := range p.live {
-		liveRunner[run.Labels[LabelRunner]] = true
-	}
 	observed := map[string]bool{}
 	for _, v := range p.repos {
 		for _, j := range v.stuck {
 			name := *j.RunnerName
-			if liveRunner[name] {
+			if p.liveRunner[name] {
 				continue
 			}
 			s, ok := r.stopped[name]
 			if !ok {
-				if p.budget <= 0 {
+				// Cached jobs later in the listing still need no read.
+				if p.luxReads <= 0 {
 					p.truncated = true
-					return nil
+					continue
 				}
-				p.budget--
+				p.luxReads--
 				run, err := p.endedRun(v, name)
 				if err != nil {
 					return err
@@ -62,7 +54,7 @@ func (p *pass) closeStopped() error {
 					continue
 				}
 				// A Run without finishedAt counts from when it was seen ended.
-				s = stoppedRun{run: *run, finished: r.now()}
+				s = &stoppedRun{run: *run, finished: r.now()}
 				if run.FinishedAt != nil {
 					s.finished = *run.FinishedAt
 				}
@@ -77,7 +69,7 @@ func (p *pass) closeStopped() error {
 			if err := p.explain(v, j, s); err != nil {
 				return err
 			}
-			if err := p.unstick(v, j, s, liveRunner); err != nil {
+			if err := p.unstick(v, j, s); err != nil {
 				return err
 			}
 		}
@@ -86,11 +78,12 @@ func (p *pass) closeStopped() error {
 	return nil
 }
 
-// stoppedRun is the ended Run of a runner whose job is still in_progress.
-// A resumePolicy never Run never runs again, so it stays ended.
+// stoppedRun is the ended Run of a runner whose job is still in_progress,
+// and what was done about it. A resumePolicy never Run stays ended.
 type stoppedRun struct {
-	run      luxclient.Run
-	finished time.Time
+	run                  luxclient.Run
+	finished             time.Time
+	explained, cancelled bool
 }
 
 // endedRun reads the Runs labelled with the runner's name, in any state:
@@ -124,13 +117,12 @@ func (p *pass) endedRun(v *repoView, name string) (*luxclient.Run, error) {
 // explain posts the job's check run once per Run. Whether one was posted is
 // read from GitHub (a lux-gha check run on the job's commit whose
 // external_id is the Run id), so a restart does not post it again.
-func (p *pass) explain(v *repoView, j githubapp.WorkflowJob, s stoppedRun) error {
+func (p *pass) explain(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) error {
 	r, run := p.r, s.run
-	name := *j.RunnerName
-	if _, done := r.explained[name]; done || p.noChecks {
+	if s.explained || p.noChecks {
 		return nil
 	}
-	log := r.log.With("repository", v.full, "job", j.ID, "runner", name, "run", run.ID)
+	log := r.log.With("repository", v.full, "job", j.ID, "runner", *j.RunnerName, "run", run.ID)
 	posted, err := p.checkPosted(v, j.HeadSHA, run.ID)
 	if err == nil && !posted {
 		_, err = r.gh.CreateCheckRun(p.ctx, v.ref, r.checkRun(j, s))
@@ -150,7 +142,7 @@ func (p *pass) explain(v *repoView, j githubapp.WorkflowJob, s stoppedRun) error
 		p.setError(ErrGitHub)
 		return nil
 	}
-	r.explained[name] = r.now()
+	s.explained = true
 	return nil
 }
 
@@ -180,10 +172,9 @@ func (p *pass) checkPosted(v *repoView, sha, runID string) (bool, error) {
 // unstick force-cancels the job's workflow run once the job has stayed
 // in_progress stuckJobGrace past its Run's end: the runner did not cancel
 // it (SIGKILL, a lost host), so GitHub would wait out the job's timeout.
-func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s stoppedRun, liveRunner map[string]bool) error {
+func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) error {
 	r := p.r
-	name := *j.RunnerName
-	if _, done := r.cancelled[name]; done || p.noCancel {
+	if s.cancelled || p.noCancel {
 		return nil
 	}
 	now := r.now()
@@ -191,13 +182,13 @@ func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s stoppedRun, liveR
 		return nil
 	}
 	run := s.run
-	log := r.log.With("repository", v.full, "workflowRun", j.RunID, "job", j.ID, "runner", name, "run", run.ID)
+	log := r.log.With("repository", v.full, "workflowRun", j.RunID, "job", j.ID, "runner", *j.RunnerName, "run", run.ID)
 	if v.partial[j.RunID] {
 		log.Info("not force-cancelling: the workflow run's jobs were not all listed this pass")
 		return nil
 	}
 	for _, sibling := range v.runRunners[j.RunID] {
-		if liveRunner[sibling] {
+		if p.liveRunner[sibling] {
 			log.Info("not force-cancelling: another job of the workflow run holds a runner with a live Run", "sibling", sibling)
 			return nil
 		}
@@ -222,7 +213,7 @@ func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s stoppedRun, liveR
 		p.setError(ErrGitHub)
 		return nil
 	}
-	r.cancelled[name] = now
+	s.cancelled = true
 	return nil
 }
 
@@ -253,15 +244,12 @@ func (p *pass) pruneStopped(observed map[string]bool) {
 	for _, v := range p.repos {
 		prefixes = append(prefixes, p.r.runnerPrefix(v.id))
 	}
-	gone := func(name string) bool {
+	maps.DeleteFunc(p.r.stopped, func(name string, _ *stoppedRun) bool {
 		return !observed[name] && slices.ContainsFunc(prefixes, func(prefix string) bool { return strings.HasPrefix(name, prefix) })
-	}
-	maps.DeleteFunc(p.r.stopped, func(name string, _ stoppedRun) bool { return gone(name) })
-	maps.DeleteFunc(p.r.explained, func(name string, _ time.Time) bool { return gone(name) })
-	maps.DeleteFunc(p.r.cancelled, func(name string, _ time.Time) bool { return gone(name) })
+	})
 }
 
-func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s stoppedRun) githubapp.CheckRunRequest {
+func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s *stoppedRun) githubapp.CheckRunRequest {
 	run, finished := s.run, s.finished
 	// A resumePolicy never Run's reason ends in "; resumePolicy never",
 	// which says nothing about the stop.
@@ -278,7 +266,7 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s stoppedRun) githubapp.C
 	fmt.Fprintf(&b, "| Route | `%s` |\n", run.Labels[LabelRoute])
 	fmt.Fprintf(&b, "| Lux Run | `%s` |\n", run.ID)
 	fmt.Fprintf(&b, "| State | %s |\n", run.State)
-	fmt.Fprintf(&b, "| Reason | %s |\n", cmp.Or(run.StateReason, run.State))
+	fmt.Fprintf(&b, "| Reason | %s |\n", reason)
 	if run.ExitCode != nil {
 		fmt.Fprintf(&b, "| Exit code | %d |\n", *run.ExitCode)
 	}
@@ -286,16 +274,13 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s stoppedRun) githubapp.C
 	if hint := r.hint(reason, route); hint != "" {
 		fmt.Fprintf(&b, "\n%s\n", hint)
 	}
-	summary := b.String()
-	if len(summary) > 65535 {
-		summary = summary[:65535]
-	}
 	return githubapp.CheckRunRequest{
 		Name: CheckName, HeadSHA: j.HeadSHA, ExternalID: run.ID, Status: "completed", Conclusion: "failure",
 		CompletedAt: finished,
 		Output: githubapp.CheckRunOutput{
-			Title:   truncate(`Lux stopped job "`+j.Name+`": `+reason, 255),
-			Summary: summary,
+			Title: cutRunes(`Lux stopped job "`+j.Name+`": `+reason, githubapp.MaxCheckTitle),
+			// The reason is Lux's free text, so the summary has no fixed bound.
+			Summary: cutRunes(b.String(), githubapp.MaxCheckSummary),
 		},
 	}
 }
@@ -342,9 +327,13 @@ func diskGiB(route *config.Route) int64 {
 	return cmp.Or(route.DiskGiB, luxDefaultDiskGiB)
 }
 
-func truncate(s string, n int) string {
+// cutRunes returns at most n bytes of s, cut on a rune boundary.
+func cutRunes(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

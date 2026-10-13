@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ type fakeJob struct {
 	labels     []string
 	runner     string
 	runnerID   int64
+	name       string // defaults to build-<id>
 }
 
 // fakeRepo is one repository's Actions state.
@@ -213,7 +215,7 @@ func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repos
 			continue
 		}
 		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels,
-			Name: fmt.Sprintf("build-%d", j.id), HeadSHA: fakeSHA(j.runID)}
+			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID)}
 		if j.conclusion != "" {
 			c := j.conclusion
 			out.Conclusion = &c
@@ -459,6 +461,13 @@ func (f *fakeGitHub) job(jobID int64) *fakeJob {
 	return nil
 }
 
+// editJob changes a job under the lock.
+func (f *fakeGitHub) editJob(jobID int64, edit func(*fakeJob)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	edit(f.job(jobID))
+}
+
 func (f *fakeGitHub) setOnline(name string, online bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -563,6 +572,11 @@ type fakeLux struct {
 	pending      *fakeRun
 	pendingLists int
 	byRunner     int
+	// failRunnerList fails the next n Lists whose selector names a runner;
+	// runnerListState, when set, is the state those Lists report every Run
+	// in, as a Run that went live after the pass's live listing would be.
+	failRunnerList  int
+	runnerListState string
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -663,8 +677,14 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 		}
 	}
 	var out []luxclient.Run
-	if _, ok := labels[LabelRunner]; ok {
+	_, byRunner := labels[LabelRunner]
+	if byRunner {
 		l.byRunner++
+		if l.failRunnerList > 0 {
+			l.failRunnerList--
+			l.mu.Unlock()
+			return nil, &luxclient.APIError{Op: "list runs", Status: 503}
+		}
 	}
 	for i := len(l.runs) - 1; i >= 0; i-- {
 		r := l.runs[i]
@@ -678,7 +698,11 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 			}
 		}
 		if match {
-			out = append(out, r.run)
+			run := r.run
+			if byRunner && l.runnerListState != "" {
+				run.State = l.runnerListState
+			}
+			out = append(out, run)
 		}
 	}
 	l.mu.Unlock()
@@ -703,6 +727,17 @@ func (l *fakeLux) end(id, reason string) {
 		if r.run.ID == id {
 			at := l.clock.Now()
 			r.run.State, r.run.StateReason, r.run.FinishedAt = "terminated", reason, &at
+		}
+	}
+}
+
+// endNoFinish is end with no finishedAt reported.
+func (l *fakeLux) endNoFinish(id, reason string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range l.runs {
+		if r.run.ID == id {
+			r.run.State, r.run.StateReason, r.run.FinishedAt = "terminated", reason, nil
 		}
 	}
 }

@@ -134,16 +134,11 @@ type Reconciler struct {
 	// Touched only by the pass goroutine.
 	repoIDs          map[string]int64
 	rateLimitedUntil time.Time
-	surplusSince     map[string]time.Time // runner name: idle while its trigger job is not queued
-	missingSince     map[string]time.Time // Run id: live Run whose runner is not registered
-	offlineSince     map[string]time.Time // runner name: registered runner with no live Run
-	// Runner name, for a job left in_progress after the runner's Run
-	// ended: that Run, when its check run was posted or found, and when
-	// its workflow run was force-cancelled.
-	stopped   map[string]stoppedRun
-	explained map[string]time.Time
-	cancelled map[string]time.Time
-	disc      *discovery // nil with an explicit repository list
+	surplusSince     map[string]time.Time   // runner name: idle while its trigger job is not queued
+	missingSince     map[string]time.Time   // Run id: live Run whose runner is not registered
+	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
+	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
+	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
 	status Status
@@ -169,9 +164,7 @@ func New(o Options) (*Reconciler, error) {
 		surplusSince: map[string]time.Time{},
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
-		stopped:      map[string]stoppedRun{},
-		explained:    map[string]time.Time{},
-		cancelled:    map[string]time.Time{},
+		stopped:      map[string]*stoppedRun{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -312,20 +305,22 @@ type pass struct {
 	st        Status
 	repos     []*repoView
 	truncated bool
-	// budget: jobs this pass may still take on (maxJobsPerPass), shared by
-	// demand and closeStopped's Lux reads.
-	budget int
+	// budget: demand jobs this pass may still take on (maxJobsPerPass).
+	// luxReads: Runs closeStopped may still read this pass (maxRunners);
+	// newly ended busy runners are bounded by the previous pass's live Runs.
+	budget, luxReads int
 	// noChecks, noCancel: GitHub refused the Checks or Actions write
 	// permission this pass; later calls needing it are skipped.
 	noChecks, noCancel bool
 	// unread: a repository's registrations are unknown this pass (its read
 	// failed, or it has not been read since startup), so its unresolved
 	// submissions are unknown and no Run may be created.
-	unread    bool
-	live      []luxclient.Run
-	ended     map[string]bool // Run ids terminated this pass
-	liveByJob map[string]bool // repo id/job id
-	liveRoute map[string]int
+	unread     bool
+	live       []luxclient.Run
+	ended      map[string]bool // Run ids terminated this pass
+	liveByJob  map[string]bool // repo id/job id
+	liveRunner map[string]bool // runner name
+	liveRoute  map[string]int
 	// Cap slots held this pass by submissions with an unknown outcome, in
 	// total and by route; their Runs may commit at any moment.
 	unresolved      int
@@ -414,12 +409,13 @@ func (p *pass) act() error {
 // repositories read successfully here; any other is unknown this pass.
 func (p *pass) readGitHub(repositories []string) error {
 	p.budget = p.r.cfg.Reconcile.MaxJobsPerPass
+	p.luxReads = p.r.cfg.MaxRunners
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
 			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
 			runRunners: map[int64][]string{}, partial: map[int64]bool{}}
-		err := p.readRepo(v, &p.budget)
+		err := p.readRepo(v)
 		if p.rateLimited(err) {
 			return errAbort
 		}
@@ -439,7 +435,7 @@ func (p *pass) readGitHub(repositories []string) error {
 	return nil
 }
 
-func (p *pass) readRepo(v *repoView, budget *int) error {
+func (p *pass) readRepo(v *repoView) error {
 	id, ok := p.r.repoIDs[v.full]
 	if !ok {
 		info, err := p.r.gh.GetRepository(p.ctx, v.ref)
@@ -450,7 +446,7 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 		p.r.repoIDs[v.full] = id
 	}
 	v.id = id
-	if err := p.readDemand(v, budget); err != nil {
+	if err := p.readDemand(v); err != nil {
 		return err
 	}
 	prefix := p.r.runnerPrefix(v.id)
@@ -476,11 +472,12 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 
 // readDemand collects queued jobs that match a route. Queued jobs live in
 // queued runs and, behind finished jobs, in in_progress runs, which also
-// hold the in_progress jobs closeStopped looks at.
-func (p *pass) readDemand(v *repoView, budget *int) error {
-	for _, status := range []string{"queued", "in_progress"} {
+// hold the in_progress jobs closeStopped looks at. in_progress runs are
+// listed first, so a queued backlog that spends the budget cannot hide them.
+func (p *pass) readDemand(v *repoView) error {
+	for _, status := range []string{"in_progress", "queued"} {
 		for page := 1; ; page++ {
-			if page > maxRunPages || *budget <= 0 {
+			if page > maxRunPages || p.budget <= 0 {
 				p.truncated = true
 				return nil
 			}
@@ -489,7 +486,7 @@ func (p *pass) readDemand(v *repoView, budget *int) error {
 				return err
 			}
 			for _, run := range runs.Runs {
-				if err := p.readRunJobs(v, run.ID, budget); err != nil {
+				if err := p.readRunJobs(v, run.ID); err != nil {
 					return err
 				}
 			}
@@ -501,9 +498,9 @@ func (p *pass) readDemand(v *repoView, budget *int) error {
 	return nil
 }
 
-func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
+func (p *pass) readRunJobs(v *repoView, runID int64) error {
 	for page := 1; ; page++ {
-		if page > maxRunPages || *budget <= 0 {
+		if page > maxRunPages || p.budget <= 0 {
 			p.truncated = true
 			v.partial[runID] = true
 			return nil
@@ -529,12 +526,12 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 				continue
 			}
 			if _, seen := v.demand[j.ID]; !seen {
-				if *budget <= 0 {
+				if p.budget <= 0 {
 					p.truncated = true
 					v.partial[runID] = true
 					return nil
 				}
-				*budget--
+				p.budget--
 				v.demand[j.ID] = route
 			}
 		}
@@ -553,10 +550,12 @@ func (p *pass) readLux() error {
 	}
 	p.live = runs
 	p.liveByJob = map[string]bool{}
+	p.liveRunner = map[string]bool{}
 	p.liveRoute = map[string]int{}
 	p.unresolvedRoute = map[string]int{}
 	for _, run := range runs {
 		p.liveByJob[run.Labels[LabelRepo]+"/"+run.Labels[LabelJob]] = true
+		p.liveRunner[run.Labels[LabelRunner]] = true
 		p.liveRoute[run.Labels[LabelRoute]]++
 		p.st.Live[run.Labels[LabelRoute]]++
 	}
@@ -649,6 +648,7 @@ func (p *pass) readJobHistory(owned map[string]string, log *slog.Logger) ([]luxc
 func (p *pass) addLive(v *repoView, jobID int64, run luxclient.Run) {
 	p.live = append(p.live, run)
 	p.liveByJob[jobKey(v, jobID)] = true
+	p.liveRunner[run.Labels[LabelRunner]] = true
 	p.liveRoute[run.Labels[LabelRoute]]++
 	p.st.Live[run.Labels[LabelRoute]]++
 }
@@ -711,19 +711,11 @@ func (p *pass) classifyJob(v *repoView, jobID int64, route *config.Route) (*luxc
 // still commit), and a gen whose Run ended is left to orphan cleanup.
 func (p *pass) classifyRegistrations(classified map[string]bool) error {
 	r := p.r
-	liveRunner := map[string]bool{}
-	for _, run := range p.live {
-		liveRunner[run.Labels[LabelRunner]] = true
-	}
 	for _, v := range p.repos {
-		prefix := r.runnerPrefix(v.id)
 		gens := map[int64][]int{}
 		for name := range v.runners {
-			job, gen, ok := strings.Cut(strings.TrimPrefix(name, prefix), "-")
-			jobID, jerr := strconv.ParseInt(job, 10, 64)
-			n, gerr := strconv.Atoi(gen)
-			if !ok || jerr != nil || gerr != nil || name != prefix+job+"-"+gen ||
-				classified[jobKey(v, jobID)] || liveRunner[name] {
+			jobID, n, ok := r.parseRunnerName(v.id, name)
+			if !ok || classified[jobKey(v, jobID)] || p.liveRunner[name] {
 				continue
 			}
 			gens[jobID] = append(gens[jobID], n)
@@ -1020,10 +1012,6 @@ func (p *pass) cleanUp() error {
 	now := r.now()
 	grace := r.cfg.Reconcile.IdleGrace.Duration
 	missing, offline := map[string]bool{}, map[string]bool{}
-	liveRunner := map[string]bool{}
-	for _, run := range p.live {
-		liveRunner[run.Labels[LabelRunner]] = true
-	}
 	for _, v := range p.repos {
 		repoID := strconv.FormatInt(v.id, 10)
 		for _, run := range p.live {
@@ -1052,7 +1040,7 @@ func (p *pass) cleanUp() error {
 		}
 		for _, name := range sortedKeys(v.runners) {
 			rn := v.runners[name]
-			if liveRunner[name] || rn.Status != "offline" || rn.Busy {
+			if p.liveRunner[name] || rn.Status != "offline" || rn.Busy {
 				continue
 			}
 			offline[name] = true
@@ -1085,13 +1073,26 @@ func (r *Reconciler) runnerPrefix(repoID int64) string {
 	return "lux-gha-" + r.cfg.Instance + "-" + strconv.FormatInt(repoID, 10) + "-"
 }
 
-// managedRunner reports whether name is lux-gha-<instance>-<repo id>-<job id>-<gen>.
-func (r *Reconciler) managedRunner(repoID int64, name string) bool {
+// parseRunnerName parses lux-gha-<instance>-<repo id>-<job id>-<gen>. Only
+// the canonical spelling is accepted ("-007-01" is not), so a name maps to
+// one job and gen and back.
+func (r *Reconciler) parseRunnerName(repoID int64, name string) (job int64, gen int, ok bool) {
 	prefix := r.runnerPrefix(repoID)
-	job, gen, ok := strings.Cut(strings.TrimPrefix(name, prefix), "-")
-	_, jerr := strconv.ParseUint(job, 10, 63)
-	_, gerr := strconv.ParseUint(gen, 10, 31)
-	return ok && jerr == nil && gerr == nil && strings.HasPrefix(name, prefix)
+	if !strings.HasPrefix(name, prefix) {
+		return 0, 0, false
+	}
+	js, gs, ok := strings.Cut(name[len(prefix):], "-")
+	job, jerr := strconv.ParseInt(js, 10, 64)
+	gen, gerr := strconv.Atoi(gs)
+	if !ok || jerr != nil || gerr != nil || gen < 0 || name != prefix+strconv.FormatInt(job, 10)+"-"+strconv.Itoa(gen) {
+		return 0, 0, false
+	}
+	return job, gen, true
+}
+
+func (r *Reconciler) managedRunner(repoID int64, name string) bool {
+	_, _, ok := r.parseRunnerName(repoID, name)
+	return ok
 }
 
 func prune[V any](m map[string]V, keep map[string]bool) {

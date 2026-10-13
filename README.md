@@ -55,8 +55,8 @@ state is Lux Run labels and GitHub's own records.
 
 The bridge keeps **one live Run per queued matching job**. A pass:
 
-1. **Demand.** For each repository read this pass, lists workflow runs with status `queued`
-   and `in_progress` and their latest-attempt jobs. A job is demand when its
+1. **Demand.** For each repository read this pass, lists workflow runs with status `in_progress`
+   before `queued` and their latest-attempt jobs. A job is demand when its
    status is `queued` and its labels match a route. `waiting` jobs
    (environment approval) are not demand. At most `reconcile.maxJobsPerPass`
    jobs are read per pass, in configuration order (name order when
@@ -358,14 +358,20 @@ labels, any state; one Run per runner name). If the Run has ended:
   Run, and logs it at `WARN`. A `409` (the run has completed meanwhile)
   counts as done. **This cancels every unfinished job of that workflow
   run, not only the stuck one.** That is the trade-off for not waiting out
-  the job's timeout. It is never done while another listed job of the
+   the job's timeout. Queued siblings and siblings running on GitHub-hosted
+   runners are cancelled too. It is never done while another listed job of the
   workflow run holds a runner of this instance with a live Run, or when the
   pass did not list all of the run's jobs. A job that completes on its own
   within the grace is left alone.
 
-Reading a job's Run counts against `reconcile.maxJobsPerPass`, after
-demand. A Run once read ended is remembered, so later passes do not read
-it again. A pass that runs out of budget leaves the rest for the next pass.
+`in_progress` workflow runs are listed before `queued` ones so a queued
+backlog cannot hide stopped jobs. Reading their Lux Runs has its own per-pass
+allowance of `maxRunners`, separate from `reconcile.maxJobsPerPass`: Lux reads
+are not GitHub requests, and newly ended busy runners are bounded by the
+previous pass's live Runs. An ended Run is cached, so later passes do not
+read it again. When the allowance runs out, uncached jobs wait, but cached
+jobs still get their explanation and cancellation. Cache pruning waits for
+a complete pass; removed repositories are forgotten after `idleGrace`.
 A `403` from either call means the App lacks Checks or Actions write. It is
 logged once per pass and reported in `GET /status` as `github_permission`.
 The pass goes on: provisioning and cleanup are not affected, and the
