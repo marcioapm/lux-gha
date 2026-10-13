@@ -41,6 +41,13 @@ type Reconcile struct {
 	RepositoryRefresh Duration `json:"repositoryRefresh"`
 	HotWindow         Duration `json:"hotWindow"`
 	ColdSweep         Duration `json:"coldSweep"`
+	// StopGrace is each runner Run's Lux workload.grace: the time between
+	// SIGTERM and SIGKILL in which the runner cancels its job and uploads
+	// its logs.
+	StopGrace Duration `json:"stopGrace"`
+	// StuckJobGrace is how long a job may stay in_progress after its
+	// runner's Run ended before its workflow run is force-cancelled.
+	StuckJobGrace Duration `json:"stuckJobGrace"`
 }
 
 const (
@@ -51,6 +58,19 @@ const (
 	DefaultRepositoryRefresh = 10 * time.Minute
 	DefaultHotWindow         = 2 * time.Minute
 	DefaultColdSweep         = 10 * time.Minute
+	DefaultStopGrace         = 60 * time.Second
+	DefaultStuckJobGrace     = 2 * time.Minute
+)
+
+// Bounds of StopGrace and StuckJobGrace. Below MinStopGrace the runner
+// cannot cancel a step (it escalates SIGINT to SIGTERM after 7.5 s) and
+// still upload logs; above MaxStopGrace every Lux stop, a surplus terminate
+// included, holds its host that long.
+const (
+	MinStopGrace     = 15 * time.Second
+	MaxStopGrace     = 10 * time.Minute
+	MinStuckJobGrace = 30 * time.Second
+	MaxStuckJobGrace = time.Hour
 )
 
 type GitHub struct {
@@ -193,6 +213,18 @@ func (c *Config) validate() error {
 	}
 	if rc.MaxGensPerJob == 0 {
 		rc.MaxGensPerJob = DefaultMaxGensPerJob
+	}
+	if rc.StopGrace.Duration == 0 {
+		rc.StopGrace.Duration = DefaultStopGrace
+	}
+	if g := rc.StopGrace.Duration; g < MinStopGrace || g > MaxStopGrace {
+		add("reconcile.stopGrace %s must be between %s and %s", g, MinStopGrace, MaxStopGrace)
+	}
+	if rc.StuckJobGrace.Duration == 0 {
+		rc.StuckJobGrace.Duration = DefaultStuckJobGrace
+	}
+	if g := rc.StuckJobGrace.Duration; g < MinStuckJobGrace || g > MaxStuckJobGrace {
+		add("reconcile.stuckJobGrace %s must be between %s and %s", g, MinStuckJobGrace, MaxStuckJobGrace)
 	}
 	g := c.GitHub
 	if strings.TrimSpace(g.AppID) == "" {

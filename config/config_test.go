@@ -158,6 +158,39 @@ func TestAllowsRepositoryIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestStopGraceAndStuckJobGrace(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Reconcile.StopGrace.Duration != time.Minute || c.Reconcile.StuckJobGrace.Duration != 2*time.Minute {
+		t.Fatalf("defaults: %+v", c.Reconcile)
+	}
+	with := func(fields string) []byte {
+		return mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {`+fields+`},`)
+	}
+	tuned, err := Parse(with(`"stopGrace": "15s", "stuckJobGrace": "1h"`))
+	if err != nil || tuned.Reconcile.StopGrace.Duration != 15*time.Second || tuned.Reconcile.StuckJobGrace.Duration != time.Hour {
+		t.Fatalf("bounds accepted: %+v err=%v", tuned, err)
+	}
+	tuned, err = Parse(with(`"stopGrace": "10m", "stuckJobGrace": "30s"`))
+	if err != nil || tuned.Reconcile.StopGrace.Duration != 10*time.Minute || tuned.Reconcile.StuckJobGrace.Duration != 30*time.Second {
+		t.Fatalf("bounds accepted: %+v err=%v", tuned, err)
+	}
+	for fields, want := range map[string]string{
+		`"stopGrace": "14s"`:      "reconcile.stopGrace 14s must be between 15s and 10m0s",
+		`"stopGrace": "11m"`:      "reconcile.stopGrace 11m0s must be between 15s and 10m0s",
+		`"stopGrace": "-1m"`:      "reconcile.stopGrace -1m0s must be between",
+		`"stuckJobGrace": "29s"`:  "reconcile.stuckJobGrace 29s must be between 30s and 1h0m0s",
+		`"stuckJobGrace": "61m"`:  "reconcile.stuckJobGrace 1h1m0s must be between",
+		`"stuckJobGrace": "-30s"`: "reconcile.stuckJobGrace -30s must be between",
+	} {
+		if _, err := Parse(with(fields)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", fields, err, want)
+		}
+	}
+}
+
 func TestRepositoriesAreOptional(t *testing.T) {
 	explicit, err := Parse([]byte(validConfig))
 	if err != nil || explicit.DiscoverRepositories() {

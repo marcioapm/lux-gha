@@ -800,6 +800,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		Secrets:            []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
 		Resources:          luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
 		Timeout:            route.Timeout.Duration,
+		Grace:              r.cfg.Reconcile.StopGrace.Duration,
 		Pool:               route.Pool,
 		Sandbox:            luxclient.Sandbox{NestedContainers: route.NestedContainers},
 		UnrestrictedEgress: route.UnrestrictedEgress,

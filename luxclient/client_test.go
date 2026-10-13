@@ -51,6 +51,7 @@ func jitSpec() RunSpec {
 		Secrets:   []FileSecret{{Name: "jit", Value: "JITCONFIG-SECRET-VALUE", Path: "/run/secrets/jit"}},
 		Resources: Resources{CPUs: 2, Memory: 4 << 30, Disk: 20 << 30, Pids: 2048},
 		Timeout:   90 * time.Minute,
+		Grace:     90 * time.Second,
 		Pool:      "gha",
 		Egress:    []EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {CIDR: "140.82.112.0/20"}},
 		Sandbox:   Sandbox{NestedContainers: true},
@@ -62,7 +63,7 @@ const jitSpecWire = `{
 	"name": "gha-job-42",
 	"labels": {"lux-gha/attempt": "1", "lux-gha/job": "42"},
 	"image": {"ref": "ghcr.io/acme/runner@sha256:abc"},
-	"workload": {"adapter": "generic", "command": ["/entrypoint", "--jit-file", "/run/secrets/jit"], "workdir": "/home/runner", "user": "runner"},
+	"workload": {"adapter": "generic", "command": ["/entrypoint", "--jit-file", "/run/secrets/jit"], "workdir": "/home/runner", "user": "runner", "grace": "1m30s"},
 	"env": {"RUNNER_ALLOW_RUNASROOT": "0"},
 	"secrets": [{"name": "jit", "value": "JITCONFIG-SECRET-VALUE", "as": "file", "path": "/run/secrets/jit"}],
 	"resources": {"cpus": 2, "memory": 4294967296, "disk": 21474836480, "pids": 2048},
@@ -292,6 +293,7 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 		"egress bad cidr":     {"k", leak(func(s *RunSpec) { s.Egress = []EgressRule{{CIDR: "nope"}} })},
 		"egress unrestricted": {"k", leak(func(s *RunSpec) { s.UnrestrictedEgress = true })},
 		"negative resources":  {"k", leak(func(s *RunSpec) { s.Resources.CPUs = -1 })},
+		"negative grace":      {"k", leak(func(s *RunSpec) { s.Grace = -time.Second })},
 		"reserved env":        {"k", leak(func(s *RunSpec) { s.Env["LUX_X"] = "1" })},
 	}
 	for name, tc := range cases {

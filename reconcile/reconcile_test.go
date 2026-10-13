@@ -150,6 +150,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		Workload struct {
 			Adapter string
 			Command []string
+			Grace   string
 		}
 		Secrets   []struct{ Name, Value, As, Path string }
 		Resources struct {
@@ -167,7 +168,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w.Name != "gha acme/widgets job 7" || w.Image.Ref != "ghcr.io/acme/runner@sha256:abc" || w.Workload.Adapter != "generic" ||
-		!slices.Equal(w.Workload.Command, []string{"/usr/local/bin/lux-gha-runner"}) || w.Secrets[0].As != "file" ||
+		!slices.Equal(w.Workload.Command, []string{"/usr/local/bin/lux-gha-runner"}) || w.Workload.Grace != "1m0s" || w.Secrets[0].As != "file" ||
 		w.Resources.CPUs != 2 || w.Resources.Memory != 4096<<20 || w.Resources.Disk != 20<<30 || w.Timeout != "1h30m0s" ||
 		w.Placement.Pool != "gha" || len(w.Network.Egress) != 2 || w.Network.Egress[1].Host != "*.actions.githubusercontent.com" ||
 		w.Sandbox.NestedContainers || w.ResumePolicy != "never" {
@@ -222,12 +223,13 @@ func mapsEqual(a, b map[string]string) bool {
 }
 
 func TestRouteSpecificCommandAndShape(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"stopGrace": "3m"}`))
 	e.gh.queue(8, "queued", "lux-big")
 	e.pass()
 	r := e.lux.all()
 	if len(r) != 1 || !slices.Equal(r[0].spec.Command, []string{"/opt/start"}) || r[0].spec.Pool != "gha-big" ||
-		!r[0].spec.Sandbox.NestedContainers || r[0].run.Labels[LabelRoute] != "big" || r[0].spec.Timeout != 2*time.Hour {
+		!r[0].spec.Sandbox.NestedContainers || r[0].run.Labels[LabelRoute] != "big" || r[0].spec.Timeout != 2*time.Hour ||
+		r[0].spec.Grace != 3*time.Minute {
 		t.Fatalf("runs %+v", r)
 	}
 }
