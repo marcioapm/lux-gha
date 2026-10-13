@@ -71,6 +71,8 @@ func TestCreateCheckRunValidatesBeforeSending(t *testing.T) {
 		"no conclusion":   edit(func(r *CheckRunRequest) { r.Conclusion = "" }),
 		"no completed_at": edit(func(r *CheckRunRequest) { r.CompletedAt = time.Time{} }),
 		"no title":        edit(func(r *CheckRunRequest) { r.Output.Title = "" }),
+		"long title":      edit(func(r *CheckRunRequest) { r.Output.Title = strings.Repeat("x", 256) }),
+		"multibyte title": edit(func(r *CheckRunRequest) { r.Output.Title = strings.Repeat("界", 85) + "x" }),
 		"long summary":    edit(func(r *CheckRunRequest) { r.Output.Summary = strings.Repeat("x", 65536) }),
 	} {
 		if _, err := c.CreateCheckRun(context.Background(), repo, req); err == nil {
@@ -83,6 +85,45 @@ func TestCreateCheckRunValidatesBeforeSending(t *testing.T) {
 	// A 201 without an id is not a created check run.
 	if _, err := c.CreateCheckRun(context.Background(), repo, checkRequest()); err == nil {
 		t.Fatal("accepted a response without id")
+	}
+}
+
+func TestCreateCheckRunAccepts255ByteTitles(t *testing.T) {
+	for _, title := range []string{strings.Repeat("x", 255), strings.Repeat("界", 85)} {
+		t.Run(title[:3], func(t *testing.T) {
+			var calls atomic.Int32
+			c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if !requireInstallationToken(w, r, "ghs_token1") {
+					return
+				}
+				if r.Method != "POST" || r.URL.EscapedPath() != "/repos/octo-org/app.repo/check-runs" || r.URL.RawQuery != "" || r.Header.Get("Content-Type") != "application/json" {
+					t.Error("unexpected request route")
+					http.Error(w, "route", 404)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				want := map[string]any{
+					"name": "lux-gha", "head_sha": sha, "external_id": "run_1", "status": "completed", "conclusion": "failure",
+					"completed_at": "2026-10-09T12:00:00Z",
+					"output":       map[string]any{"title": title, "summary": "route default"},
+				}
+				if !reflect.DeepEqual(body, want) {
+					t.Errorf("body %+v, want %+v", body, want)
+				}
+				w.WriteHeader(201)
+				w.Write([]byte(`{"id":77}`))
+			})
+			req := checkRequest()
+			req.Output.Title = title
+			got, err := c.CreateCheckRun(context.Background(), repo, req)
+			if err != nil || got.ID != 77 || calls.Load() != 1 {
+				t.Fatalf("got %+v err %v calls %d", got, err, calls.Load())
+			}
+		})
 	}
 }
 

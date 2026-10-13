@@ -331,7 +331,7 @@ func TestUnstartedRunForCancelledJobIsReclaimedAfterGrace(t *testing.T) {
 }
 
 func TestTruncatedDemandProvisionsWithinBoundAndRemovesNothing(t *testing.T) {
-	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 2}`))
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 4}`))
 	e.gh.queue(1, "queued", lux3...)
 	e.pass()
 	e.gh.complete(1, "cancelled")
@@ -973,11 +973,11 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 	j7, j8, j9 := job{widgets, 7, runner("7", 0)}, job{widgets, 8, runner("8", 0)}, job{widgets, 9, runner("9", 0)}
 	gadgets9 := job{"acme/gadgets", 9, "lux-gha-t1-1002-9-0"}
 	truncate := func(maxRunners string) []func(string) string {
-		return []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": `+maxRunners+`, "reconcile": {"maxJobsPerPass": 1}`)}
+		return []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": `+maxRunners+`, "reconcile": {"maxJobsPerPass": 2}`)}
 	}
 	// What happens to the unresolved job's trigger while its submission is
 	// in flight; "truncated" leaves it queued but sorts it after the fresh
-	// job beyond maxJobsPerPass 1.
+	// job beyond the queued status's allowance of 1.
 	const (
 		queued    = "queued"
 		cancelled = "cancelled"

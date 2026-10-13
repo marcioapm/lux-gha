@@ -291,7 +291,8 @@ func TestPermissionDeniedStopsFurtherCallsThisPass(t *testing.T) {
 
 func TestJobsOnOtherRunnersAreIgnored(t *testing.T) {
 	e := newEnv(t)
-	names := []string{"hosted-runner", "lux-gha-t2-1001-7-0", "lux-gha-t1-1002-7-0", "lux-gha-t1-1001-x-0", "lux-gha-t1-1001-7-0-1"}
+	names := []string{"hosted-runner", "lux-gha-t2-1001-7-0", "lux-gha-t1-1002-7-0", "lux-gha-t1-1001-x-0", "lux-gha-t1-1001-7-0-1",
+		"lux-gha-t1-1001-007-0", "lux-gha-t1-1001-7-01", "lux-gha-t1-1001-+7-0", "lux-gha-t1-1001-7-+1", "lux-gha-t1-1001-7--1"}
 	for i, name := range names {
 		job := int64(20 + i)
 		e.gh.queueIn(widgets, job*10, job, "queued", "ubuntu-latest")
@@ -302,6 +303,90 @@ func TestJobsOnOtherRunnersAreIgnored(t *testing.T) {
 	e.pass()
 	if checks, _ := e.gh.checks(); len(checks) != 0 || len(e.gh.cancels()) != 0 || e.lux.runnerLists() != 0 {
 		t.Fatalf("checks %+v cancels %v runner lists %d", checks, e.gh.cancels(), e.lux.runnerLists())
+	}
+}
+
+func TestStatusReservationServesQueuedWorkflowBehindCappedActiveBacklog(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Routes[0].MaxRunners = 1
+	e.startJob(7)
+	e.cfg.Reconcile.MaxJobsPerPass = 2
+	for _, job := range []int64{8, 9, 10, 11} {
+		e.gh.queueIn(widgets, 70, job, "queued", lux3...)
+	}
+	e.gh.queueIn(widgets, 120, 12, "queued", "self-hosted", "linux", "lux-big")
+	for range 3 {
+		st := e.pass()
+		if st.Demand["default"]+st.Demand["big"] > 2 {
+			t.Fatalf("demand exceeds allowance: %+v", st)
+		}
+	}
+	if len(e.lux.liveForJob("12")) != 1 {
+		t.Fatal("queued workflow B did not get a Run")
+	}
+	for _, job := range []int64{8, 9, 10, 11} {
+		if e.gh.job(job).status != "queued" || len(e.lux.liveForJob(itoa(job))) != 0 {
+			t.Fatalf("capped backlog changed: %d", job)
+		}
+	}
+}
+
+func TestSingleDemandAllowanceAlternatesStatuses(t *testing.T) {
+	for _, initialQueuedTurn := range []bool{false, true} {
+		t.Run(strconv.FormatBool(initialQueuedTurn), func(t *testing.T) {
+			e := newEnv(t)
+			id := e.startJob(7)
+			e.lux.end(id, diskStop)
+			e.cfg.Reconcile.MaxJobsPerPass = 1
+			e.rec.queuedTurn = initialQueuedTurn
+			e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+			for range 4 {
+				st := e.pass()
+				if st.Demand["default"] > 1 {
+					t.Fatalf("demand exceeds allowance: %+v", st)
+				}
+				e.clock.Add(time.Minute)
+			}
+			checks, _ := e.gh.checks()
+			if len(checks) != 1 || len(e.lux.liveForJob("8")) != 1 || !slices.Equal(e.gh.cancels(), []int64{70}) {
+				t.Fatalf("checks %d, queued Runs %d, cancels %v", len(checks), len(e.lux.liveForJob("8")), e.gh.cancels())
+			}
+		})
+	}
+}
+
+func TestMalformedRegistrationsAreNotOwnedHistory(t *testing.T) {
+	for _, suffix := range []string{"007-0", "7-01", "+7-0", "7-+1", "7--1"} {
+		t.Run(suffix, func(t *testing.T) {
+			e := newEnv(t)
+			e.gh.addRunner(widgets, 900, "lux-gha-t1-1001-"+suffix)
+			e.gh.addRunner(widgets, 901, runner("8", 0))
+			st := e.pass()
+			if st.Error != "" || st.Provisioned != 0 || st.Live["default"] != 0 || e.lux.createCount() != 0 || !slices.Equal(e.lux.historyJobs, []string{"8"}) {
+				t.Fatalf("status %+v, histories %v, creates %d", st, e.lux.historyJobs, e.lux.createCount())
+			}
+			if checks, _ := e.gh.checks(); len(checks) != 0 || len(e.gh.cancels()) != 0 || e.lux.runnerLists() != 0 {
+				t.Fatalf("checks %v cancels %v runner reads %d", checks, e.gh.cancels(), e.lux.runnerLists())
+			}
+		})
+	}
+}
+
+func TestMultibyteReasonSummaryRetainsExactPrefix(t *testing.T) {
+	e := newEnv(t)
+	id := e.startJob(7)
+	e.lux.end(id, strings.Repeat("界", 30000))
+	e.pass()
+	_, reqs := e.gh.checks()
+	if len(reqs) != 1 {
+		t.Fatal(reqs)
+	}
+	prefix := "Lux ended the Run that held this job's runner, so the runner could not finish the job.\n\n" +
+		"| | |\n|---|---|\n| Route | `default` |\n| Lux Run | `" + id + "` |\n| State | terminated |\n| Reason | "
+	want := prefix + strings.Repeat("界", (githubapp.MaxCheckSummary-len(prefix))/3)
+	got := reqs[0].Output.Summary
+	if got != want || len(got) > githubapp.MaxCheckSummary || !utf8.ValidString(got) {
+		t.Fatalf("summary length %d, want %d; exact prefix match %v, UTF8 %v", len(got), len(want), got == want, utf8.ValidString(got))
 	}
 }
 
@@ -446,9 +531,16 @@ func TestStoppedGitHubTransientErrorsRetry(t *testing.T) {
 				return nil
 			}
 			st := e.pass()
-			s := e.rec.stopped[runner("7", 0)]
-			if st.Error != ErrGitHub || (op == opCancel && s.cancelled) || (op != opCancel && s.explained) {
-				t.Fatalf("failed call marked done: %+v %+v", st, s)
+			checks, _ := e.gh.checks()
+			if st.Error != ErrGitHub {
+				t.Fatalf("failed call: %+v", st)
+			}
+			if op == opCancel {
+				if st.ForceCancelled != 0 || len(e.gh.cancels()) != 0 || e.gh.job(7).status != "in_progress" {
+					t.Fatalf("failed cancel changed workflow state: %+v", st)
+				}
+			} else if st.CheckRuns != 0 || len(checks) != 0 {
+				t.Fatalf("failed Checks operation posted a check: %+v", st)
 			}
 			e.gh.fail = nil
 			st = e.pass()
@@ -612,8 +704,9 @@ func TestMultibyteJobTitleIsBoundedAndValidUTF8(t *testing.T) {
 		t.Fatal(reqs)
 	}
 	title := reqs[0].Output.Title
-	if len(title) > githubapp.MaxCheckTitle || !utf8.ValidString(title) {
-		t.Fatalf("title %q (%d bytes)", title, len(title))
+	want := `Lux stopped job "` + strings.Repeat("界", 79)
+	if title != want || !utf8.ValidString(title) {
+		t.Fatalf("title %q, want %q", title, want)
 	}
 }
 

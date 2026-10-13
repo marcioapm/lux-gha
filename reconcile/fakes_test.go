@@ -572,6 +572,7 @@ type fakeLux struct {
 	pending      *fakeRun
 	pendingLists int
 	byRunner     int
+	historyJobs  []string
 	// failRunnerList fails the next n Lists whose selector names a runner;
 	// runnerListState, when set, is the state those Lists report every Run
 	// in, as a Run that went live after the pass's live listing would be.
@@ -677,6 +678,9 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 		}
 	}
 	var out []luxclient.Run
+	if job, ok := labels[LabelJob]; ok && len(states) == 0 {
+		l.historyJobs = append(l.historyJobs, job)
+	}
 	_, byRunner := labels[LabelRunner]
 	if byRunner {
 		l.byRunner++

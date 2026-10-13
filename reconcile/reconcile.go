@@ -137,6 +137,7 @@ type Reconciler struct {
 	surplusSince     map[string]time.Time   // runner name: idle while its trigger job is not queued
 	missingSince     map[string]time.Time   // Run id: live Run whose runner is not registered
 	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
+	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
 	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
 	disc             *discovery             // nil with an explicit repository list
 
@@ -309,6 +310,7 @@ type pass struct {
 	// luxReads: Runs closeStopped may still read this pass (maxRunners);
 	// newly ended busy runners are bounded by the previous pass's live Runs.
 	budget, luxReads int
+	statusBudget     [2]int
 	// noChecks, noCancel: GitHub refused the Checks or Actions write
 	// permission this pass; later calls needing it are skipped.
 	noChecks, noCancel bool
@@ -408,7 +410,14 @@ func (p *pass) act() error {
 // readGitHub reads each named repository. Every later step acts only on
 // repositories read successfully here; any other is unknown this pass.
 func (p *pass) readGitHub(repositories []string) error {
-	p.budget = p.r.cfg.Reconcile.MaxJobsPerPass
+	n := p.r.cfg.Reconcile.MaxJobsPerPass
+	p.statusBudget = [2]int{(n + 1) / 2, n / 2}
+	if n == 1 {
+		if p.r.queuedTurn {
+			p.statusBudget = [2]int{0, 1}
+		}
+		p.r.queuedTurn = !p.r.queuedTurn
+	}
 	p.luxReads = p.r.cfg.MaxRunners
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
@@ -470,29 +479,34 @@ func (p *pass) readRepo(v *repoView) error {
 	return nil
 }
 
-// readDemand collects queued jobs that match a route. Queued jobs live in
-// queued runs and, behind finished jobs, in in_progress runs, which also
-// hold the in_progress jobs closeStopped looks at. in_progress runs are
-// listed first, so a queued backlog that spends the budget cannot hide them.
+// readDemand reserves separate bounded demand portions for both statuses.
+// in_progress is read first to expose stopped jobs even under queued backlog.
 func (p *pass) readDemand(v *repoView) error {
-	for _, status := range []string{"in_progress", "queued"} {
+	for i, status := range []string{"in_progress", "queued"} {
+		p.budget = p.statusBudget[i]
 		for page := 1; ; page++ {
 			if page > maxRunPages || p.budget <= 0 {
 				p.truncated = true
-				return nil
+				break
 			}
 			runs, err := p.r.gh.ListWorkflowRuns(p.ctx, v.ref, githubapp.WorkflowRunListOptions{PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Status: status})
 			if err != nil {
 				return err
 			}
 			for _, run := range runs.Runs {
-				if err := p.readRunJobs(v, run.ID); err != nil {
+				err := p.readRunJobs(v, run.ID)
+				p.statusBudget[i] = p.budget
+				if err != nil {
 					return err
 				}
 			}
 			if !runs.HasNext {
 				break
 			}
+		}
+		p.statusBudget[i] = p.budget
+		if p.budget == 0 {
+			p.truncated = true
 		}
 	}
 	return nil

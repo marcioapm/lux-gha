@@ -59,9 +59,16 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    before `queued` and their latest-attempt jobs. A job is demand when its
    status is `queued` and its labels match a route. `waiting` jobs
    (environment approval) are not demand. At most `reconcile.maxJobsPerPass`
-   jobs are read per pass, in configuration order (name order when
-   discovered), so a backlog over that
-   bound in one repository can delay the others.
+   queued matching jobs are admitted per pass; other listed jobs do not spend
+   this allowance. Its ceiling half is reserved for `in_progress` workflows
+   and floor half for `queued` workflows, without borrowing unused portions.
+   At a limit of one, the allocated status alternates across passes in memory,
+   starting with `in_progress` after restart. Each listing retains its page
+   bound; exhaustion marks the pass truncated and a cut-short workflow partial,
+   so unseen siblings cannot permit force-cancel and pruning waits for a
+   complete pass. Repository order remains configuration order (name order
+   when discovered): earlier backlogs can still delay later repositories,
+   including their stopped-job recovery. This is not cross-repository fairness.
 2. **Supply.** Lists the instance's live Lux Runs (`submitted`, `scheduled`,
    `provisioning`, `starting`, `running`, `stopping`, `resuming`) and the
    repository's runners named `lux-gha-<instance>-...`.
