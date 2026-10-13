@@ -22,6 +22,16 @@ func pullRequest(n, base int64) githubapp.PullRequestRef {
 	return pr
 }
 
+// forkPR is run as GitHub lists it for a pull request from contributor's
+// fork: no pull requests, the fork as head repository.
+func forkPR(run githubapp.WorkflowRun) githubapp.WorkflowRun {
+	run.Event = "pull_request"
+	run.PullRequests = nil
+	run.HeadRepository = &githubapp.HeadRepository{}
+	run.HeadRepository.Owner.Login = "contributor"
+	return run
+}
+
 func TestRunName(t *testing.T) {
 	job := githubapp.WorkflowJob{ID: 7, RunID: 70, Name: "build", WorkflowName: ptr("Lib (Java)")}
 	run := githubapp.WorkflowRun{ID: 70, Name: ptr("Lib (Java)"), HeadBranch: ptr("lux/lib-on-lux"), RunNumber: 12}
@@ -43,6 +53,7 @@ func TestRunName(t *testing.T) {
 			"widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
 		"own pull request beside one into another repository": {withPRs(pullRequest(5, 2002), pullRequest(34, metaRepoID)), job,
 			"widgets · Lib (Java) / build · #34 run 12"},
+		"pull request from a fork names owner and branch": {forkPR(run), job, "widgets · Lib (Java) / build · contributor:lux/lib-on-lux run 12"},
 		"workflow from the run when the job has none": {func() githubapp.WorkflowRun {
 			r := run
 			r.Name = ptr("CI")
@@ -127,5 +138,24 @@ func TestMetaLabelsLeaveOutAPullRequestIntoAnotherRepository(t *testing.T) {
 	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7}))
 	if _, ok := got[LabelPR]; ok || got[LabelBranch] != "main" {
 		t.Fatalf("labels %v", got)
+	}
+}
+
+func TestMetaLabelsNameAForkPullRequestsOwner(t *testing.T) {
+	fork := forkPR(githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main")})
+	if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, fork, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "contributor:main" {
+		t.Fatalf("fork pull request branch %q", got)
+	}
+	push := fork
+	push.Event = "push"
+	if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, push, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "main" {
+		t.Fatalf("push branch %q", got)
+	}
+	own := fork
+	own.Event = "pull_request_target"
+	own.PullRequests = []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, own, githubapp.WorkflowJob{ID: 7}))
+	if got[LabelBranch] != "main" || got[LabelPR] != "34" {
+		t.Fatalf("own pull request labels %v", got)
 	}
 }

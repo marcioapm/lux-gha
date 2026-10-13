@@ -557,7 +557,8 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 		t.Fatalf("runs=%+v err=%v", runs, err)
 	}
 	if r := runs.Runs[0]; *r.HeadBranch != "feature/x" || r.RunNumber != 12 || r.Event != "pull_request" || *r.Name != "CI" ||
-		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 || r.PullRequests[0].Base.Repo.ID != 77 {
+		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 || r.PullRequests[0].Base.Repo.ID != 77 ||
+		r.HeadRepository == nil || r.HeadRepository.Owner.Login != "contributor" {
 		t.Fatalf("run metadata %+v", r)
 	}
 	all, err := c.ListWorkflowRunJobs(context.Background(), repo, 5, WorkflowJobListOptions{Filter: "all"})

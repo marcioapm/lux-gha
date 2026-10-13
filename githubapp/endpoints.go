@@ -83,7 +83,8 @@ type WorkflowRun struct {
 	// PullRequests lists the open pull requests whose head is this run's
 	// head, whatever their base: it can hold a pull request into a fork, and
 	// it is empty for a pull request from a fork.
-	PullRequests []PullRequestRef `json:"pull_requests"`
+	PullRequests   []PullRequestRef `json:"pull_requests"`
+	HeadRepository *HeadRepository  `json:"head_repository"`
 }
 
 type PullRequestRef struct {
@@ -95,6 +96,12 @@ type PullRequestBase struct {
 	Repo struct {
 		ID int64 `json:"id"`
 	} `json:"repo"`
+}
+
+type HeadRepository struct {
+	Owner struct {
+		Login string `json:"login"`
+	} `json:"owner"`
 }
 
 // Page and PerPage default to GitHub's 1 and 30 when zero; PerPage is capped by GitHub at 100.

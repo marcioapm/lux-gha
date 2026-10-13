@@ -317,12 +317,13 @@ left out.
 | `lux-gha/job-name` | job name |
 | `lux-gha/run-id` | workflow run ID |
 | `lux-gha/run-attempt` | workflow run attempt |
-| `lux-gha/branch` | head branch |
+| `lux-gha/branch` | head branch; `<fork owner>:<branch>` (e.g. `contributor:main`) for a `pull_request*` run that lists no pull request into this repository, as a pull request from a fork does |
 | `lux-gha/pr` | pull request number, only when exactly one of the pull requests the run lists has this repository as its base (GitHub also lists pull requests into forks that share the run's head, and none for a pull request from a fork) |
 | `lux-gha/sha` | head commit, first 12 characters |
 
 The Run's name is `<repo> · <workflow> / <job> · <#PR or branch> run <run number>`,
-for example `widgets · CI / build · #34 run 12`. Unknown parts are left out
+for example `widgets · CI / build · #34 run 12`; the branch is written as in
+`lux-gha/branch`. Unknown parts are left out
 (`job <id>` stands in for a missing job name), and the name is cut to 128
 bytes on a UTF-8 boundary with `…`, keeping the run number. The name is
 cosmetic: nothing parses it.

@@ -71,6 +71,12 @@ func newJobMeta(repoID int64, run githubapp.WorkflowRun, j githubapp.WorkflowJob
 	if run.HeadBranch != nil {
 		m.branch = *run.HeadBranch
 	}
+	// A pull request from a fork lists none into this repository; its head
+	// branch is the fork's, so it is shown as owner:branch.
+	if n == 0 && m.branch != "" && strings.HasPrefix(run.Event, "pull_request") &&
+		run.HeadRepository != nil && run.HeadRepository.Owner.Login != "" {
+		m.branch = run.HeadRepository.Owner.Login + ":" + m.branch
+	}
 	if m.runID == 0 {
 		m.runID = run.ID
 	}
