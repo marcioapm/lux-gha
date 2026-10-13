@@ -49,6 +49,10 @@ hung-probe paths, and that the config never shows up in output or in the runner'
 The smoke cases that pass a fake config to the real runner only show that `run.sh` was reached with
 invalid input. The `--privileged` checks are only an approximation, because Lux never runs a nested Run
 privileged. Only a real nested Run proves that Docker works under Lux.
+The real listener's job cancellation and log upload within `stopGrace` is
+only verified live, against a real GitHub job; the signal harness uses a fake listener.
+`make entrypoint-test` also checks uid 0 through real `setpriv`, dropping to
+uid 1000; this path leaves Docker startup to the job.
 
 CI runs the default `smoke.sh` on a linux/arm64 runner for every pull request. A `v*` tag builds, smoke-tests
 and pushes the arm64 image to `ghcr.io/<owner>/lux-gha-runner` (see [Releases](../../README.md#releases)).

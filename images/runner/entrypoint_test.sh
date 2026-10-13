@@ -15,9 +15,16 @@
 # shellcheck disable=SC2016
 set -eu
 
-ep=${1:-$(cd "$(dirname "$0")" && pwd)/entrypoint.sh}
-[ "$(id -u)" -ne 0 ] || { echo "entrypoint_test: run as a non-root user" >&2; exit 2; }
-root=$(mktemp -d)
+ep=${1:-$(dirname "$0")/entrypoint.sh}
+root_case=${2:-}
+if [ "$root_case" = sigterm-root ]; then
+	[ "$(id -u)" -eq 0 ] || { echo "sigterm-root requires uid 0" >&2; exit 2; }
+else
+	[ "$(id -u)" -ne 0 ] || { echo "entrypoint_test: run as a non-root user" >&2; exit 2; }
+fi
+root=$PWD/.scratch/entrypoint-$$
+mkdir -p "$root"
+chmod 755 "$root" "$PWD/.scratch"
 sentinel=sentinel-jitconfig-$$-$(date +%s)
 failures=0
 
@@ -34,6 +41,7 @@ mkdir -p "$root/bin" "$root/runner"
 cat >"$root/runner/run.sh" <<'EOF'
 #!/bin/sh
 env >"$FAKE_CASE_DIR/runner.env"
+id -u >"$FAKE_CASE_DIR/runner.uid"
 printf '%s\n' "$@" >"$FAKE_CASE_DIR/runner.args"
 mode=${FAKE_RUN:-exit:0}
 case $mode in
@@ -121,6 +129,7 @@ run_case() {
 	shift
 	d=$root/$name
 	mkdir -p "$d/xdg"
+	if [ "$root_case" = sigterm-root ]; then chown -R 1000:1000 "$d"; fi
 	printf %s "$sentinel" >"$d/jit"
 	start=$(date +%s)
 	rc=0
@@ -149,6 +158,19 @@ check_no_leak() {
 }
 reached='[ -f "$d/runner.args" ]'
 not_reached='[ ! -f "$d/runner.args" ]'
+
+if [ "$root_case" = sigterm-root ]; then
+	run_case sigterm-root FAKE_RUN=await-term FAKE_TERM=1 RUNNER_USER=ubuntu
+	check "exits 0 through setpriv" '[ "$rc" = 0 ]'
+	check "RUNNER_MANUALLY_TRAP_SIG is set for run.sh" 'grep -qx "RUNNER_MANUALLY_TRAP_SIG=1" "$d/runner.env"'
+	check "SIGTERM reached run.sh's trap" '[ "$(cat "$d/term" 2>/dev/null)" = TERM ]'
+	check "run.sh runs as uid 1000" 'grep -qx "1000" "$d/runner.uid"'
+	check "root path leaves Docker to the job" '[ ! -f "$d/dockerd.pid" ]'
+	check_no_leak
+	[ "$failures" -eq 0 ] || exit 1
+	echo "entrypoint_test: OK"
+	exit 0
+fi
 
 run_case exec FAKE_RUN=signal-parent
 check "exits 0" '[ "$rc" = 0 ]'

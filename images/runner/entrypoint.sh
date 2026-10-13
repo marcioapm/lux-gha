@@ -60,7 +60,7 @@ cd "$RUNNER_DIR"
 # run.sh forwards SIGTERM to the listener as SIGINT only with this set; the
 # listener then cancels the running job and uploads its logs before exiting.
 # Lux stops a Run (disk limit, timeout, preemption, drain, terminate) with
-# SIGTERM to this process, which exec makes run.sh, then SIGKILL after
+# SIGTERM to this process's group (exec makes this run.sh), then SIGKILL after
 # workload.grace. dockerd runs in its own session and keeps serving the
 # job's containers while it is cancelled.
 export RUNNER_MANUALLY_TRAP_SIG=1
