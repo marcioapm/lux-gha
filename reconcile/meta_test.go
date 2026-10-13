@@ -1,0 +1,212 @@
+package reconcile
+
+import (
+	"strings"
+	"testing"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/luxclient"
+)
+
+func ptr[T any](v T) *T { return &v }
+
+// metaRepoID is acme/widgets' repository id in these tests and in fakeGitHub.
+const metaRepoID = 1001
+
+// pullRequest is a pull request number n whose base is repository base.
+func pullRequest(n, base int64) githubapp.PullRequestRef {
+	pr := githubapp.PullRequestRef{Number: n}
+	pr.Base.Repo.ID = base
+	return pr
+}
+
+// forkPR is run as GitHub lists it for a pull request from contributor's
+// fork: no pull requests, the fork as head repository.
+func forkPR(run githubapp.WorkflowRun) githubapp.WorkflowRun {
+	run.Event = "pull_request"
+	run.PullRequests = nil
+	run.HeadRepository = &githubapp.HeadRepository{ID: 2002}
+	run.HeadRepository.Owner.Login = "contributor"
+	return run
+}
+
+func TestRunName(t *testing.T) {
+	job := githubapp.WorkflowJob{ID: 7, RunID: 70, Name: "build", WorkflowName: ptr("Lib (Java)")}
+	run := githubapp.WorkflowRun{ID: 70, Name: ptr("Lib (Java)"), HeadBranch: ptr("lux/lib-on-lux"), RunNumber: 12}
+	withPRs := func(prs ...githubapp.PullRequestRef) githubapp.WorkflowRun {
+		r := run
+		r.PullRequests = prs
+		return r
+	}
+	cases := map[string]struct {
+		run  githubapp.WorkflowRun
+		job  githubapp.WorkflowJob
+		want string
+	}{
+		"branch":       {run, job, "widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"pull request": {withPRs(pullRequest(34, metaRepoID)), job, "widgets · Lib (Java) / build · #34 run 12"},
+		"several pull requests name the branch": {withPRs(pullRequest(34, metaRepoID), pullRequest(35, metaRepoID)), job,
+			"widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"a pull request into another repository names the branch": {withPRs(pullRequest(5, 2002)), job,
+			"widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"own pull request beside one into another repository": {withPRs(pullRequest(5, 2002), pullRequest(34, metaRepoID)), job,
+			"widgets · Lib (Java) / build · #34 run 12"},
+		"pull request from a fork names owner and branch": {forkPR(run), job, "widgets · Lib (Java) / build · contributor:lux/lib-on-lux run 12"},
+		"several own pull requests on a pull_request run name the bare branch": {func() githubapp.WorkflowRun {
+			r := forkPR(run)
+			r.PullRequests = []githubapp.PullRequestRef{pullRequest(34, metaRepoID), pullRequest(35, metaRepoID)}
+			return r
+		}(), job, "widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"workflow from the run when the job has none": {func() githubapp.WorkflowRun {
+			r := run
+			r.Name = ptr("CI")
+			return r
+		}(), func() githubapp.WorkflowJob { j := job; j.WorkflowName = nil; return j }(), "widgets · CI / build · lux/lib-on-lux run 12"},
+		"no workflow name": {func() githubapp.WorkflowRun { r := run; r.Name = nil; return r }(),
+			func() githubapp.WorkflowJob { j := job; j.WorkflowName = nil; return j }(), "widgets · build · lux/lib-on-lux run 12"},
+		"no job name, branch or number": {githubapp.WorkflowRun{ID: 70},
+			githubapp.WorkflowJob{ID: 7, WorkflowName: ptr("CI")}, "widgets · CI / job 7"},
+		"newlines and tabs": {run, func() githubapp.WorkflowJob { j := job; j.Name = "build\n\tall\r\n"; return j }(),
+			"widgets · Lib (Java) / build all · lux/lib-on-lux run 12"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := runName("acme/widgets", 7, newJobMeta(metaRepoID, tc.run, tc.job)); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// hostile is a 1 KiB-plus name: emoji (4-byte runes), newlines, a NUL, an
+// escape sequence, line and paragraph separators and an invalid byte.
+func hostile() string {
+	return strings.Repeat("🚀 deploy\nstage\x00\x1b[31m\u2028é\u2029\xff ", 40)
+}
+
+// unprintable matches what cleanText must remove: control characters and
+// line and paragraph separators, which a console renders as line breaks.
+func unprintable(r rune) bool {
+	return unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp)
+}
+
+func TestCutsNeverSplitARune(t *testing.T) {
+	for pad := range 4 { // shifts a 4-byte rune across every offset of the cut
+		s := strings.Repeat("a", pad) + strings.Repeat("🚀", luxclient.MaxLabelValue/4+1)
+		if v := labelValue(s); !utf8.ValidString(v) || len(v) > luxclient.MaxLabelValue || len(v) < luxclient.MaxLabelValue-3 {
+			t.Fatalf("label value, pad %d: %d bytes, valid=%v", pad, len(v), utf8.ValidString(v))
+		}
+		n := runName("acme/widgets", 7, jobMeta{job: strings.Repeat("a", pad) + strings.Repeat("🚀", maxRunName/4+1), runNumber: 4})
+		if !utf8.ValidString(n) || len(n) > maxRunName || len(n) < maxRunName-3 || !strings.HasSuffix(n, "… run 4") {
+			t.Fatalf("name, pad %d: %d bytes %q", pad, len(n), n)
+		}
+	}
+}
+
+func TestRunNameIsCutOnARuneBoundaryKeepingTheRunNumber(t *testing.T) {
+	long := hostile()
+	if len(long) < 1024 {
+		t.Fatalf("fixture is %d bytes", len(long))
+	}
+	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr(long), RunNumber: 123456}
+	job := githubapp.WorkflowJob{ID: 7, RunID: 70, Name: long, WorkflowName: ptr(long)}
+	got := runName("acme/widgets", 7, newJobMeta(metaRepoID, run, job))
+	if len(got) > maxRunName || !utf8.ValidString(got) || !strings.HasSuffix(got, "… run 123456") || !strings.HasPrefix(got, "widgets · 🚀 deploy stage") {
+		t.Fatalf("%d bytes: %q", len(got), got)
+	}
+	if strings.ContainsFunc(got, unprintable) {
+		t.Fatalf("unprintable character in %q", got)
+	}
+	short := runName("acme/widgets", 7, jobMeta{job: "build", runNumber: 1})
+	if short != "widgets · build run 1" {
+		t.Fatalf("short name %q", short)
+	}
+}
+
+func TestMetaLabelsAreSanitised(t *testing.T) {
+	long := hostile()
+	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr(long), RunNumber: 3, PullRequests: []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}}
+	job := githubapp.WorkflowJob{ID: 7, RunID: 70, RunAttempt: 2, Name: long, WorkflowName: ptr(long), HeadSHA: strings.Repeat("ab", 20)}
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, job))
+	for _, k := range []string{LabelWorkflow, LabelJobName, LabelBranch} {
+		v := got[k]
+		if len(v) == 0 || len(v) > luxclient.MaxLabelValue || !utf8.ValidString(v) || strings.ContainsFunc(v, unprintable) {
+			t.Fatalf("%s: %d bytes %q", k, len(v), v)
+		}
+		if !strings.HasPrefix(v, "🚀 deploy stage [31m é ") {
+			t.Fatalf("%s: %q", k, v)
+		}
+	}
+	if got[LabelRepoName] != "acme/widgets" || got[LabelRunID] != "70" || got[LabelRunAttempt] != "2" ||
+		got[LabelPR] != "34" || got[LabelSHA] != "abababababab" {
+		t.Fatalf("labels %v", got)
+	}
+	spec := luxclient.RunSpec{Name: runName("acme/widgets", 7, newJobMeta(metaRepoID, run, job)), Labels: got, ImageRef: "img", Command: []string{"run"}}
+	if err := spec.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMetaLabelsLeaveOutWhatIsUnknown(t *testing.T) {
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, githubapp.WorkflowRun{ID: 70}, githubapp.WorkflowJob{ID: 7, WorkflowName: ptr(" \n ")}))
+	want := map[string]string{LabelRepoName: "acme/widgets", LabelRunID: "70"}
+	if !mapsEqual(got, want) {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+func TestMetaLabelsTakeTheRunsSHAWhenTheJobHasNone(t *testing.T) {
+	run := githubapp.WorkflowRun{ID: 70, HeadSHA: strings.Repeat("c", 40)}
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7, RunID: 70, HeadSHA: ""}))
+	if got[LabelSHA] != "cccccccccccc" {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+func TestMetaLabelsLeaveOutAPullRequestIntoAnotherRepository(t *testing.T) {
+	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main"), PullRequests: []githubapp.PullRequestRef{pullRequest(5, 2002)}}
+	got := runLabels(run)
+	if _, ok := got[LabelPR]; ok || got[LabelBranch] != "main" {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+// runLabels is the descriptive labels of job 7 of acme/widgets in run.
+func runLabels(run githubapp.WorkflowRun) map[string]string {
+	return metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7}))
+}
+
+func TestMetaLabelsNameAForkPullRequestsOwner(t *testing.T) {
+	fork := forkPR(githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main")})
+	if got := runLabels(fork)[LabelBranch]; got != "contributor:main" {
+		t.Fatalf("fork pull request branch %q", got)
+	}
+	push := fork
+	push.Event = "push"
+	if got := runLabels(push)[LabelBranch]; got != "main" {
+		t.Fatalf("push branch %q", got)
+	}
+	own := fork
+	own.Event = "pull_request_target"
+	own.PullRequests = []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}
+	got := runLabels(own)
+	if got[LabelBranch] != "main" || got[LabelPR] != "34" {
+		t.Fatalf("own pull request labels %v", got)
+	}
+	gone := fork // the fork was deleted: GitHub sends head_repository null
+	gone.HeadRepository = nil
+	if got := runLabels(gone)[LabelBranch]; got != "main" {
+		t.Fatalf("deleted fork branch %q", got)
+	}
+	for _, event := range []string{"pull_request", "pull_request_target"} {
+		same := forkPR(githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main")}) // a head in this repository, no pull request listed
+		same.Event = event
+		same.HeadRepository.ID = metaRepoID
+		same.HeadRepository.Owner.Login = "acme"
+		if got := runLabels(same)[LabelBranch]; got != "main" {
+			t.Fatalf("%s with a head in this repository: branch %q", event, got)
+		}
+	}
+}

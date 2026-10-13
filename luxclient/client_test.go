@@ -128,6 +128,15 @@ func TestCreateSendsExactRequest(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsLabelsAtLuxLimits(t *testing.T) {
+	s := jitSpec()
+	s.Labels["A/z0._-9"] = strings.Repeat("é", MaxLabelValue/2)
+	s.Labels[strings.Repeat("a", 64)] = "x"
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateMinimalSpecOmitsOptionalFields(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -295,6 +304,12 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 		"negative resources":  {"k", leak(func(s *RunSpec) { s.Resources.CPUs = -1 })},
 		"negative grace":      {"k", leak(func(s *RunSpec) { s.Grace = -time.Second })},
 		"reserved env":        {"k", leak(func(s *RunSpec) { s.Env["LUX_X"] = "1" })},
+		"label key space":     {"k", leak(func(s *RunSpec) { s.Labels["lux-gha/KEY SENTINEL"] = "x" })},
+		"label key empty":     {"k", leak(func(s *RunSpec) { s.Labels[""] = "x" })},
+		"label key ends -":    {"k", leak(func(s *RunSpec) { s.Labels["x-"] = "x" })},
+		"label key starts -":  {"k", leak(func(s *RunSpec) { s.Labels["-x"] = "x" })},
+		"label key 65":        {"k", leak(func(s *RunSpec) { s.Labels["KEY-SENTINEL"+strings.Repeat("a", 65-len("KEY-SENTINEL"))] = "x" })},
+		"label value 257":     {"k", leak(func(s *RunSpec) { s.Labels["lux-gha/x"] = "VALUE-SENTINEL" + strings.Repeat("é", 128) })},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -304,6 +319,10 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "JITCONFIG-SECRET-VALUE") {
 				t.Fatalf("error leaks secret: %v", err)
+			}
+			// Every label sentinel (KEY SENTINEL, KEY-SENTINEL, VALUE-SENTINEL) holds this.
+			if strings.Contains(err.Error(), "SENTINEL") {
+				t.Fatalf("error quotes a label: %v", err)
 			}
 		})
 	}

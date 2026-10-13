@@ -289,7 +289,8 @@ read.
 
 `GET /status` reports `demand` for the repositories read in the pass.
 
-Run labels (no secrets ever go in labels):
+Run labels (no secrets ever go in labels). These six identify the Run;
+ownership, matching, adoption and cleanup read only these:
 
 | Label | Value |
 |---|---|
@@ -299,6 +300,37 @@ Run labels (no secrets ever go in labels):
 | `lux-gha/job` | ID of the job that triggered provisioning |
 | `lux-gha/gen` | generation for that job |
 | `lux-gha/runner` | GitHub runner name |
+
+`app` is always `lux-gha`, Lux's convention for which tool submitted a Run.
+It is for cost breakdowns only (`label:app`); nothing reads it back.
+
+The labels below describe the triggering job for people reading Lux (the console,
+`lux ls`, costs grouped by label). They come from the workflow-runs and jobs
+listings that found the job, so they cost no extra GitHub request. Nothing
+reads them back, and they are not part of the `Idempotency-Key`: a replayed
+key matches whatever they say. Control characters become spaces, and each
+value is cut to 256 bytes on a UTF-8 boundary. Lux does not check Run labels
+at submit; 256 bytes and its key rule are what it applies to server labels
+and to cost label-filter keys, and `lux-gha` holds Run labels to them so they
+stay queryable in costs. An empty value is left out.
+
+| Label | Value |
+|---|---|
+| `lux-gha/repo-name` | `owner/repo` |
+| `lux-gha/workflow` | workflow name |
+| `lux-gha/job-name` | job name |
+| `lux-gha/run-id` | workflow run ID |
+| `lux-gha/run-attempt` | workflow run attempt |
+| `lux-gha/branch` | head branch; `<fork owner>:<branch>` (e.g. `contributor:main`) for a `pull_request*` run that lists no pull request into this repository, as a pull request from a fork does |
+| `lux-gha/pr` | pull request number, only when exactly one of the pull requests the run lists has this repository as its base (GitHub also lists pull requests into forks that share the run's head, and none for a pull request from a fork) |
+| `lux-gha/sha` | head commit, first 12 characters |
+
+The Run's name is `<repo> · <workflow> / <job> · <#PR or branch> run <run number>`,
+for example `widgets · CI / build · #34 run 12`; the branch is written as in
+`lux-gha/branch`. Unknown parts are left out
+(`job <id>` stands in for a missing job name), and the name is cut to 128
+bytes on a UTF-8 boundary with `…`, keeping the run number. The name is
+cosmetic: nothing parses it.
 
 A GitHub rate limit stops the pass where it is; no pass calls GitHub again
 until the reported retry time. Other errors end the pass early or skip one

@@ -80,6 +80,29 @@ type WorkflowRun struct {
 	WorkflowID int64     `json:"workflow_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// PullRequests lists the open pull requests whose head is this run's
+	// head, whatever their base: it can hold a pull request into a fork, and
+	// it is empty for a pull request from a fork.
+	PullRequests   []PullRequestRef `json:"pull_requests"`
+	HeadRepository *HeadRepository  `json:"head_repository"`
+}
+
+type PullRequestRef struct {
+	Number int64           `json:"number"`
+	Base   PullRequestBase `json:"base"`
+}
+
+type PullRequestBase struct {
+	Repo struct {
+		ID int64 `json:"id"`
+	} `json:"repo"`
+}
+
+type HeadRepository struct {
+	ID    int64 `json:"id"`
+	Owner struct {
+		Login string `json:"login"`
+	} `json:"owner"`
 }
 
 // Page and PerPage default to GitHub's 1 and 30 when zero; PerPage is capped by GitHub at 100.
@@ -207,7 +230,6 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, repo Repository, opts Wor
 	if opts.Status != "" {
 		q.Set("status", opts.Status)
 	}
-	q.Set("exclude_pull_requests", "true")
 	out.HasNext, err = c.list(ctx, repo, "/actions/runs", q, &out)
 	return out, err
 }
