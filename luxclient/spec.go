@@ -163,6 +163,12 @@ func (s RunSpec) MarshalJSON() ([]byte, error) {
 // reserved by Lux for its own files.
 var secretNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,62}$`)
 
+// MaxLabelValue is Lux's bound on a label value, in bytes; labelKeyRe is its
+// label key alphabet.
+const MaxLabelValue = 256
+
+var labelKeyRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
 // Validate refuses specs Lux would reject on shape alone, and any secret
 // value that also appears in the name, labels, env, command, workdir or user:
 // those are stored with the Run and visible to every reader.
@@ -187,6 +193,15 @@ func (s RunSpec) Validate() error {
 	r := s.Resources
 	if r.CPUs < 0 || r.Memory < 0 || r.Disk < 0 || r.Pids < 0 {
 		fail("resources must not be negative")
+	}
+	for k, v := range s.Labels {
+		// Neither the key nor the value is quoted: either could hold a secret.
+		if !labelKeyRe.MatchString(k) {
+			fail("a label key has characters Lux refuses")
+		}
+		if len(v) > MaxLabelValue {
+			fail("a label value exceeds %d bytes", MaxLabelValue)
+		}
 	}
 	for k := range s.Env {
 		if strings.HasPrefix(k, "LUX_") {

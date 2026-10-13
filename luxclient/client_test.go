@@ -128,6 +128,14 @@ func TestCreateSendsExactRequest(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsLabelsAtLuxLimits(t *testing.T) {
+	s := jitSpec()
+	s.Labels["Az09._/-"] = strings.Repeat("é", MaxLabelValue/2)
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateMinimalSpecOmitsOptionalFields(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -295,6 +303,9 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 		"negative resources":  {"k", leak(func(s *RunSpec) { s.Resources.CPUs = -1 })},
 		"negative grace":      {"k", leak(func(s *RunSpec) { s.Grace = -time.Second })},
 		"reserved env":        {"k", leak(func(s *RunSpec) { s.Env["LUX_X"] = "1" })},
+		"label key space":     {"k", leak(func(s *RunSpec) { s.Labels["lux-gha/job name"] = "x" })},
+		"label key empty":     {"k", leak(func(s *RunSpec) { s.Labels[""] = "x" })},
+		"label value 257":     {"k", leak(func(s *RunSpec) { s.Labels["lux-gha/x"] = strings.Repeat("é", 128) + "x" })},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
