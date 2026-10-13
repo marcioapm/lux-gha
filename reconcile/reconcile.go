@@ -494,6 +494,7 @@ func (p *pass) readDemand(v *repoView) error {
 				return err
 			}
 			for _, run := range runs.Runs {
+				// Charged before the error check: a failed job page still spends it.
 				err := p.readRunJobs(v, run.ID)
 				p.statusBudget[i] = p.budget
 				if err != nil {
@@ -504,7 +505,6 @@ func (p *pass) readDemand(v *repoView) error {
 				break
 			}
 		}
-		p.statusBudget[i] = p.budget
 		if p.budget == 0 {
 			p.truncated = true
 		}
