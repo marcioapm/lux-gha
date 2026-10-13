@@ -289,7 +289,8 @@ read.
 
 `GET /status` reports `demand` for the repositories read in the pass.
 
-Run labels (no secrets ever go in labels):
+Run labels (no secrets ever go in labels). The first six identify the Run;
+ownership, matching, adoption and cleanup read only these:
 
 | Label | Value |
 |---|---|
@@ -299,6 +300,31 @@ Run labels (no secrets ever go in labels):
 | `lux-gha/job` | ID of the job that triggered provisioning |
 | `lux-gha/gen` | generation for that job |
 | `lux-gha/runner` | GitHub runner name |
+
+The rest describe the triggering job for people reading Lux (the console,
+`lux ls`, costs grouped by label). They come from the workflow-runs and jobs
+listings that found the job, so they cost no extra GitHub request. Nothing
+reads them back, and they are not part of the `Idempotency-Key`: a replayed
+key matches whatever they say. Control characters become spaces, and each
+value is cut to Lux's 256-byte limit on a UTF-8 boundary. An empty value is
+left out.
+
+| Label | Value |
+|---|---|
+| `lux-gha/repo-name` | `owner/repo` |
+| `lux-gha/workflow` | workflow name |
+| `lux-gha/job-name` | job name |
+| `lux-gha/run-id` | workflow run ID |
+| `lux-gha/run-attempt` | workflow run attempt |
+| `lux-gha/branch` | head branch |
+| `lux-gha/pr` | pull request number, only when the run lists exactly one (GitHub lists none for a pull request from a fork) |
+| `lux-gha/sha` | head commit, first 12 characters |
+
+The Run's name is `<repo> · <workflow> / <job> · <#PR or branch> run <run number>`,
+for example `widgets · CI / build · #34 run 12`. Unknown parts are left out
+(`job <id>` stands in for a missing job name), and the name is cut to 128
+bytes on a UTF-8 boundary with `…`, keeping the run number. The name is
+cosmetic: nothing parses it.
 
 A GitHub rate limit stops the pass where it is; no pass calls GitHub again
 until the reported retry time. Other errors end the pass early or skip one
