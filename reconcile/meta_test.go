@@ -76,9 +76,28 @@ func TestRunName(t *testing.T) {
 }
 
 // hostile is a 1 KiB-plus name: emoji (4-byte runes), newlines, a NUL, an
-// escape sequence and an invalid byte.
+// escape sequence, line and paragraph separators and an invalid byte.
 func hostile() string {
-	return strings.Repeat("🚀 deploy\nstage\x00\x1b[31m é\xff ", 40)
+	return strings.Repeat("🚀 deploy\nstage\x00\x1b[31m\u2028é\u2029\xff ", 40)
+}
+
+// unprintable matches what cleanText must remove: control characters and
+// line and paragraph separators, which a console renders as line breaks.
+func unprintable(r rune) bool {
+	return unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp)
+}
+
+func TestCutsNeverSplitARune(t *testing.T) {
+	for pad := range 4 { // shifts a 4-byte rune across every offset of the cut
+		s := strings.Repeat("a", pad) + strings.Repeat("🚀", luxclient.MaxLabelValue/4+1)
+		if v := labelValue(s); !utf8.ValidString(v) || len(v) > luxclient.MaxLabelValue || len(v) < luxclient.MaxLabelValue-3 {
+			t.Fatalf("label value, pad %d: %d bytes, valid=%v", pad, len(v), utf8.ValidString(v))
+		}
+		n := runName("acme/widgets", 7, jobMeta{job: strings.Repeat("a", pad) + strings.Repeat("🚀", maxRunName/4+1), runNumber: 4})
+		if !utf8.ValidString(n) || len(n) > maxRunName || len(n) < maxRunName-3 || !strings.HasSuffix(n, "… run 4") {
+			t.Fatalf("name, pad %d: %d bytes %q", pad, len(n), n)
+		}
+	}
 }
 
 func TestRunNameIsCutOnARuneBoundaryKeepingTheRunNumber(t *testing.T) {
@@ -92,8 +111,8 @@ func TestRunNameIsCutOnARuneBoundaryKeepingTheRunNumber(t *testing.T) {
 	if len(got) > maxRunName || !utf8.ValidString(got) || !strings.HasSuffix(got, "… run 123456") || !strings.HasPrefix(got, "widgets · 🚀 deploy stage") {
 		t.Fatalf("%d bytes: %q", len(got), got)
 	}
-	if strings.ContainsFunc(got, unicode.IsControl) {
-		t.Fatalf("control character in %q", got)
+	if strings.ContainsFunc(got, unprintable) {
+		t.Fatalf("unprintable character in %q", got)
 	}
 	short := runName("acme/widgets", 7, jobMeta{job: "build", runNumber: 1})
 	if short != "widgets · build run 1" {
@@ -108,7 +127,7 @@ func TestMetaLabelsAreSanitised(t *testing.T) {
 	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, job))
 	for _, k := range []string{LabelWorkflow, LabelJobName, LabelBranch} {
 		v := got[k]
-		if len(v) == 0 || len(v) > luxclient.MaxLabelValue || !utf8.ValidString(v) || strings.ContainsFunc(v, unicode.IsControl) {
+		if len(v) == 0 || len(v) > luxclient.MaxLabelValue || !utf8.ValidString(v) || strings.ContainsFunc(v, unprintable) {
 			t.Fatalf("%s: %d bytes %q", k, len(v), v)
 		}
 		if !strings.HasPrefix(v, "🚀 deploy stage [31m é ") {
@@ -129,6 +148,14 @@ func TestMetaLabelsLeaveOutWhatIsUnknown(t *testing.T) {
 	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, githubapp.WorkflowRun{ID: 70}, githubapp.WorkflowJob{ID: 7, WorkflowName: ptr(" \n ")}))
 	want := map[string]string{LabelRepoName: "acme/widgets", LabelRunID: "70"}
 	if !mapsEqual(got, want) {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+func TestMetaLabelsTakeTheRunsSHAWhenTheJobHasNone(t *testing.T) {
+	run := githubapp.WorkflowRun{ID: 70, HeadSHA: strings.Repeat("c", 40)}
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7, RunID: 70, HeadSHA: ""}))
+	if got[LabelSHA] != "cccccccccccc" {
 		t.Fatalf("labels %v", got)
 	}
 }

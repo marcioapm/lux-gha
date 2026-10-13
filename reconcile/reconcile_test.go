@@ -318,7 +318,7 @@ func TestListedJobWithHostileNamesIsProvisionedWithBoundedLabels(t *testing.T) {
 		t.Fatalf("name %d bytes %q", len(r.spec.Name), r.spec.Name)
 	}
 	for _, k := range []string{LabelWorkflow, LabelJobName, LabelBranch} {
-		if v := r.run.Labels[k]; v == "" || len(v) > luxclient.MaxLabelValue || strings.ContainsAny(v, "\n\x00\x1b") {
+		if v := r.run.Labels[k]; v == "" || len(v) > luxclient.MaxLabelValue || strings.ContainsFunc(v, unprintable) {
 			t.Fatalf("%s = %q", k, v)
 		}
 	}
