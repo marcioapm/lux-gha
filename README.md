@@ -307,8 +307,10 @@ The rest describe the triggering job for people reading Lux (the console,
 listings that found the job, so they cost no extra GitHub request. Nothing
 reads them back, and they are not part of the `Idempotency-Key`: a replayed
 key matches whatever they say. Control characters become spaces, and each
-value is cut to Lux's 256-byte limit on a UTF-8 boundary. An empty value is
-left out.
+value is cut to 256 bytes on a UTF-8 boundary. Lux does not check Run labels
+at submit; 256 bytes and its key rule are what it applies to server labels
+and to cost label-filter keys, and `lux-gha` holds Run labels to them so they
+stay queryable in costs. An empty value is left out.
 
 | Label | Value |
 |---|---|

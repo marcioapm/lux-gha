@@ -29,9 +29,8 @@ const (
 	LabelSHA        = "lux-gha/sha"
 )
 
-// maxRunName bounds the Run name in bytes. Neither luxclient nor the Lux
-// documentation available to this repository states a Run-name limit, so it
-// stays well inside the 256-byte bound Lux puts on a label value.
+// maxRunName bounds the Run name in bytes for readability; Lux sets no
+// Run-name limit.
 const maxRunName = 128
 
 const shortSHA = 12
@@ -117,7 +116,7 @@ func runName(full string, jobID int64, m jobMeta) string {
 }
 
 // metaLabels returns the descriptive labels for a job, each value cleaned
-// and cut to Lux's label-value bound; empty values are left out.
+// and cut to luxclient.MaxLabelValue; empty values are left out.
 func metaLabels(full string, m jobMeta) map[string]string {
 	sha := m.sha
 	if len(sha) > shortSHA {
