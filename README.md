@@ -289,7 +289,7 @@ read.
 
 `GET /status` reports `demand` for the repositories read in the pass.
 
-Run labels (no secrets ever go in labels). The first six identify the Run;
+Run labels (no secrets ever go in labels). These six identify the Run;
 ownership, matching, adoption and cleanup read only these:
 
 | Label | Value |
@@ -300,9 +300,11 @@ ownership, matching, adoption and cleanup read only these:
 | `lux-gha/job` | ID of the job that triggered provisioning |
 | `lux-gha/gen` | generation for that job |
 | `lux-gha/runner` | GitHub runner name |
-| `app` | always `lux-gha`: Lux's convention for which tool submitted a Run (its costs break down by `label:app`) |
 
-The rest describe the triggering job for people reading Lux (the console,
+`app` is always `lux-gha`, Lux's convention for which tool submitted a Run.
+It is for cost breakdowns only (`label:app`); nothing reads it back.
+
+The labels below describe the triggering job for people reading Lux (the console,
 `lux ls`, costs grouped by label). They come from the workflow-runs and jobs
 listings that found the job, so they cost no extra GitHub request. Nothing
 reads them back, and they are not part of the `Idempotency-Key`: a replayed

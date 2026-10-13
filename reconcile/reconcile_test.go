@@ -328,8 +328,8 @@ func TestListedJobWithHostileNamesIsProvisionedWithBoundedLabels(t *testing.T) {
 }
 
 // A submission whose outcome was unknown is replayed with the same key after
-// the job's metadata changed; Lux answers with the first Run, whose name and
-// descriptive labels are the old ones. It is still this job's Run.
+// the job's metadata changed. The replay adds no Run, and the one Lux holds
+// is still adopted as this job's.
 func TestReplayAfterMetadataChangeStillCarries(t *testing.T) {
 	e := newEnv(t)
 	e.gh.queue(7, "queued", lux3...)
@@ -357,9 +357,8 @@ func TestReplayAfterMetadataChangeStillCarries(t *testing.T) {
 		t.Fatalf("status %+v creates=%d", st, e.lux.createCount())
 	}
 	r := e.lux.all()[0]
-	if r.key != "api.github.com/t1/1001/7/0" || r.spec.Name != "widgets · CI / build · main run 1" ||
-		r.run.Labels[LabelBranch] != "main" || r.run.Labels[LabelPR] != "" || r.run.Labels[LabelGen] != "0" {
-		t.Fatalf("key %q name %q labels %v", r.key, r.spec.Name, r.run.Labels)
+	if r.key != "api.github.com/t1/1001/7/0" || r.run.Labels[LabelGen] != "0" {
+		t.Fatalf("key %q labels %v", r.key, r.run.Labels)
 	}
 	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || len(e.lux.liveForJob("7")) != 1 {
 		t.Fatalf("deleted=%v live=%v", e.gh.deletedNames(), e.lux.liveForJob("7"))
