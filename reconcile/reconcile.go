@@ -64,6 +64,9 @@ type GitHub interface {
 	GenerateRepoJITConfig(context.Context, githubapp.Repository, githubapp.JITConfigRequest) (githubapp.JITConfig, error)
 	DeleteRepoRunner(context.Context, githubapp.Repository, int64) error
 	ListInstallationRepositories(context.Context, int64, githubapp.PageOptions) (githubapp.InstallationRepositoryPage, error)
+	CreateCheckRun(context.Context, githubapp.Repository, githubapp.CheckRunRequest) (githubapp.CheckRun, error)
+	ListCheckRunsForRef(context.Context, githubapp.Repository, string, githubapp.CheckRunListOptions) (githubapp.CheckRunPage, error)
+	ForceCancelWorkflowRun(context.Context, githubapp.Repository, int64) error
 }
 
 type Lux interface {
@@ -98,12 +101,17 @@ type Status struct {
 	Provisioned      int            `json:"provisioned"`
 	Terminated       int            `json:"terminated"`
 	Deleted          int            `json:"deleted"`
+	// CheckRuns and ForceCancelled count jobs whose Lux Run ended under them
+	// (see closeStopped): check runs posted, workflow runs force-cancelled.
+	CheckRuns      int `json:"checkRuns"`
+	ForceCancelled int `json:"forceCancelled"`
 }
 
 // Error categories in Status.Error.
 const (
 	ErrRateLimited    = "github_rate_limited"
 	ErrGitHub         = "github"
+	ErrPermission     = "github_permission"
 	ErrLux            = "lux"
 	ErrNeverNotEchoed = "lux_resume_policy_not_echoed"
 	ErrRunMismatch    = "lux_run_mismatch"
@@ -129,7 +137,13 @@ type Reconciler struct {
 	surplusSince     map[string]time.Time // runner name: idle while its trigger job is not queued
 	missingSince     map[string]time.Time // Run id: live Run whose runner is not registered
 	offlineSince     map[string]time.Time // runner name: registered runner with no live Run
-	disc             *discovery           // nil with an explicit repository list
+	// Runner name, for a job left in_progress after the runner's Run
+	// ended: that Run, when its check run was posted or found, and when
+	// its workflow run was force-cancelled.
+	stopped   map[string]stoppedRun
+	explained map[string]time.Time
+	cancelled map[string]time.Time
+	disc      *discovery // nil with an explicit repository list
 
 	mu     sync.Mutex
 	status Status
@@ -155,6 +169,9 @@ func New(o Options) (*Reconciler, error) {
 		surplusSince: map[string]time.Time{},
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
+		stopped:      map[string]stoppedRun{},
+		explained:    map[string]time.Time{},
+		cancelled:    map[string]time.Time{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -276,6 +293,13 @@ type repoView struct {
 	demand  map[int64]*config.Route
 	runners map[string]githubapp.Runner // managed runners by name
 	seen    map[int64]bool              // every job id listed, any status
+	// stuck: in_progress jobs on this instance's runners, candidates for
+	// closeStopped. runRunners: workflow run id: the runner names its
+	// listed jobs hold; partial: workflow runs whose job listing the
+	// budget or page bound cut short.
+	stuck      []githubapp.WorkflowJob
+	runRunners map[int64][]string
+	partial    map[int64]bool
 }
 
 type pass struct {
@@ -288,6 +312,12 @@ type pass struct {
 	st        Status
 	repos     []*repoView
 	truncated bool
+	// budget: jobs this pass may still take on (maxJobsPerPass), shared by
+	// demand and closeStopped's Lux reads.
+	budget int
+	// noChecks, noCancel: GitHub refused the Checks or Actions write
+	// permission this pass; later calls needing it are skipped.
+	noChecks, noCancel bool
 	// unread: a repository's registrations are unknown this pass (its read
 	// failed, or it has not been read since startup), so its unresolved
 	// submissions are unknown and no Run may be created.
@@ -374,18 +404,22 @@ func (p *pass) act() error {
 	if err := p.removeSurplus(); err != nil {
 		return err
 	}
-	return p.cleanUp()
+	if err := p.cleanUp(); err != nil {
+		return err
+	}
+	return p.closeStopped()
 }
 
 // readGitHub reads each named repository. Every later step acts only on
 // repositories read successfully here; any other is unknown this pass.
 func (p *pass) readGitHub(repositories []string) error {
-	budget := p.r.cfg.Reconcile.MaxJobsPerPass
+	p.budget = p.r.cfg.Reconcile.MaxJobsPerPass
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
-			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{}}
-		err := p.readRepo(v, &budget)
+			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
+			runRunners: map[int64][]string{}, partial: map[int64]bool{}}
+		err := p.readRepo(v, &p.budget)
 		if p.rateLimited(err) {
 			return errAbort
 		}
@@ -441,7 +475,8 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 }
 
 // readDemand collects queued jobs that match a route. Queued jobs live in
-// queued runs and, behind finished jobs, in in_progress runs.
+// queued runs and, behind finished jobs, in in_progress runs, which also
+// hold the in_progress jobs closeStopped looks at.
 func (p *pass) readDemand(v *repoView, budget *int) error {
 	for _, status := range []string{"queued", "in_progress"} {
 		for page := 1; ; page++ {
@@ -470,6 +505,7 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 	for page := 1; ; page++ {
 		if page > maxRunPages || *budget <= 0 {
 			p.truncated = true
+			v.partial[runID] = true
 			return nil
 		}
 		jobs, err := p.r.gh.ListWorkflowRunJobs(p.ctx, v.ref, runID, githubapp.WorkflowJobListOptions{PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Filter: "latest"})
@@ -478,6 +514,12 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 		}
 		for _, j := range jobs.Jobs {
 			v.seen[j.ID] = true
+			if j.RunnerName != nil && *j.RunnerName != "" {
+				v.runRunners[runID] = append(v.runRunners[runID], *j.RunnerName)
+				if j.Status == "in_progress" && p.r.managedRunner(v.id, *j.RunnerName) {
+					v.stuck = append(v.stuck, j)
+				}
+			}
 			// waiting (environment approval) and every other status are not demand.
 			if j.Status != "queued" {
 				continue
@@ -489,6 +531,7 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 			if _, seen := v.demand[j.ID]; !seen {
 				if *budget <= 0 {
 					p.truncated = true
+					v.partial[runID] = true
 					return nil
 				}
 				*budget--
@@ -1040,6 +1083,15 @@ func (p *pass) cleanUp() error {
 
 func (r *Reconciler) runnerPrefix(repoID int64) string {
 	return "lux-gha-" + r.cfg.Instance + "-" + strconv.FormatInt(repoID, 10) + "-"
+}
+
+// managedRunner reports whether name is lux-gha-<instance>-<repo id>-<job id>-<gen>.
+func (r *Reconciler) managedRunner(repoID int64, name string) bool {
+	prefix := r.runnerPrefix(repoID)
+	job, gen, ok := strings.Cut(strings.TrimPrefix(name, prefix), "-")
+	_, jerr := strconv.ParseUint(job, 10, 63)
+	_, gerr := strconv.ParseUint(gen, 10, 31)
+	return ok && jerr == nil && gerr == nil && strings.HasPrefix(name, prefix)
 }
 
 func prune[V any](m map[string]V, keep map[string]bool) {
