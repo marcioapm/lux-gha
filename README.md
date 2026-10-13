@@ -365,8 +365,8 @@ labels, any state; one Run per runner name). If the Run has ended:
   Run, and logs it at `WARN`. A `409` (the run has completed meanwhile)
   counts as done. **This cancels every unfinished job of that workflow
   run, not only the stuck one.** That is the trade-off for not waiting out
-   the job's timeout. Queued siblings and siblings running on GitHub-hosted
-   runners are cancelled too. It is never done while another listed job of the
+  the job's timeout. Queued siblings and siblings running on GitHub-hosted
+  runners are cancelled too. It is never done while another listed job of the
   workflow run holds a runner of this instance with a live Run, or when the
   pass did not list all of the run's jobs. A job that completes on its own
   within the grace is left alone.
