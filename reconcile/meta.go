@@ -41,7 +41,7 @@ type jobMeta struct {
 	workflow, job, branch string
 	runID, runAttempt     int64
 	runNumber             int64
-	pr                    int64 // 0 when the run lists no pull request
+	pr                    int64 // 0 unless exactly one listed pull request is into this repository
 	sha                   string
 }
 
@@ -51,15 +51,14 @@ func newJobMeta(repoID int64, run githubapp.WorkflowRun, j githubapp.WorkflowJob
 	// A run lists every open pull request sharing its head, including ones
 	// into forks. Only one into this repository is named, and only when it
 	// is the sole one.
-	n := 0
+	var own []int64
 	for _, pr := range run.PullRequests {
 		if pr.Base.Repo.ID == repoID {
-			n++
-			m.pr = pr.Number
+			own = append(own, pr.Number)
 		}
 	}
-	if n != 1 {
-		m.pr = 0
+	if len(own) == 1 {
+		m.pr = own[0]
 	}
 	switch {
 	case j.WorkflowName != nil && *j.WorkflowName != "":
@@ -73,7 +72,7 @@ func newJobMeta(repoID int64, run githubapp.WorkflowRun, j githubapp.WorkflowJob
 	// A pull request from a fork lists none into this repository; its head
 	// branch is the fork's, so it is shown as owner:branch. A head in this
 	// repository is never a fork's, even when GitHub lists no pull request.
-	if n == 0 && m.branch != "" && strings.HasPrefix(run.Event, "pull_request") &&
+	if len(own) == 0 && m.branch != "" && strings.HasPrefix(run.Event, "pull_request") &&
 		run.HeadRepository != nil && run.HeadRepository.ID != repoID && run.HeadRepository.Owner.Login != "" {
 		m.branch = run.HeadRepository.Owner.Login + ":" + m.branch
 	}

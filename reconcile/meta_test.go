@@ -167,32 +167,37 @@ func TestMetaLabelsTakeTheRunsSHAWhenTheJobHasNone(t *testing.T) {
 
 func TestMetaLabelsLeaveOutAPullRequestIntoAnotherRepository(t *testing.T) {
 	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main"), PullRequests: []githubapp.PullRequestRef{pullRequest(5, 2002)}}
-	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7}))
+	got := runLabels(run)
 	if _, ok := got[LabelPR]; ok || got[LabelBranch] != "main" {
 		t.Fatalf("labels %v", got)
 	}
 }
 
+// runLabels is the descriptive labels of job 7 of acme/widgets in run.
+func runLabels(run githubapp.WorkflowRun) map[string]string {
+	return metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7}))
+}
+
 func TestMetaLabelsNameAForkPullRequestsOwner(t *testing.T) {
 	fork := forkPR(githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main")})
-	if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, fork, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "contributor:main" {
+	if got := runLabels(fork)[LabelBranch]; got != "contributor:main" {
 		t.Fatalf("fork pull request branch %q", got)
 	}
 	push := fork
 	push.Event = "push"
-	if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, push, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "main" {
+	if got := runLabels(push)[LabelBranch]; got != "main" {
 		t.Fatalf("push branch %q", got)
 	}
 	own := fork
 	own.Event = "pull_request_target"
 	own.PullRequests = []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}
-	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, own, githubapp.WorkflowJob{ID: 7}))
+	got := runLabels(own)
 	if got[LabelBranch] != "main" || got[LabelPR] != "34" {
 		t.Fatalf("own pull request labels %v", got)
 	}
 	gone := fork // the fork was deleted: GitHub sends head_repository null
 	gone.HeadRepository = nil
-	if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, gone, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "main" {
+	if got := runLabels(gone)[LabelBranch]; got != "main" {
 		t.Fatalf("deleted fork branch %q", got)
 	}
 	for _, event := range []string{"pull_request", "pull_request_target"} {
@@ -200,7 +205,7 @@ func TestMetaLabelsNameAForkPullRequestsOwner(t *testing.T) {
 		same.Event = event
 		same.HeadRepository.ID = metaRepoID
 		same.HeadRepository.Owner.Login = "acme"
-		if got := metaLabels("acme/widgets", newJobMeta(metaRepoID, same, githubapp.WorkflowJob{ID: 7}))[LabelBranch]; got != "main" {
+		if got := runLabels(same)[LabelBranch]; got != "main" {
 			t.Fatalf("%s with a head in this repository: branch %q", event, got)
 		}
 	}

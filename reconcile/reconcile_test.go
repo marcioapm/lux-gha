@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -129,12 +128,12 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		t.Fatalf("JIT request %+v", req)
 	}
 	r := e.lux.all()[0]
-	identity := map[string]string{LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "7", LabelGen: "0", LabelRunner: "lux-gha-t1-1001-7-0"}
-	descriptive := map[string]string{LabelRepoName: "acme/widgets", LabelWorkflow: "Lib (Java)", LabelJobName: "build",
+	wantLabels := map[string]string{
+		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "7", LabelGen: "0", LabelRunner: "lux-gha-t1-1001-7-0",
+		LabelRepoName: "acme/widgets", LabelWorkflow: "Lib (Java)", LabelJobName: "build",
 		LabelRunID: "70", LabelRunAttempt: "2", LabelBranch: "lux/lib-on-lux", LabelSHA: "000000000000",
-		LabelApp: "lux-gha"}
-	wantLabels := maps.Clone(identity)
-	maps.Copy(wantLabels, descriptive)
+		LabelApp: "lux-gha",
+	}
 	if !mapsEqual(r.run.Labels, wantLabels) {
 		t.Fatalf("labels %v", r.run.Labels)
 	}
