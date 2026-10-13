@@ -318,7 +318,7 @@ left out.
 | `lux-gha/run-id` | workflow run ID |
 | `lux-gha/run-attempt` | workflow run attempt |
 | `lux-gha/branch` | head branch |
-| `lux-gha/pr` | pull request number, only when the run lists exactly one (GitHub lists none for a pull request from a fork) |
+| `lux-gha/pr` | pull request number, only when exactly one of the pull requests the run lists has this repository as its base (GitHub also lists pull requests into forks that share the run's head, and none for a pull request from a fork) |
 | `lux-gha/sha` | head commit, first 12 characters |
 
 The Run's name is `<repo> · <workflow> / <job> · <#PR or branch> run <run number>`,

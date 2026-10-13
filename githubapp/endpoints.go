@@ -80,13 +80,21 @@ type WorkflowRun struct {
 	WorkflowID int64     `json:"workflow_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
-	// PullRequests is empty for a pull request from a fork: GitHub fills it
-	// only with pull requests whose head is in this repository.
+	// PullRequests lists the open pull requests whose head is this run's
+	// head, whatever their base: it can hold a pull request into a fork, and
+	// it is empty for a pull request from a fork.
 	PullRequests []PullRequestRef `json:"pull_requests"`
 }
 
 type PullRequestRef struct {
-	Number int64 `json:"number"`
+	Number int64           `json:"number"`
+	Base   PullRequestBase `json:"base"`
+}
+
+type PullRequestBase struct {
+	Repo struct {
+		ID int64 `json:"id"`
+	} `json:"repo"`
 }
 
 // Page and PerPage default to GitHub's 1 and 30 when zero; PerPage is capped by GitHub at 100.

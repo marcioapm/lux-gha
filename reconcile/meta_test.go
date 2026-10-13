@@ -12,25 +12,37 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+// metaRepoID is acme/widgets' repository id in these tests and in fakeGitHub.
+const metaRepoID = 1001
+
+// pullRequest is a pull request number n whose base is repository base.
+func pullRequest(n, base int64) githubapp.PullRequestRef {
+	pr := githubapp.PullRequestRef{Number: n}
+	pr.Base.Repo.ID = base
+	return pr
+}
+
 func TestRunName(t *testing.T) {
 	job := githubapp.WorkflowJob{ID: 7, RunID: 70, Name: "build", WorkflowName: ptr("Lib (Java)")}
 	run := githubapp.WorkflowRun{ID: 70, Name: ptr("Lib (Java)"), HeadBranch: ptr("lux/lib-on-lux"), RunNumber: 12}
+	withPRs := func(prs ...githubapp.PullRequestRef) githubapp.WorkflowRun {
+		r := run
+		r.PullRequests = prs
+		return r
+	}
 	cases := map[string]struct {
 		run  githubapp.WorkflowRun
 		job  githubapp.WorkflowJob
 		want string
 	}{
-		"branch": {run, job, "widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
-		"pull request": {func() githubapp.WorkflowRun {
-			r := run
-			r.PullRequests = []githubapp.PullRequestRef{{Number: 34}}
-			return r
-		}(), job, "widgets · Lib (Java) / build · #34 run 12"},
-		"several pull requests name the branch": {func() githubapp.WorkflowRun {
-			r := run
-			r.PullRequests = []githubapp.PullRequestRef{{Number: 34}, {Number: 35}}
-			return r
-		}(), job, "widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"branch":       {run, job, "widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"pull request": {withPRs(pullRequest(34, metaRepoID)), job, "widgets · Lib (Java) / build · #34 run 12"},
+		"several pull requests name the branch": {withPRs(pullRequest(34, metaRepoID), pullRequest(35, metaRepoID)), job,
+			"widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"a pull request into another repository names the branch": {withPRs(pullRequest(5, 2002)), job,
+			"widgets · Lib (Java) / build · lux/lib-on-lux run 12"},
+		"own pull request beside one into another repository": {withPRs(pullRequest(5, 2002), pullRequest(34, metaRepoID)), job,
+			"widgets · Lib (Java) / build · #34 run 12"},
 		"workflow from the run when the job has none": {func() githubapp.WorkflowRun {
 			r := run
 			r.Name = ptr("CI")
@@ -45,7 +57,7 @@ func TestRunName(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := runName("acme/widgets", 7, newJobMeta(tc.run, tc.job)); got != tc.want {
+			if got := runName("acme/widgets", 7, newJobMeta(metaRepoID, tc.run, tc.job)); got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
@@ -65,7 +77,7 @@ func TestRunNameIsCutOnARuneBoundaryKeepingTheRunNumber(t *testing.T) {
 	}
 	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr(long), RunNumber: 123456}
 	job := githubapp.WorkflowJob{ID: 7, RunID: 70, Name: long, WorkflowName: ptr(long)}
-	got := runName("acme/widgets", 7, newJobMeta(run, job))
+	got := runName("acme/widgets", 7, newJobMeta(metaRepoID, run, job))
 	if len(got) > maxRunName || !utf8.ValidString(got) || !strings.HasSuffix(got, "… run 123456") || !strings.HasPrefix(got, "widgets · 🚀 deploy stage") {
 		t.Fatalf("%d bytes: %q", len(got), got)
 	}
@@ -80,9 +92,9 @@ func TestRunNameIsCutOnARuneBoundaryKeepingTheRunNumber(t *testing.T) {
 
 func TestMetaLabelsAreSanitised(t *testing.T) {
 	long := hostile()
-	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr(long), RunNumber: 3, PullRequests: []githubapp.PullRequestRef{{Number: 34}}}
+	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr(long), RunNumber: 3, PullRequests: []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}}
 	job := githubapp.WorkflowJob{ID: 7, RunID: 70, RunAttempt: 2, Name: long, WorkflowName: ptr(long), HeadSHA: strings.Repeat("ab", 20)}
-	got := metaLabels("acme/widgets", newJobMeta(run, job))
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, job))
 	for _, k := range []string{LabelWorkflow, LabelJobName, LabelBranch} {
 		v := got[k]
 		if len(v) == 0 || len(v) > luxclient.MaxLabelValue || !utf8.ValidString(v) || strings.ContainsFunc(v, unicode.IsControl) {
@@ -96,16 +108,24 @@ func TestMetaLabelsAreSanitised(t *testing.T) {
 		got[LabelPR] != "34" || got[LabelSHA] != "abababababab" {
 		t.Fatalf("labels %v", got)
 	}
-	spec := luxclient.RunSpec{Name: runName("acme/widgets", 7, newJobMeta(run, job)), Labels: got, ImageRef: "img", Command: []string{"run"}}
+	spec := luxclient.RunSpec{Name: runName("acme/widgets", 7, newJobMeta(metaRepoID, run, job)), Labels: got, ImageRef: "img", Command: []string{"run"}}
 	if err := spec.Validate(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestMetaLabelsLeaveOutWhatIsUnknown(t *testing.T) {
-	got := metaLabels("acme/widgets", newJobMeta(githubapp.WorkflowRun{ID: 70}, githubapp.WorkflowJob{ID: 7, WorkflowName: ptr(" \n ")}))
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, githubapp.WorkflowRun{ID: 70}, githubapp.WorkflowJob{ID: 7, WorkflowName: ptr(" \n ")}))
 	want := map[string]string{LabelRepoName: "acme/widgets", LabelRunID: "70"}
 	if !mapsEqual(got, want) {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+func TestMetaLabelsLeaveOutAPullRequestIntoAnotherRepository(t *testing.T) {
+	run := githubapp.WorkflowRun{ID: 70, HeadBranch: ptr("main"), PullRequests: []githubapp.PullRequestRef{pullRequest(5, 2002)}}
+	got := metaLabels("acme/widgets", newJobMeta(metaRepoID, run, githubapp.WorkflowJob{ID: 7}))
+	if _, ok := got[LabelPR]; ok || got[LabelBranch] != "main" {
 		t.Fatalf("labels %v", got)
 	}
 }

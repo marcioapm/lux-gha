@@ -550,7 +550,7 @@ func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 				}
 				p.budget--
 				v.demand[j.ID] = route
-				v.meta[j.ID] = newJobMeta(run, j)
+				v.meta[j.ID] = newJobMeta(v.id, run, j)
 			}
 		}
 		if !jobs.HasNext {

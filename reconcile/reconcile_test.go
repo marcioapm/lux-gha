@@ -306,7 +306,7 @@ func TestListedJobWithHostileNamesIsProvisionedWithBoundedLabels(t *testing.T) {
 	long := hostile()
 	e.gh.queue(7, "queued", lux3...)
 	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name, j.attempt = long, long, 1 })
-	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &long, RunNumber: 4, PullRequests: []githubapp.PullRequestRef{{Number: 34}}})
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &long, RunNumber: 4, PullRequests: []githubapp.PullRequestRef{pullRequest(34, metaRepoID)}})
 	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
 		t.Fatalf("status %+v", st)
 	}
@@ -342,7 +342,7 @@ func TestReplayAfterMetadataChangeStillCarries(t *testing.T) {
 	}
 	renamed := "release"
 	e.gh.editJob(7, func(j *fakeJob) { j.workflow, j.name = "CI renamed", "build all" })
-	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &renamed, RunNumber: 1, PullRequests: []githubapp.PullRequestRef{{Number: 9}}})
+	e.gh.describeRun(githubapp.WorkflowRun{ID: 70, HeadBranch: &renamed, RunNumber: 1, PullRequests: []githubapp.PullRequestRef{pullRequest(9, metaRepoID)}})
 	// The runner never connects; orphan cleanup deletes it after idleGrace
 	// and the job is submitted again under the same key.
 	var st Status

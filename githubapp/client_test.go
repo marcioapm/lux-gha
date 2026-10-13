@@ -534,7 +534,8 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 				return
 			}
 			w.Write([]byte(`{"total_count":1,"workflow_runs":[{"id":5,"run_attempt":2,"status":"queued","conclusion":null,"head_sha":"abc",` +
-				`"head_branch":"feature/x","run_number":12,"event":"pull_request","name":"CI","pull_requests":[{"id":900,"number":34,"url":"u"}]}]}`))
+				`"head_branch":"feature/x","run_number":12,"event":"pull_request","name":"CI","pull_requests":[{"id":900,"number":34,"url":"u","base":{"ref":"main","repo":{"id":77,"name":"app.repo"}}}],` +
+				`"head_repository":{"id":78,"owner":{"login":"contributor","id":5}}}]}`))
 		case "/repos/octo-org/app.repo/actions/runs/5/jobs":
 			if q.Get("filter") != "all" {
 				http.Error(w, "query", 400)
@@ -556,7 +557,7 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 		t.Fatalf("runs=%+v err=%v", runs, err)
 	}
 	if r := runs.Runs[0]; *r.HeadBranch != "feature/x" || r.RunNumber != 12 || r.Event != "pull_request" || *r.Name != "CI" ||
-		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 {
+		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 || r.PullRequests[0].Base.Repo.ID != 77 {
 		t.Fatalf("run metadata %+v", r)
 	}
 	all, err := c.ListWorkflowRunJobs(context.Background(), repo, 5, WorkflowJobListOptions{Filter: "all"})

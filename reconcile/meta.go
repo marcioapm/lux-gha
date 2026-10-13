@@ -46,12 +46,21 @@ type jobMeta struct {
 	sha                   string
 }
 
-func newJobMeta(run githubapp.WorkflowRun, j githubapp.WorkflowJob) jobMeta {
+// newJobMeta reads a job of repository repoID and its workflow run.
+func newJobMeta(repoID int64, run githubapp.WorkflowRun, j githubapp.WorkflowJob) jobMeta {
 	m := jobMeta{job: j.Name, runID: j.RunID, runAttempt: j.RunAttempt, runNumber: run.RunNumber, sha: j.HeadSHA}
-	// A run can list several pull requests sharing its head; only one is
-	// named, and only when it is unambiguous.
-	if len(run.PullRequests) == 1 {
-		m.pr = run.PullRequests[0].Number
+	// A run lists every open pull request sharing its head, including ones
+	// into forks. Only one into this repository is named, and only when it
+	// is the sole one.
+	n := 0
+	for _, pr := range run.PullRequests {
+		if pr.Base.Repo.ID == repoID {
+			n++
+			m.pr = pr.Number
+		}
+	}
+	if n != 1 {
+		m.pr = 0
 	}
 	switch {
 	case j.WorkflowName != nil && *j.WorkflowName != "":
