@@ -64,6 +64,9 @@ type GitHub interface {
 	GenerateRepoJITConfig(context.Context, githubapp.Repository, githubapp.JITConfigRequest) (githubapp.JITConfig, error)
 	DeleteRepoRunner(context.Context, githubapp.Repository, int64) error
 	ListInstallationRepositories(context.Context, int64, githubapp.PageOptions) (githubapp.InstallationRepositoryPage, error)
+	CreateCheckRun(context.Context, githubapp.Repository, githubapp.CheckRunRequest) (githubapp.CheckRun, error)
+	ListCheckRunsForRef(context.Context, githubapp.Repository, string, githubapp.CheckRunListOptions) (githubapp.CheckRunPage, error)
+	ForceCancelWorkflowRun(context.Context, githubapp.Repository, int64) error
 }
 
 type Lux interface {
@@ -98,12 +101,17 @@ type Status struct {
 	Provisioned      int            `json:"provisioned"`
 	Terminated       int            `json:"terminated"`
 	Deleted          int            `json:"deleted"`
+	// CheckRuns and ForceCancelled count jobs whose Lux Run ended under them
+	// (see closeStopped): check runs posted, workflow runs force-cancelled.
+	CheckRuns      int `json:"checkRuns"`
+	ForceCancelled int `json:"forceCancelled"`
 }
 
 // Error categories in Status.Error.
 const (
 	ErrRateLimited    = "github_rate_limited"
 	ErrGitHub         = "github"
+	ErrPermission     = "github_permission"
 	ErrLux            = "lux"
 	ErrNeverNotEchoed = "lux_resume_policy_not_echoed"
 	ErrRunMismatch    = "lux_run_mismatch"
@@ -126,10 +134,12 @@ type Reconciler struct {
 	// Touched only by the pass goroutine.
 	repoIDs          map[string]int64
 	rateLimitedUntil time.Time
-	surplusSince     map[string]time.Time // runner name: idle while its trigger job is not queued
-	missingSince     map[string]time.Time // Run id: live Run whose runner is not registered
-	offlineSince     map[string]time.Time // runner name: registered runner with no live Run
-	disc             *discovery           // nil with an explicit repository list
+	surplusSince     map[string]time.Time   // runner name: idle while its trigger job is not queued
+	missingSince     map[string]time.Time   // Run id: live Run whose runner is not registered
+	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
+	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
+	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
+	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
 	status Status
@@ -155,6 +165,7 @@ func New(o Options) (*Reconciler, error) {
 		surplusSince: map[string]time.Time{},
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
+		stopped:      map[string]*stoppedRun{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -276,6 +287,13 @@ type repoView struct {
 	demand  map[int64]*config.Route
 	runners map[string]githubapp.Runner // managed runners by name
 	seen    map[int64]bool              // every job id listed, any status
+	// stuck: in_progress jobs on this instance's runners, candidates for
+	// closeStopped. runRunners: workflow run id: the runner names its
+	// listed jobs hold; partial: workflow runs whose job listing the
+	// budget or page bound cut short.
+	stuck      []githubapp.WorkflowJob
+	runRunners map[int64][]string
+	partial    map[int64]bool
 }
 
 type pass struct {
@@ -288,14 +306,23 @@ type pass struct {
 	st        Status
 	repos     []*repoView
 	truncated bool
+	// budget: demand jobs this pass may still take on (maxJobsPerPass).
+	// luxReads: Runs closeStopped may still read this pass (maxRunners);
+	// newly ended busy runners are bounded by the previous pass's live Runs.
+	budget, luxReads int
+	statusBudget     [2]int
+	// noChecks, noCancel: GitHub refused the Checks or Actions write
+	// permission this pass; later calls needing it are skipped.
+	noChecks, noCancel bool
 	// unread: a repository's registrations are unknown this pass (its read
 	// failed, or it has not been read since startup), so its unresolved
 	// submissions are unknown and no Run may be created.
-	unread    bool
-	live      []luxclient.Run
-	ended     map[string]bool // Run ids terminated this pass
-	liveByJob map[string]bool // repo id/job id
-	liveRoute map[string]int
+	unread     bool
+	live       []luxclient.Run
+	ended      map[string]bool // Run ids terminated this pass
+	liveByJob  map[string]bool // repo id/job id
+	liveRunner map[string]bool // runner name
+	liveRoute  map[string]int
 	// Cap slots held this pass by submissions with an unknown outcome, in
 	// total and by route; their Runs may commit at any moment.
 	unresolved      int
@@ -374,18 +401,30 @@ func (p *pass) act() error {
 	if err := p.removeSurplus(); err != nil {
 		return err
 	}
-	return p.cleanUp()
+	if err := p.cleanUp(); err != nil {
+		return err
+	}
+	return p.closeStopped()
 }
 
 // readGitHub reads each named repository. Every later step acts only on
 // repositories read successfully here; any other is unknown this pass.
 func (p *pass) readGitHub(repositories []string) error {
-	budget := p.r.cfg.Reconcile.MaxJobsPerPass
+	n := p.r.cfg.Reconcile.MaxJobsPerPass
+	p.statusBudget = [2]int{(n + 1) / 2, n / 2}
+	if n == 1 {
+		if p.r.queuedTurn {
+			p.statusBudget = [2]int{0, 1}
+		}
+		p.r.queuedTurn = !p.r.queuedTurn
+	}
+	p.luxReads = p.r.cfg.MaxRunners
 	for _, full := range repositories {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
-			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{}}
-		err := p.readRepo(v, &budget)
+			demand: map[int64]*config.Route{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
+			runRunners: map[int64][]string{}, partial: map[int64]bool{}}
+		err := p.readRepo(v)
 		if p.rateLimited(err) {
 			return errAbort
 		}
@@ -405,7 +444,7 @@ func (p *pass) readGitHub(repositories []string) error {
 	return nil
 }
 
-func (p *pass) readRepo(v *repoView, budget *int) error {
+func (p *pass) readRepo(v *repoView) error {
 	id, ok := p.r.repoIDs[v.full]
 	if !ok {
 		info, err := p.r.gh.GetRepository(p.ctx, v.ref)
@@ -416,7 +455,7 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 		p.r.repoIDs[v.full] = id
 	}
 	v.id = id
-	if err := p.readDemand(v, budget); err != nil {
+	if err := p.readDemand(v); err != nil {
 		return err
 	}
 	prefix := p.r.runnerPrefix(v.id)
@@ -440,21 +479,25 @@ func (p *pass) readRepo(v *repoView, budget *int) error {
 	return nil
 }
 
-// readDemand collects queued jobs that match a route. Queued jobs live in
-// queued runs and, behind finished jobs, in in_progress runs.
-func (p *pass) readDemand(v *repoView, budget *int) error {
-	for _, status := range []string{"queued", "in_progress"} {
+// readDemand reserves separate bounded demand portions for both statuses.
+// in_progress is read first to expose stopped jobs even under queued backlog.
+func (p *pass) readDemand(v *repoView) error {
+	for i, status := range []string{"in_progress", "queued"} {
+		p.budget = p.statusBudget[i]
 		for page := 1; ; page++ {
-			if page > maxRunPages || *budget <= 0 {
+			if page > maxRunPages || p.budget <= 0 {
 				p.truncated = true
-				return nil
+				break
 			}
 			runs, err := p.r.gh.ListWorkflowRuns(p.ctx, v.ref, githubapp.WorkflowRunListOptions{PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Status: status})
 			if err != nil {
 				return err
 			}
 			for _, run := range runs.Runs {
-				if err := p.readRunJobs(v, run.ID, budget); err != nil {
+				// Charged before the error check: a failed job page still spends it.
+				err := p.readRunJobs(v, run.ID)
+				p.statusBudget[i] = p.budget
+				if err != nil {
 					return err
 				}
 			}
@@ -462,14 +505,18 @@ func (p *pass) readDemand(v *repoView, budget *int) error {
 				break
 			}
 		}
+		if p.budget == 0 {
+			p.truncated = true
+		}
 	}
 	return nil
 }
 
-func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
+func (p *pass) readRunJobs(v *repoView, runID int64) error {
 	for page := 1; ; page++ {
-		if page > maxRunPages || *budget <= 0 {
+		if page > maxRunPages || p.budget <= 0 {
 			p.truncated = true
+			v.partial[runID] = true
 			return nil
 		}
 		jobs, err := p.r.gh.ListWorkflowRunJobs(p.ctx, v.ref, runID, githubapp.WorkflowJobListOptions{PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Filter: "latest"})
@@ -478,6 +525,12 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 		}
 		for _, j := range jobs.Jobs {
 			v.seen[j.ID] = true
+			if j.RunnerName != nil && *j.RunnerName != "" {
+				v.runRunners[runID] = append(v.runRunners[runID], *j.RunnerName)
+				if j.Status == "in_progress" && p.r.managedRunner(v.id, *j.RunnerName) {
+					v.stuck = append(v.stuck, j)
+				}
+			}
 			// waiting (environment approval) and every other status are not demand.
 			if j.Status != "queued" {
 				continue
@@ -487,11 +540,12 @@ func (p *pass) readRunJobs(v *repoView, runID int64, budget *int) error {
 				continue
 			}
 			if _, seen := v.demand[j.ID]; !seen {
-				if *budget <= 0 {
+				if p.budget <= 0 {
 					p.truncated = true
+					v.partial[runID] = true
 					return nil
 				}
-				*budget--
+				p.budget--
 				v.demand[j.ID] = route
 			}
 		}
@@ -510,10 +564,12 @@ func (p *pass) readLux() error {
 	}
 	p.live = runs
 	p.liveByJob = map[string]bool{}
+	p.liveRunner = map[string]bool{}
 	p.liveRoute = map[string]int{}
 	p.unresolvedRoute = map[string]int{}
 	for _, run := range runs {
 		p.liveByJob[run.Labels[LabelRepo]+"/"+run.Labels[LabelJob]] = true
+		p.liveRunner[run.Labels[LabelRunner]] = true
 		p.liveRoute[run.Labels[LabelRoute]]++
 		p.st.Live[run.Labels[LabelRoute]]++
 	}
@@ -606,6 +662,7 @@ func (p *pass) readJobHistory(owned map[string]string, log *slog.Logger) ([]luxc
 func (p *pass) addLive(v *repoView, jobID int64, run luxclient.Run) {
 	p.live = append(p.live, run)
 	p.liveByJob[jobKey(v, jobID)] = true
+	p.liveRunner[run.Labels[LabelRunner]] = true
 	p.liveRoute[run.Labels[LabelRoute]]++
 	p.st.Live[run.Labels[LabelRoute]]++
 }
@@ -668,19 +725,11 @@ func (p *pass) classifyJob(v *repoView, jobID int64, route *config.Route) (*luxc
 // still commit), and a gen whose Run ended is left to orphan cleanup.
 func (p *pass) classifyRegistrations(classified map[string]bool) error {
 	r := p.r
-	liveRunner := map[string]bool{}
-	for _, run := range p.live {
-		liveRunner[run.Labels[LabelRunner]] = true
-	}
 	for _, v := range p.repos {
-		prefix := r.runnerPrefix(v.id)
 		gens := map[int64][]int{}
 		for name := range v.runners {
-			job, gen, ok := strings.Cut(strings.TrimPrefix(name, prefix), "-")
-			jobID, jerr := strconv.ParseInt(job, 10, 64)
-			n, gerr := strconv.Atoi(gen)
-			if !ok || jerr != nil || gerr != nil || name != prefix+job+"-"+gen ||
-				classified[jobKey(v, jobID)] || liveRunner[name] {
+			jobID, n, ok := r.parseRunnerName(v.id, name)
+			if !ok || classified[jobKey(v, jobID)] || p.liveRunner[name] {
 				continue
 			}
 			gens[jobID] = append(gens[jobID], n)
@@ -800,6 +849,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		Secrets:            []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
 		Resources:          luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
 		Timeout:            route.Timeout.Duration,
+		Grace:              r.cfg.Reconcile.StopGrace.Duration,
 		Pool:               route.Pool,
 		Sandbox:            luxclient.Sandbox{NestedContainers: route.NestedContainers},
 		UnrestrictedEgress: route.UnrestrictedEgress,
@@ -976,10 +1026,6 @@ func (p *pass) cleanUp() error {
 	now := r.now()
 	grace := r.cfg.Reconcile.IdleGrace.Duration
 	missing, offline := map[string]bool{}, map[string]bool{}
-	liveRunner := map[string]bool{}
-	for _, run := range p.live {
-		liveRunner[run.Labels[LabelRunner]] = true
-	}
 	for _, v := range p.repos {
 		repoID := strconv.FormatInt(v.id, 10)
 		for _, run := range p.live {
@@ -1008,7 +1054,7 @@ func (p *pass) cleanUp() error {
 		}
 		for _, name := range sortedKeys(v.runners) {
 			rn := v.runners[name]
-			if liveRunner[name] || rn.Status != "offline" || rn.Busy {
+			if p.liveRunner[name] || rn.Status != "offline" || rn.Busy {
 				continue
 			}
 			offline[name] = true
@@ -1039,6 +1085,28 @@ func (p *pass) cleanUp() error {
 
 func (r *Reconciler) runnerPrefix(repoID int64) string {
 	return "lux-gha-" + r.cfg.Instance + "-" + strconv.FormatInt(repoID, 10) + "-"
+}
+
+// parseRunnerName parses lux-gha-<instance>-<repo id>-<job id>-<gen>. Only
+// the canonical spelling is accepted ("-007-01" is not), so a name maps to
+// one job and gen and back.
+func (r *Reconciler) parseRunnerName(repoID int64, name string) (job int64, gen int, ok bool) {
+	prefix := r.runnerPrefix(repoID)
+	if !strings.HasPrefix(name, prefix) {
+		return 0, 0, false
+	}
+	js, gs, ok := strings.Cut(name[len(prefix):], "-")
+	job, jerr := strconv.ParseInt(js, 10, 64)
+	gen, gerr := strconv.Atoi(gs)
+	if !ok || jerr != nil || gerr != nil || gen < 0 || name != prefix+strconv.FormatInt(job, 10)+"-"+strconv.Itoa(gen) {
+		return 0, 0, false
+	}
+	return job, gen, true
+}
+
+func (r *Reconciler) managedRunner(repoID int64, name string) bool {
+	_, _, ok := r.parseRunnerName(repoID, name)
+	return ok
 }
 
 func prune[V any](m map[string]V, keep map[string]bool) {

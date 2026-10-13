@@ -23,8 +23,10 @@ test:
 # entrypoint_test.sh against the working tree's entrypoint.sh, as uid 1000 in
 # the runner's base image: the invocation smoke.sh uses inside the built image.
 entrypoint-test:
-	docker run --rm -i --user 1000:1000 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
+	docker run --rm -i --workdir /home/ubuntu --user 1000:1000 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
 		$(RUNNER_BASE) -s /src/entrypoint.sh <images/runner/entrypoint_test.sh
+	docker run --rm -i --workdir /home/ubuntu --user 0:0 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
+		$(RUNNER_BASE) -s /src/entrypoint.sh sigterm-root <images/runner/entrypoint_test.sh
 
 # The runner image for the host's architecture, loaded into the local Docker.
 image:

@@ -150,6 +150,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		Workload struct {
 			Adapter string
 			Command []string
+			Grace   string
 		}
 		Secrets   []struct{ Name, Value, As, Path string }
 		Resources struct {
@@ -167,7 +168,7 @@ func TestQueuedJobGetsExactlyOneRunnerAndRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w.Name != "gha acme/widgets job 7" || w.Image.Ref != "ghcr.io/acme/runner@sha256:abc" || w.Workload.Adapter != "generic" ||
-		!slices.Equal(w.Workload.Command, []string{"/usr/local/bin/lux-gha-runner"}) || w.Secrets[0].As != "file" ||
+		!slices.Equal(w.Workload.Command, []string{"/usr/local/bin/lux-gha-runner"}) || w.Workload.Grace != "1m0s" || w.Secrets[0].As != "file" ||
 		w.Resources.CPUs != 2 || w.Resources.Memory != 4096<<20 || w.Resources.Disk != 20<<30 || w.Timeout != "1h30m0s" ||
 		w.Placement.Pool != "gha" || len(w.Network.Egress) != 2 || w.Network.Egress[1].Host != "*.actions.githubusercontent.com" ||
 		w.Sandbox.NestedContainers || w.ResumePolicy != "never" {
@@ -222,12 +223,13 @@ func mapsEqual(a, b map[string]string) bool {
 }
 
 func TestRouteSpecificCommandAndShape(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"stopGrace": "3m"}`))
 	e.gh.queue(8, "queued", "lux-big")
 	e.pass()
 	r := e.lux.all()
 	if len(r) != 1 || !slices.Equal(r[0].spec.Command, []string{"/opt/start"}) || r[0].spec.Pool != "gha-big" ||
-		!r[0].spec.Sandbox.NestedContainers || r[0].run.Labels[LabelRoute] != "big" || r[0].spec.Timeout != 2*time.Hour {
+		!r[0].spec.Sandbox.NestedContainers || r[0].run.Labels[LabelRoute] != "big" || r[0].spec.Timeout != 2*time.Hour ||
+		r[0].spec.Grace != 3*time.Minute {
 		t.Fatalf("runs %+v", r)
 	}
 }
@@ -329,7 +331,7 @@ func TestUnstartedRunForCancelledJobIsReclaimedAfterGrace(t *testing.T) {
 }
 
 func TestTruncatedDemandProvisionsWithinBoundAndRemovesNothing(t *testing.T) {
-	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 2}`))
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 4}`))
 	e.gh.queue(1, "queued", lux3...)
 	e.pass()
 	e.gh.complete(1, "cancelled")
@@ -971,11 +973,11 @@ func TestUnresolvedSubmissionHoldsACapSlot(t *testing.T) {
 	j7, j8, j9 := job{widgets, 7, runner("7", 0)}, job{widgets, 8, runner("8", 0)}, job{widgets, 9, runner("9", 0)}
 	gadgets9 := job{"acme/gadgets", 9, "lux-gha-t1-1002-9-0"}
 	truncate := func(maxRunners string) []func(string) string {
-		return []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": `+maxRunners+`, "reconcile": {"maxJobsPerPass": 1}`)}
+		return []func(string) string{replace(`"maxRunners": 10`, `"maxRunners": `+maxRunners+`, "reconcile": {"maxJobsPerPass": 2}`)}
 	}
 	// What happens to the unresolved job's trigger while its submission is
 	// in flight; "truncated" leaves it queued but sorts it after the fresh
-	// job beyond maxJobsPerPass 1.
+	// job beyond the queued status's allowance of 1.
 	const (
 		queued    = "queued"
 		cancelled = "cancelled"
@@ -1392,6 +1394,23 @@ func TestFailedJobPageSkipsTheRepositoryAndHoldsBackCreation(t *testing.T) {
 	e.pass()
 	if got := liveJobs(e, "1002"); !slices.Equal(got, []string{"4"}) {
 		t.Fatalf("gadgets Runs %v once widgets read again", got)
+	}
+}
+
+func TestFailedJobPageStillChargesQueuedAllowance(t *testing.T) {
+	e := newEnv(t, twoRepos(10))
+	e.gh.addRepo("acme/gadgets", 1002)
+	e.cfg.Reconcile.MaxJobsPerPass = 6
+	for id := int64(1); id <= 3; id++ {
+		e.gh.queueIn(widgets, 70, id, "queued", lux3...)
+	}
+	for id := int64(4); id <= 6; id++ {
+		e.gh.queueIn("acme/gadgets", 80, id, "queued", lux3...)
+	}
+	e.gh.fail = failOn(opJobs, widgets, 2)
+	st := e.pass()
+	if st.Error != ErrGitHub || st.Demand["default"] != 1 || st.Provisioned != 0 || e.lux.createCount() != 0 {
+		t.Fatalf("failed-read accounting: %+v creates=%d", st, e.lux.createCount())
 	}
 }
 

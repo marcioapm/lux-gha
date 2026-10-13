@@ -49,8 +49,12 @@ type RunSpec struct {
 	Resources Resources
 	// Timeout is running time summed over placements; zero means no limit.
 	Timeout time.Duration
-	Pool    string
-	Egress  []EgressRule
+	// Grace is workload.grace: how long a stop waits after SIGTERM before
+	// SIGKILL. Zero takes Lux's default (30s); a preemption or a
+	// force-evicting drain may shorten it to half the time left.
+	Grace  time.Duration
+	Pool   string
+	Egress []EgressRule
 	// UnrestrictedEgress sends network.unrestricted: Lux stops filtering the
 	// Run's egress (its hard blocks still apply). Exclusive with Egress.
 	UnrestrictedEgress bool
@@ -108,6 +112,7 @@ type wireWorkload struct {
 	Command []string `json:"command"`
 	Workdir string   `json:"workdir,omitempty"`
 	User    string   `json:"user,omitempty"`
+	Grace   string   `json:"grace,omitempty"`
 }
 
 type wireSecret struct {
@@ -145,6 +150,9 @@ func (s RunSpec) MarshalJSON() ([]byte, error) {
 	if s.Timeout > 0 {
 		w.Timeout = s.Timeout.String()
 	}
+	if s.Grace > 0 {
+		w.Workload.Grace = s.Grace.String()
+	}
 	for _, sec := range s.Secrets {
 		w.Secrets = append(w.Secrets, wireSecret{Name: sec.Name, Value: sec.Value, As: "file", Path: sec.Path})
 	}
@@ -172,6 +180,9 @@ func (s RunSpec) Validate() error {
 	}
 	if s.Timeout < 0 {
 		fail("timeout must not be negative")
+	}
+	if s.Grace < 0 {
+		fail("grace must not be negative")
 	}
 	r := s.Resources
 	if r.CPUs < 0 || r.Memory < 0 || r.Disk < 0 || r.Pids < 0 {

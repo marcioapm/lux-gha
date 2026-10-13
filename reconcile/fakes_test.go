@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ type fakeJob struct {
 	labels     []string
 	runner     string
 	runnerID   int64
+	name       string // defaults to build-<id>
 }
 
 // fakeRepo is one repository's Actions state.
@@ -44,16 +46,21 @@ type fakeRepo struct {
 	// an uninstalled repository answers 404 to the installation token, as
 	// GitHub does once it leaves the installation.
 	archived, disabled, uninstalled bool
+	checkRuns                       []githubapp.CheckRun
+	forceCancels                    []int64
 }
 
 // Fake GitHub operations, for fail.
 const (
-	opRuns    = "runs"
-	opJobs    = "jobs"
-	opRunners = "runners"
-	opJIT     = "jit"
-	opDelete  = "delete"
-	opInstall = "installation"
+	opRuns        = "runs"
+	opJobs        = "jobs"
+	opRunners     = "runners"
+	opJIT         = "jit"
+	opDelete      = "delete"
+	opInstall     = "installation"
+	opListChecks  = "list-checks"
+	opCreateCheck = "create-check"
+	opCancel      = "force-cancel"
 )
 
 // fakeGitHub models one installation's repositories: workflow jobs with
@@ -87,6 +94,7 @@ type fakeGitHub struct {
 	listTwice string
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
+	checkOutputs []githubapp.CheckRunRequest
 }
 
 const widgets = "acme/widgets"
@@ -206,7 +214,8 @@ func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repos
 		if j.runID != runID {
 			continue
 		}
-		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels}
+		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels,
+			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID)}
 		if j.conclusion != "" {
 			c := j.conclusion
 			out.Conclusion = &c
@@ -330,6 +339,79 @@ func (f *fakeGitHub) DeleteRepoRunner(_ context.Context, repo githubapp.Reposito
 
 // Test controls.
 
+// fakeSHA is the head commit of a workflow run: one commit per run.
+func fakeSHA(runID int64) string { return fmt.Sprintf("%040x", runID) }
+
+// CreateCheckRun stores a check run on its commit, as GitHub does.
+func (f *fakeGitHub) CreateCheckRun(_ context.Context, repo githubapp.Repository, req githubapp.CheckRunRequest) (githubapp.CheckRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opCreateCheck, repo, 0)
+	if err != nil {
+		return githubapp.CheckRun{}, err
+	}
+	if req.Status != "completed" || req.Conclusion == "" || req.HeadSHA == "" {
+		return githubapp.CheckRun{}, &githubapp.APIError{StatusCode: 422}
+	}
+	f.nextID++
+	c := req.Conclusion
+	run := githubapp.CheckRun{ID: f.nextID, Name: req.Name, HeadSHA: req.HeadSHA, ExternalID: req.ExternalID, Status: req.Status, Conclusion: &c}
+	r.checkRuns = append(r.checkRuns, run)
+	f.checkOutputs = append(f.checkOutputs, req)
+	return run, nil
+}
+
+func (f *fakeGitHub) ListCheckRunsForRef(_ context.Context, repo githubapp.Repository, ref string, opts githubapp.CheckRunListOptions) (githubapp.CheckRunPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opListChecks, repo, opts.Page)
+	if err != nil {
+		return githubapp.CheckRunPage{}, err
+	}
+	var all []githubapp.CheckRun
+	for _, c := range r.checkRuns {
+		if c.HeadSHA == ref && (opts.CheckName == "" || c.Name == opts.CheckName) {
+			all = append(all, c)
+		}
+	}
+	items, next := page(all, opts.PageOptions, f.perPage)
+	return githubapp.CheckRunPage{TotalCount: len(all), CheckRuns: items, HasNext: next}, nil
+}
+
+// ForceCancelWorkflowRun cancels every unfinished job of the run; a run
+// with none answers 409, as GitHub does for a completed run.
+func (f *fakeGitHub) ForceCancelWorkflowRun(_ context.Context, repo githubapp.Repository, runID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opCancel, repo, 0)
+	if err != nil {
+		return err
+	}
+	if r.runStatus(runID) == "completed" {
+		return &githubapp.APIError{StatusCode: http.StatusConflict}
+	}
+	r.forceCancels = append(r.forceCancels, runID)
+	for _, j := range r.jobs {
+		if j.runID == runID && j.status != "completed" {
+			j.status, j.conclusion = "completed", "cancelled"
+		}
+	}
+	return nil
+}
+
+// checks returns acme/widgets' check runs and the requests that made them.
+func (f *fakeGitHub) checks() ([]githubapp.CheckRun, []githubapp.CheckRunRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.repos[widgets].checkRuns), slices.Clone(f.checkOutputs)
+}
+
+func (f *fakeGitHub) cancels() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.repos[widgets].forceCancels)
+}
+
 func (f *fakeGitHub) repo(full string) *fakeRepo {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -377,6 +459,13 @@ func (f *fakeGitHub) job(jobID int64) *fakeJob {
 		}
 	}
 	return nil
+}
+
+// editJob changes a job under the lock.
+func (f *fakeGitHub) editJob(jobID int64, edit func(*fakeJob)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	edit(f.job(jobID))
 }
 
 func (f *fakeGitHub) setOnline(name string, online bool) {
@@ -482,6 +571,13 @@ type fakeLux struct {
 	lateCommit   int
 	pending      *fakeRun
 	pendingLists int
+	byRunner     int
+	historyJobs  []string
+	// failRunnerList fails the next n Lists whose selector names a runner;
+	// runnerListState, when set, is the state those Lists report every Run
+	// in, as a Run that went live after the pass's live listing would be.
+	failRunnerList  int
+	runnerListState string
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -582,6 +678,18 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 		}
 	}
 	var out []luxclient.Run
+	if job, ok := labels[LabelJob]; ok && len(states) == 0 {
+		l.historyJobs = append(l.historyJobs, job)
+	}
+	_, byRunner := labels[LabelRunner]
+	if byRunner {
+		l.byRunner++
+		if l.failRunnerList > 0 {
+			l.failRunnerList--
+			l.mu.Unlock()
+			return nil, &luxclient.APIError{Op: "list runs", Status: 503}
+		}
+	}
 	for i := len(l.runs) - 1; i >= 0; i-- {
 		r := l.runs[i]
 		if len(states) > 0 && !slices.Contains(states, r.run.State) {
@@ -594,7 +702,11 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 			}
 		}
 		if match {
-			out = append(out, r.run)
+			run := r.run
+			if byRunner && l.runnerListState != "" {
+				run.State = l.runnerListState
+			}
+			out = append(out, run)
 		}
 	}
 	l.mu.Unlock()
@@ -617,10 +729,25 @@ func (l *fakeLux) end(id, reason string) {
 	defer l.mu.Unlock()
 	for _, r := range l.runs {
 		if r.run.ID == id {
-			r.run.State, r.run.StateReason = "terminated", reason
+			at := l.clock.Now()
+			r.run.State, r.run.StateReason, r.run.FinishedAt = "terminated", reason, &at
 		}
 	}
 }
+
+// endNoFinish is end with no finishedAt reported.
+func (l *fakeLux) endNoFinish(id, reason string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range l.runs {
+		if r.run.ID == id {
+			r.run.State, r.run.StateReason, r.run.FinishedAt = "terminated", reason, nil
+		}
+	}
+}
+
+// runnerLists counts List calls whose selector names a runner.
+func (l *fakeLux) runnerLists() int { l.mu.Lock(); defer l.mu.Unlock(); return l.byRunner }
 
 func (l *fakeLux) setState(id, state string) {
 	l.mu.Lock()

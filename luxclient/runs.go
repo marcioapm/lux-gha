@@ -14,6 +14,8 @@ import (
 )
 
 // MinVersion is the first Lux release that implements resumePolicy never.
+// Its strict RunSpec decoder also accepts every field MarshalJSON sends,
+// workload.grace included.
 var MinVersion = [3]uint64{0, 1, 14}
 
 var releaseRe = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)

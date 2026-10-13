@@ -42,12 +42,17 @@ images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail th
 user with `sh images/runner/entrypoint_test.sh`, or anywhere with Docker as `make entrypoint-test` (uid 1000
 in the pinned base image, against the working tree's `entrypoint.sh`). It drives the entrypoint with a fake `run.sh` and fake
 `dockerd-rootless`/`docker`. It checks that `run.sh` replaces the entrypoint (exec), that its exit status
-propagates, the bad-config, daemon-exit, never-ready and hung-probe paths, and that the config never shows
-up in output or in the runner's environment.
+propagates, that a SIGTERM to the entrypoint's process group (how Lux stops a Run) reaches `run.sh` with
+`RUNNER_MANUALLY_TRAP_SIG=1` set and leaves dockerd running, the bad-config, daemon-exit, never-ready and
+hung-probe paths, and that the config never shows up in output or in the runner's environment.
 
 The smoke cases that pass a fake config to the real runner only show that `run.sh` was reached with
 invalid input. The `--privileged` checks are only an approximation, because Lux never runs a nested Run
 privileged. Only a real nested Run proves that Docker works under Lux.
+The real listener's job cancellation and log upload within `stopGrace` is
+only verified live, against a real GitHub job; the signal harness uses a fake listener.
+`make entrypoint-test` also checks uid 0 through real `setpriv`, dropping to
+uid 1000; this path leaves Docker startup to the job.
 
 CI runs the default `smoke.sh` on a linux/arm64 runner for every pull request. A `v*` tag builds, smoke-tests
 and pushes the arm64 image to `ghcr.io/<owner>/lux-gha-runner` (see [Releases](../../README.md#releases)).
