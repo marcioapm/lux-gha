@@ -1397,6 +1397,23 @@ func TestFailedJobPageSkipsTheRepositoryAndHoldsBackCreation(t *testing.T) {
 	}
 }
 
+func TestFailedJobPageStillChargesQueuedAllowance(t *testing.T) {
+	e := newEnv(t, twoRepos(10))
+	e.gh.addRepo("acme/gadgets", 1002)
+	e.cfg.Reconcile.MaxJobsPerPass = 6
+	for id := int64(1); id <= 3; id++ {
+		e.gh.queueIn(widgets, 70, id, "queued", lux3...)
+	}
+	for id := int64(4); id <= 6; id++ {
+		e.gh.queueIn("acme/gadgets", 80, id, "queued", lux3...)
+	}
+	e.gh.fail = failOn(opJobs, widgets, 2)
+	st := e.pass()
+	if st.Error != ErrGitHub || st.Demand["default"] != 1 || st.Provisioned != 0 || e.lux.createCount() != 0 {
+		t.Fatalf("failed-read accounting: %+v creates=%d", st, e.lux.createCount())
+	}
+}
+
 func TestRunnerListingBeyondItsPageBoundRemovesNothing(t *testing.T) {
 	e := newEnv(t, twoRepos(10))
 	e.gh.addRepo("acme/gadgets", 1002)
