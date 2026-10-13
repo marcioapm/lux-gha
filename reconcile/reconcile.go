@@ -847,6 +847,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	maps.Copy(labels, map[string]string{
 		LabelManaged: r.cfg.Instance, LabelRepo: repoID, LabelRoute: route.Name,
 		LabelJob: job, LabelGen: strconv.Itoa(gen), LabelRunner: name,
+		LabelApp: AppName,
 	})
 	spec := luxclient.RunSpec{
 		Name:               runName(v.full, j.jobID, meta),

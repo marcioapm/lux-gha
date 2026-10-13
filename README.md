@@ -300,6 +300,7 @@ ownership, matching, adoption and cleanup read only these:
 | `lux-gha/job` | ID of the job that triggered provisioning |
 | `lux-gha/gen` | generation for that job |
 | `lux-gha/runner` | GitHub runner name |
+| `app` | always `lux-gha`: Lux's convention for which tool submitted a Run (its costs break down by `label:app`) |
 
 The rest describe the triggering job for people reading Lux (the console,
 `lux ls`, costs grouped by label). They come from the workflow-runs and jobs

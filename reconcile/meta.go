@@ -9,6 +9,13 @@ import (
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
+// LabelApp names the tool that submitted a Run, Lux's convention for
+// breaking costs down by submitter. Its value is always AppName.
+const (
+	LabelApp = "app"
+	AppName  = "lux-gha"
+)
+
 // Descriptive Run labels. Nothing reads them back: ownership, matching and
 // idempotency use only the labels in jobLabels plus gen and runner.
 const (
