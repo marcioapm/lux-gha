@@ -35,10 +35,11 @@ func (e *env) startJob(job int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-func denied(op string) func(string, string, int) error {
+// failOp fails every call of op with an APIError of the given status.
+func failOp(op string, status int) func(string, string, int) error {
 	return func(got, _ string, _ int) error {
 		if got == op {
-			return &githubapp.APIError{StatusCode: 403}
+			return &githubapp.APIError{StatusCode: status}
 		}
 		return nil
 	}
@@ -215,7 +216,7 @@ func TestChecksPermissionMissingKeepsProvisioningAndForceCancel(t *testing.T) {
 			id8 := e.startJob(8)
 			e.lux.end(id7, diskStop)
 			e.lux.end(id8, diskStop)
-			e.gh.fail = denied(op)
+			e.gh.fail = failOp(op, 403)
 			e.clock.Add(2 * time.Minute)
 			e.gh.queue(9, "queued", lux3...)
 			st := e.pass()
@@ -238,7 +239,7 @@ func TestActionsPermissionMissingKeepsProvisioningAndChecks(t *testing.T) {
 	e := newEnv(t)
 	id7 := e.startJob(7)
 	id8 := e.startJob(8)
-	e.gh.fail = denied(opCancel)
+	e.gh.fail = failOp(opCancel, 403)
 	e.lux.end(id7, diskStop)
 	e.lux.end(id8, diskStop)
 	e.clock.Add(2 * time.Minute)
@@ -524,12 +525,7 @@ func TestStoppedGitHubTransientErrorsRetry(t *testing.T) {
 			if op == opCancel {
 				e.clock.Add(2 * time.Minute)
 			}
-			e.gh.fail = func(got, _ string, _ int) error {
-				if got == op {
-					return &githubapp.APIError{StatusCode: 502}
-				}
-				return nil
-			}
+			e.gh.fail = failOp(op, 502)
 			st := e.pass()
 			checks, _ := e.gh.checks()
 			if st.Error != ErrGitHub {
