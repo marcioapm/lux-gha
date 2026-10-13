@@ -39,6 +39,17 @@ mode=${FAKE_RUN:-exit:0}
 case $mode in
 signal-parent) kill -USR1 "$PPID" ;;
 exit:*) exit "${mode#exit:}" ;;
+await-term)
+	# As GitHub's run.sh: only with RUNNER_MANUALLY_TRAP_SIG set does it
+	# trap TERM (and pass it to the listener as INT); otherwise TERM kills it.
+	if [ -n "${RUNNER_MANUALLY_TRAP_SIG:-}" ]; then
+		trap 'echo TERM >"$FAKE_CASE_DIR/term"; exit 0' TERM
+	fi
+	: >"$FAKE_CASE_DIR/ready"
+	i=0
+	while [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+	exit 9
+	;;
 esac
 EOF
 
@@ -75,15 +86,32 @@ chmod 000 "$root/unreadable"
 
 # The supervisor exits with the entrypoint's status and records a USR1 sent
 # to it. A trapped signal interrupts wait with status >128, so it waits
-# again until a wait returns without the trap having fired.
+# again until a wait returns without the trap having fired. With FAKE_TERM
+# set it stops the entrypoint as Lux does: the entrypoint leads its own
+# process group, and once run.sh is up SIGTERM goes to that group. On exit
+# it records whether dockerd survived the entrypoint.
 supervisor='
 trap "trapped=1; echo USR1 >\"\$FAKE_CASE_DIR/signal\"" USR1
-"$1" &
-child=$!
+if [ -n "${FAKE_TERM:-}" ]; then
+	setsid "$1" &
+	child=$!
+	(
+		i=0
+		while [ ! -f "$FAKE_CASE_DIR/ready" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+		kill -TERM -"$child"
+	) &
+else
+	"$1" &
+	child=$!
+fi
 while :; do
 	trapped=0
 	wait "$child" && rc=0 || rc=$?
-	[ "$trapped" = 1 ] || exit "$rc"
+	[ "$trapped" = 1 ] && continue
+	if [ -f "$FAKE_CASE_DIR/dockerd.pid" ] && kill -0 "$(cat "$FAKE_CASE_DIR/dockerd.pid")" 2>/dev/null; then
+		: >"$FAKE_CASE_DIR/dockerd.alive"
+	fi
+	exit "$rc"
 done'
 
 # run_case NAME [VAR=value...]: run the entrypoint in a fresh case dir with
@@ -127,6 +155,16 @@ check "exits 0" '[ "$rc" = 0 ]'
 check "run.sh replaces the entrypoint: its parent is the supervisor" '[ -f "$d/signal" ]'
 check "runner gets exactly --jitconfig <config>" '[ "$(cat "$d/runner.args")" = "$(printf "%s\n%s" --jitconfig "$sentinel")" ]'
 check "dockerd listens on DOCKER_HOST" '[ "$(cat "$d/dockerd.args")" = "$(printf "%s\n%s" --host "unix://$d/custom.sock")" ]'
+check_no_leak
+
+# Lux stops a Run with SIGTERM to its workload's process group, then SIGKILL
+# after workload.grace. run.sh must get it with RUNNER_MANUALLY_TRAP_SIG set,
+# so it hands it to the listener, which cancels the job and uploads logs.
+run_case sigterm FAKE_RUN=await-term FAKE_TERM=1
+check "exits 0: run.sh, not a shell around it, took the signal" '[ "$rc" = 0 ]'
+check "RUNNER_MANUALLY_TRAP_SIG is set for run.sh" 'grep -qx "RUNNER_MANUALLY_TRAP_SIG=1" "$d/runner.env"'
+check "SIGTERM reached run.sh's trap" '[ "$(cat "$d/term" 2>/dev/null)" = TERM ]'
+check "rootless dockerd outlives the signal" '[ -f "$d/dockerd.alive" ]'
 check_no_leak
 
 run_case exit-code FAKE_RUN=exit:37
