@@ -116,6 +116,7 @@ const (
 	ErrLux            = "lux"
 	ErrNeverNotEchoed = "lux_resume_policy_not_echoed"
 	ErrRunMismatch    = "lux_run_mismatch"
+	ErrSizeRefused    = "lux_size_refused"
 )
 
 type Reconciler struct {
@@ -140,6 +141,7 @@ type Reconciler struct {
 	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
 	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
 	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
+	refused          map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
 	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
@@ -167,6 +169,7 @@ func New(o Options) (*Reconciler, error) {
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
 		stopped:      map[string]*stoppedRun{},
+		refused:      map[string]*refusal{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -406,7 +409,10 @@ func (p *pass) act() error {
 	if err := p.cleanUp(); err != nil {
 		return err
 	}
-	return p.closeStopped()
+	if err := p.closeStopped(); err != nil {
+		return err
+	}
+	return p.closeRefused()
 }
 
 // readGitHub reads each named repository. Every later step acts only on
@@ -598,7 +604,7 @@ func (p *pass) provision() error {
 	for _, v := range p.repos {
 		for _, jobID := range sortedKeys(v.demand) {
 			route := v.demand[jobID]
-			if p.liveByJob[jobKey(v, jobID)] {
+			if p.liveByJob[jobKey(v, jobID)] || p.r.refused[jobKey(v, jobID)] != nil {
 				continue
 			}
 			classified[jobKey(v, jobID)] = true
@@ -880,6 +886,10 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		}
 		p.setError(ErrNeverNotEchoed)
 		return nil, errAbort
+	}
+	if code, ok := sizeRefusal(err); ok {
+		// A 4xx: no Run exists, and the same submission is refused again.
+		return nil, p.refuse(j, code, name, jit.Runner.ID, log)
 	}
 	if err != nil {
 		// The outcome is unknown: the Run may still appear. Until it does or

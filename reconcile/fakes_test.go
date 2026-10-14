@@ -596,6 +596,10 @@ type fakeLux struct {
 	// in, as a Run that went live after the pass's live listing would be.
 	failRunnerList  int
 	runnerListState string
+	// sizes, when set, are each shaped pool's size names, as luxd resolves
+	// resources.size at submit: a pool absent from it is unshaped.
+	sizes   map[string][]string
+	refused int
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -635,6 +639,15 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 			run := r.run
 			l.mu.Unlock()
 			return &run, nil
+		}
+	}
+	if size := spec.Resources.Size; size != "" && l.sizes != nil {
+		ladder, shaped := l.sizes[spec.Pool]
+		code := map[bool]string{false: "size_unsupported", true: "unknown_size"}[shaped]
+		if !slices.Contains(ladder, size) {
+			l.refused++
+			l.mu.Unlock()
+			return nil, &luxclient.APIError{Op: "create run", Status: http.StatusUnprocessableEntity, Code: code}
 		}
 	}
 	if l.failCreate > 0 {
@@ -813,4 +826,5 @@ func (l *fakeLux) terminatedIDs() []string {
 	return slices.Clone(l.terminated)
 }
 
-func (l *fakeLux) createCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.creates }
+func (l *fakeLux) createCount() int  { l.mu.Lock(); defer l.mu.Unlock(); return l.creates }
+func (l *fakeLux) refusedCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.refused }
