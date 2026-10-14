@@ -244,10 +244,10 @@ func (c *Config) validate() error {
 	if g := rc.StuckJobGrace.Duration; g < MinStuckJobGrace || g > MaxStuckJobGrace {
 		add("reconcile.stuckJobGrace %s must be between %s and %s", g, MinStuckJobGrace, MaxStuckJobGrace)
 	}
-	if n := rc.Reruns(); n < 0 || n > MaxHostLossReruns {
+	n := rc.Reruns()
+	if n < 0 || n > MaxHostLossReruns {
 		add("reconcile.hostLossReruns %d must be between 0 and %d", n, MaxHostLossReruns)
 	}
-	n := rc.Reruns()
 	rc.HostLossReruns = &n
 	g := c.GitHub
 	if strings.TrimSpace(g.AppID) == "" {
