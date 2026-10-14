@@ -856,7 +856,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		Command:            route.Command,
 		Env:                map[string]string{JITConfigEnv: JITConfigPath},
 		Secrets:            []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
-		Resources:          luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
+		Resources:          routeResources(route),
 		Timeout:            route.Timeout.Duration,
 		Grace:              r.cfg.Reconcile.StopGrace.Duration,
 		Pool:               route.Pool,
@@ -895,6 +895,14 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
 	return run, nil
+}
+
+// routeResources is a size route's size, or a raw route's cpus, memory and disk.
+func routeResources(route *config.Route) luxclient.Resources {
+	if route.Size != "" {
+		return luxclient.Resources{Size: route.Size}
+	}
+	return luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30}
 }
 
 // carries reports whether run has the ownership labels and the gen and

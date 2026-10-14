@@ -269,6 +269,35 @@ func TestRawRouteRequestIsByteForByte(t *testing.T) {
 	}
 }
 
+// withSizeRoute adds route "m-2", which asks the shaped pool for size
+// m-2-arm64 and serves runs-on: lux-m-2-arm64.
+var withSizeRoute = replace(`"routes": [`, `"routes": [
+    {"name": "m-2", "labels": ["lux-m-2-arm64"], "pool": "shaped",
+     "image": "ghcr.io/acme/runner@sha256:abc", "size": "m-2-arm64", "timeout": "1h", "unrestrictedEgress": true},`)
+
+func TestSizeRouteRequestsSizeAndNoRawResources(t *testing.T) {
+	e := newEnv(t, withSizeRoute)
+	e.gh.queue(7, "queued", "lux-m-2-arm64")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	r := e.lux.all()[0]
+	wire, err := json.Marshal(r.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w struct {
+		Resources map[string]any
+		Placement struct{ Pool string }
+	}
+	if err := json.Unmarshal(wire, &w); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Resources) != 1 || w.Resources["size"] != "m-2-arm64" || w.Placement.Pool != "shaped" || r.run.Labels[LabelRoute] != "m-2" {
+		t.Fatalf("wire %s", wire)
+	}
+}
+
 func TestRepeatedWakesAndStaleEventsNeverDuplicateARun(t *testing.T) {
 	e := newEnv(t)
 	e.gh.queue(7, "queued", lux3...)
