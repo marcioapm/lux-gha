@@ -190,22 +190,18 @@ func TestJobCausedStopsAreNeverRerun(t *testing.T) {
 
 func TestHostLossRerunBound(t *testing.T) {
 	for _, tc := range []struct {
-		edit    func(string) string
+		edit    []func(string) string
 		attempt int64
 		reruns  int
 		hint    string
 	}{
 		{nil, 2, 1, "lux-gha re-runs the job automatically (attempt 3 of 3)."},
 		{nil, 3, 0, "re-run the job. Automatic re-runs are used up (this was attempt 3; lux-gha re-runs up to attempt 3)."},
-		{noReruns, 1, 0, "re-run the job. Automatic re-runs are off."},
-		{replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 5}`), 5, 1, "(attempt 6 of 6)."},
+		{[]func(string) string{noReruns}, 1, 0, "re-run the job. Automatic re-runs are off."},
+		{[]func(string) string{replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 5}`)}, 5, 1, "(attempt 6 of 6)."},
 	} {
 		t.Run(tc.hint, func(t *testing.T) {
-			var edits []func(string) string
-			if tc.edit != nil {
-				edits = append(edits, tc.edit)
-			}
-			e := newEnv(t, edits...)
+			e := newEnv(t, tc.edit...)
 			e.loseHost(tc.attempt, hostLoss)
 			e.pass()
 			e.clock.Add(2 * time.Minute)
@@ -459,12 +455,12 @@ func TestLostRunListingFailureIsALuxError(t *testing.T) {
 	})
 	t.Run("list", func(t *testing.T) {
 		e := newEnv(t)
-		e.lux.failSinceList = true
+		e.lux.sinceListErr = &luxclient.APIError{Op: "list runs", Status: 503}
 		e.runnerCancels()
 		if st := e.pass(); st.Error != ErrLux || st.Rerun != 0 {
 			t.Fatalf("status %+v", st)
 		}
-		e.lux.failSinceList = false
+		e.lux.sinceListErr = nil
 		if st := e.pass(); st.Rerun != 1 {
 			t.Fatalf("after recovery: %+v", st)
 		}

@@ -764,11 +764,9 @@ type fakeLux struct {
 	// resources.size at submit: a pool absent from it is unshaped.
 	sizes   map[string][]string
 	refused int
-	// sinceLists records each ListCreatedSince's since; failSinceList
-	// fails them.
-	sinceLists    []time.Time
-	failSinceList bool
-	// sinceListErr, when set, is what ListCreatedSince returns.
+	// sinceLists records each ListCreatedSince's since; a non-nil
+	// sinceListErr fails them.
+	sinceLists   []time.Time
 	sinceListErr error
 	// gets records each Get's id; failGet fails them.
 	gets    []string
@@ -927,13 +925,10 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 func (l *fakeLux) ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]luxclient.Run, error) {
 	l.mu.Lock()
 	l.sinceLists = append(l.sinceLists, since)
-	fail, failErr := l.failSinceList, l.sinceListErr
+	err := l.sinceListErr
 	l.mu.Unlock()
-	if failErr != nil {
-		return nil, failErr
-	}
-	if fail {
-		return nil, &luxclient.APIError{Op: "list runs", Status: 503}
+	if err != nil {
+		return nil, err
 	}
 	runs, err := l.List(ctx, labels, states...)
 	return slices.DeleteFunc(runs, func(r luxclient.Run) bool { return r.CreatedAt.Before(since) }), err

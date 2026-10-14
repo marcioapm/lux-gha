@@ -108,7 +108,7 @@ func (p *pass) discoverLost() {
 	if p.lostPrev == nil {
 		ok = p.listEnded(now)
 	} else {
-		ok = p.readEnded(p.lostPrev, now)
+		ok = p.readEnded(now)
 	}
 	if !ok {
 		return
@@ -119,7 +119,7 @@ func (p *pass) discoverLost() {
 		if run.CreatedAt.Before(next) {
 			next = run.CreatedAt
 		}
-		if l, ok := lostFromLabels(run.Labels); ok && r.attemptEligible(l.attempt) {
+		if l := lostFromLabels(run.Labels); l != nil && r.attemptEligible(l.attempt) {
 			live[run.ID] = true
 		}
 	}
@@ -155,15 +155,15 @@ func (p *pass) listEnded(now time.Time) bool {
 	return true
 }
 
-// readEnded reads each Run of prev that is no longer live. On a failed read
-// the next pass lists from the unchanged cursor, which covers every Run of
-// prev; Runs already queued are not queued again (lostSeen).
-func (p *pass) readEnded(prev map[string]bool, now time.Time) bool {
+// readEnded reads each Run of p.lostPrev that is no longer live. On a failed
+// read the next pass lists from the unchanged cursor, which covers every Run
+// of p.lostPrev; Runs already queued are not queued again (lostSeen).
+func (p *pass) readEnded(now time.Time) bool {
 	r := p.r
 	for _, run := range p.live {
-		delete(prev, run.ID)
+		delete(p.lostPrev, run.ID)
 	}
-	for _, id := range sortedKeys(prev) {
+	for _, id := range sortedKeys(p.lostPrev) {
 		run, err := r.lux.Get(p.ctx, id)
 		if err != nil {
 			r.log.Error("reading an ended Lux Run for a lost host failed", "run", id, "error", err)
@@ -183,26 +183,25 @@ func (p *pass) considerEnded(run luxclient.Run, now time.Time) {
 	if now.Sub(finished) > hostLossHorizon {
 		return
 	}
-	if l, ok := lostFromLabels(run.Labels); ok && p.r.rerunEligible(run.StateReason, l.attempt) {
+	if l := lostFromLabels(run.Labels); l != nil && p.r.rerunEligible(run.StateReason, l.attempt) {
 		p.r.queueLost(run.ID, finished, l)
 	}
 }
 
-// lostFromLabels reads a Run's job identity; a Run missing any of it is
-// skipped.
-func lostFromLabels(labels map[string]string) (*lostJob, bool) {
+// lostFromLabels reads a Run's job identity, or nil if any of it is missing.
+func lostFromLabels(labels map[string]string) *lostJob {
 	var ids [4]int64
 	for i, k := range []string{LabelRepo, LabelJob, LabelRunID, LabelRunAttempt} {
 		n, err := strconv.ParseInt(labels[k], 10, 64)
 		if err != nil || n <= 0 {
-			return nil, false
+			return nil
 		}
 		ids[i] = n
 	}
 	if labels[LabelRunner] == "" {
-		return nil, false
+		return nil
 	}
-	return &lostJob{repoID: ids[0], jobID: ids[1], runID: ids[2], attempt: ids[3], runner: labels[LabelRunner]}, true
+	return &lostJob{repoID: ids[0], jobID: ids[1], runID: ids[2], attempt: ids[3], runner: labels[LabelRunner]}
 }
 
 func (r *Reconciler) longestTimeout() time.Duration {

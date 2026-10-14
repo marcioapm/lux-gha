@@ -689,7 +689,7 @@ func TestStoppedHints(t *testing.T) {
 			}
 		})
 	}
-	off := newEnv(t, bigDisk, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 0}`))
+	off := newEnv(t, bigDisk, noReruns)
 	if got, want := off.rec.hint("host lost", nil, 1), lost+"re-run the job. Automatic re-runs are off."; got != want {
 		t.Fatalf("off: got %q want %q", got, want)
 	}
