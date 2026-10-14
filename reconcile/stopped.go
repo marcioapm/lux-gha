@@ -55,11 +55,15 @@ func (p *pass) closeStopped() error {
 					continue
 				}
 				// A Run without finishedAt counts from when it was seen ended.
-				s = &stoppedRun{run: *run, finished: r.now()}
+				s = &stoppedRun{run: *run, finished: r.now(), rerunEligible: r.rerunEligible(run.StateReason, j.RunAttempt)}
 				if run.FinishedAt != nil {
 					s.finished = *run.FinishedAt
 				}
 				r.stopped[name] = s
+				// Queued once per Run; rerunLost drops it when settled.
+				if s.rerunEligible {
+					r.lost[jobKey(v, j.ID)] = &lostJob{repoID: v.id, jobID: j.ID, runID: j.RunID, attempt: j.RunAttempt}
+				}
 			}
 			observed[name] = true
 			// A Run that exited 0 by itself ran its job to the end; GitHub's
@@ -81,10 +85,13 @@ func (p *pass) closeStopped() error {
 
 // stoppedRun is the ended Run of a runner whose job is still in_progress,
 // and what was done about it. A resumePolicy never Run stays ended.
+// rerunEligible: the Run's host was lost and the job's attempt is within
+// reconcile.hostLossReruns, so the job is queued for rerunLost.
 type stoppedRun struct {
 	run                  luxclient.Run
 	finished             time.Time
 	explained, cancelled bool
+	rerunEligible        bool
 }
 
 // endedRun reads the Runs labelled with the runner's name, in any state:
@@ -292,7 +299,7 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s *stoppedRun) githubapp.
 		fmt.Fprintf(&b, "| Exit code | %d |\n", *run.ExitCode)
 	}
 	fmt.Fprintf(&b, "| Finished | %s |\n", finished.UTC().Format(time.RFC3339))
-	if hint := r.hint(reason, route); hint != "" {
+	if hint := r.hint(reason, route, j.RunAttempt); hint != "" {
 		fmt.Fprintf(&b, "\n%s\n", hint)
 	}
 	return githubapp.CheckRunRequest{
@@ -307,8 +314,9 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s *stoppedRun) githubapp.
 }
 
 // hint says what to change for the stop reasons a job can cause or avoid;
-// reason is Lux's stateReason without the resumePolicy suffix.
-func (r *Reconciler) hint(reason string, route *config.Route) string {
+// reason is Lux's stateReason without the resumePolicy suffix, attempt the
+// job's run_attempt.
+func (r *Reconciler) hint(reason string, route *config.Route, attempt int64) string {
 	switch {
 	case strings.HasPrefix(reason, "disk limit exceeded"):
 		if route == nil {
@@ -327,8 +335,16 @@ func (r *Reconciler) hint(reason string, route *config.Route) string {
 			return "The Run reached its Lux timeout."
 		}
 		return fmt.Sprintf("The Run reached the route's Lux timeout (%s): shorten the job, or raise the route's timeout.", route.Timeout.Duration)
-	case strings.Contains(reason, "preempt"), strings.Contains(reason, "drain"), strings.Contains(reason, "host lost"):
-		return "The Run's host was taken away (preemption, drain or loss); re-run the job."
+	case hostLost(reason):
+		// Posted when the job is seen stopped, before any re-run.
+		n := r.cfg.Reconcile.Reruns()
+		switch {
+		case r.rerunEligible(reason, attempt):
+			return fmt.Sprintf("The Run's host was taken away (preemption, drain or loss); lux-gha re-runs the job automatically (attempt %d of %d).", attempt+1, n+1)
+		case n == 0:
+			return "The Run's host was taken away (preemption, drain or loss); re-run the job. Automatic re-runs are off."
+		}
+		return fmt.Sprintf("The Run's host was taken away (preemption, drain or loss); re-run the job. Automatic re-runs are used up (%d attempts).", n+1)
 	case strings.HasPrefix(reason, "terminated"):
 		return "The Run was terminated through the Lux API."
 	}

@@ -246,7 +246,7 @@ func TestRouteSpecificCommandAndShape(t *testing.T) {
 // with raw cpus, memoryMiB and diskGiB.
 const rawRouteWire = `{"name":"widgets · build-7","labels":{"app":"lux-gha","lux-gha/gen":"0","lux-gha/job":"7",` +
 	`"lux-gha/job-name":"build-7","lux-gha/managed":"t1","lux-gha/repo":"1001","lux-gha/repo-name":"acme/widgets",` +
-	`"lux-gha/route":"default","lux-gha/run-id":"70","lux-gha/runner":"lux-gha-t1-1001-7-0","lux-gha/sha":"000000000000"},` +
+	`"lux-gha/route":"default","lux-gha/run-attempt":"1","lux-gha/run-id":"70","lux-gha/runner":"lux-gha-t1-1001-7-0","lux-gha/sha":"000000000000"},` +
 	`"image":{"ref":"ghcr.io/acme/runner@sha256:abc"},"workload":{"adapter":"generic","command":["/usr/local/bin/lux-gha-runner"],"grace":"1m0s"},` +
 	`"env":{"LUXGHA_JITCONFIG_FILE":"/run/lux-gha/jitconfig"},` +
 	`"secrets":[{"name":"jitconfig","value":"SECRET-JIT-501-lux-gha-t1-1001-7-0","as":"file","path":"/run/lux-gha/jitconfig"}],` +
@@ -656,7 +656,7 @@ func TestRunnerThatServedAnotherJobLeadsToNextGen(t *testing.T) {
 }
 
 func TestMidJobLossProvisionsNothing(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, noReruns)
 	e.gh.queue(7, "queued", lux3...)
 	e.pass()
 	if err := e.gh.pick(runner("7", 0), 7); err != nil {

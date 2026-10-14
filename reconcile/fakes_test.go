@@ -66,6 +66,8 @@ const (
 	opListChecks  = "list-checks"
 	opCreateCheck = "create-check"
 	opCancel      = "force-cancel"
+	opGetRun      = "get-run"
+	opRerun       = "rerun"
 )
 
 // fakeGitHub models one installation's repositories: workflow jobs with
@@ -100,6 +102,7 @@ type fakeGitHub struct {
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
 	checkOutputs []githubapp.CheckRunRequest
+	reruns       []int64 // job ids re-run
 }
 
 const widgets = "acme/widgets"
@@ -222,7 +225,7 @@ func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repos
 			continue
 		}
 		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels,
-			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID), RunAttempt: j.attempt}
+			Name: cmp.Or(j.name, fmt.Sprintf("build-%d", j.id)), HeadSHA: fakeSHA(j.runID), RunAttempt: attemptOf(j)}
 		if j.workflow != "" {
 			wf := j.workflow
 			out.WorkflowName = &wf
@@ -408,6 +411,73 @@ func (f *fakeGitHub) ForceCancelWorkflowRun(_ context.Context, repo githubapp.Re
 		}
 	}
 	return nil
+}
+
+// GetWorkflowRun reports the run's latest attempt (its jobs' highest) and
+// the status derived from its jobs.
+func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository, runID int64) (githubapp.WorkflowRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opGetRun, repo, 0)
+	if err != nil {
+		return githubapp.WorkflowRun{}, err
+	}
+	run := githubapp.WorkflowRun{ID: runID}
+	for _, j := range r.jobs {
+		if j.runID == runID {
+			run.RunAttempt = max(run.RunAttempt, attemptOf(j))
+		}
+	}
+	if run.RunAttempt == 0 {
+		return githubapp.WorkflowRun{}, &githubapp.APIError{StatusCode: http.StatusNotFound}
+	}
+	s := r.runStatus(runID)
+	run.Status = &s
+	// The worst conclusion of its jobs, as GitHub concludes a run.
+	if s == "completed" {
+		c := "success"
+		for _, j := range r.jobs {
+			if j.runID == runID && (j.conclusion == "failure" || j.conclusion == "cancelled" && c != "failure") {
+				c = j.conclusion
+			}
+		}
+		run.Conclusion = &c
+	}
+	return run, nil
+}
+
+// RerunJob starts the run's next attempt with the job queued again; GitHub
+// refuses a run that is not completed with 403 "already running".
+func (f *fakeGitHub) RerunJob(_ context.Context, repo githubapp.Repository, jobID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opRerun, repo, 0)
+	if err != nil {
+		return err
+	}
+	j := r.jobs[jobID]
+	if j == nil {
+		return &githubapp.APIError{StatusCode: http.StatusNotFound}
+	}
+	if r.runStatus(j.runID) != "completed" {
+		return &githubapp.APIError{StatusCode: http.StatusForbidden, Already: true}
+	}
+	f.reruns = append(f.reruns, jobID)
+	for _, o := range r.jobs {
+		if o.runID == j.runID {
+			o.attempt = attemptOf(o) + 1
+		}
+	}
+	j.status, j.conclusion, j.runner, j.runnerID = "queued", "", "", 0
+	return nil
+}
+
+func attemptOf(j *fakeJob) int64 { return max(j.attempt, 1) }
+
+func (f *fakeGitHub) rerunJobs() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.reruns)
 }
 
 // checks returns acme/widgets' check runs and the requests that made them.

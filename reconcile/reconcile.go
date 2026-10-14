@@ -68,6 +68,8 @@ type GitHub interface {
 	CreateCheckRun(context.Context, githubapp.Repository, githubapp.CheckRunRequest) (githubapp.CheckRun, error)
 	ListCheckRunsForRef(context.Context, githubapp.Repository, string, githubapp.CheckRunListOptions) (githubapp.CheckRunPage, error)
 	ForceCancelWorkflowRun(context.Context, githubapp.Repository, int64) error
+	GetWorkflowRun(context.Context, githubapp.Repository, int64) (githubapp.WorkflowRun, error)
+	RerunJob(context.Context, githubapp.Repository, int64) error
 }
 
 type Lux interface {
@@ -104,8 +106,10 @@ type Status struct {
 	Deleted          int            `json:"deleted"`
 	// CheckRuns and ForceCancelled count jobs whose Lux Run ended under them
 	// (see closeStopped): check runs posted, workflow runs force-cancelled.
+	// Rerun counts jobs re-run after their Run's host was lost (rerunLost).
 	CheckRuns      int `json:"checkRuns"`
 	ForceCancelled int `json:"forceCancelled"`
+	Rerun          int `json:"rerun"`
 }
 
 // Error categories in Status.Error.
@@ -142,6 +146,7 @@ type Reconciler struct {
 	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
 	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
 	refused          map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
+	lost             map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
 	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
@@ -170,6 +175,7 @@ func New(o Options) (*Reconciler, error) {
 		offlineSince: map[string]time.Time{},
 		stopped:      map[string]*stoppedRun{},
 		refused:      map[string]*refusal{},
+		lost:         map[string]*lostJob{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -316,9 +322,9 @@ type pass struct {
 	// newly ended busy runners are bounded by the previous pass's live Runs.
 	budget, luxReads int
 	statusBudget     [2]int
-	// noChecks, noCancel: GitHub refused the Checks or Actions write
-	// permission this pass; later calls needing it are skipped.
-	noChecks, noCancel bool
+	// noChecks, noCancel, noRerun: GitHub refused the Checks or Actions
+	// write permission this pass; later calls needing it are skipped.
+	noChecks, noCancel, noRerun bool
 	// unread: a repository's registrations are unknown this pass (its read
 	// failed, or it has not been read since startup), so its unresolved
 	// submissions are unknown and no Run may be created.
@@ -410,6 +416,9 @@ func (p *pass) act() error {
 		return err
 	}
 	if err := p.closeStopped(); err != nil {
+		return err
+	}
+	if err := p.rerunLost(); err != nil {
 		return err
 	}
 	return p.closeRefused()
