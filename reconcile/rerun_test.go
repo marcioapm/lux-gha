@@ -148,8 +148,9 @@ func TestRerunOfAnAdvancedAttemptIsNotPosted(t *testing.T) {
 	if st := e.pass(); st.Rerun != 1 {
 		t.Fatalf("first bridge: %+v", st)
 	}
-	// The new attempt ran elsewhere and completed: the run is completed again.
-	e.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion = "completed", "success" })
+	// The new attempt ran elsewhere and failed: the run is completed and
+	// failed again, and only its run_attempt tells it was re-run.
+	e.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion = "completed", "failure" })
 	ops := countOps(e, nil)
 	if st := other.Pass(t.Context()); st.Rerun != 0 || ops[opRerun] != 0 || ops[opGetRun] != 1 || st.Error != "" {
 		t.Fatalf("second bridge: %+v ops %v", st, ops)
