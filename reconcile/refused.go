@@ -103,6 +103,8 @@ func (p *pass) closeRefused() error {
 // the job, as no Lux Run exists.
 func (r *Reconciler) refusalCheck(f *refusal) githubapp.CheckRunRequest {
 	route := f.route
+	id := strconv.FormatInt(f.jobID, 10)
+	jobName := cmp.Or(f.job, "job "+id)
 	var b strings.Builder
 	fmt.Fprintf(&b, "Lux refused the Run for this job's runner, so no runner can take the job. "+
 		"The bridge does not retry it and cancels the workflow run.\n\n")
@@ -117,10 +119,10 @@ func (r *Reconciler) refusalCheck(f *refusal) githubapp.CheckRunRequest {
 	fmt.Fprintf(&b, "| Lux error | `%s` |\n", f.code)
 	fmt.Fprintf(&b, "\n%s\n", refusalHint(f.code, route))
 	return githubapp.CheckRunRequest{
-		Name: CheckName, HeadSHA: f.sha, ExternalID: "job-" + strconv.FormatInt(f.jobID, 10), Status: "completed", Conclusion: "failure",
+		Name: CheckName, HeadSHA: f.sha, ExternalID: "job-" + id, Status: "completed", Conclusion: "failure",
 		CompletedAt: r.now(),
 		Output: githubapp.CheckRunOutput{
-			Title:   cutRunes(`Lux refused job "`+cmp.Or(f.job, "job "+strconv.FormatInt(f.jobID, 10))+`": `+f.code, githubapp.MaxCheckTitle),
+			Title:   cutRunes(`Lux refused job "`+jobName+`": `+f.code, githubapp.MaxCheckTitle),
 			Summary: b.String(),
 		},
 	}

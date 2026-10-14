@@ -551,13 +551,12 @@ func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 			if _, seen := v.demand[j.ID]; !seen {
 				// A refused job is kept as demand for closeRefused but is
 				// never provisioned, so it does not use the budget.
-				refused := p.r.refused[jobKey(v, j.ID)] != nil
-				if p.budget <= 0 && !refused {
-					p.truncated = true
-					v.partial[runID] = true
-					return nil
-				}
-				if !refused {
+				if p.r.refused[jobKey(v, j.ID)] == nil {
+					if p.budget <= 0 {
+						p.truncated = true
+						v.partial[runID] = true
+						return nil
+					}
 					p.budget--
 				}
 				v.demand[j.ID] = route

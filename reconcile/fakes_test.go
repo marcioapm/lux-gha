@@ -646,8 +646,11 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 	}
 	if size := spec.Resources.Size; size != "" && l.sizes != nil {
 		ladder, shaped := l.sizes[spec.Pool]
-		code := map[bool]string{false: "size_unsupported", true: "unknown_size"}[shaped]
 		if !slices.Contains(ladder, size) {
+			code := "unknown_size"
+			if !shaped {
+				code = "size_unsupported"
+			}
 			l.refused++
 			l.mu.Unlock()
 			return nil, &luxclient.APIError{Op: "create run", Status: http.StatusUnprocessableEntity, Code: code}
