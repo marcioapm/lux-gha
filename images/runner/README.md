@@ -69,8 +69,8 @@ and pushes the arm64 image to `ghcr.io/<owner>/lux-gha-runner` (see [Releases](.
 - `image`: the pushed image, referenced by digest.
 - `nestedContainers: true`, with `pool` set to a pool whose hosts run `lux-runner --nested`. Otherwise the
   entrypoint exits 1 because dockerd cannot start.
-- Docker's store sits on the ephemeral volume Lux mounts at `~/.local/share/docker`, so `diskGiB` must
-  also hold the job's images and build cache.
+- Docker's store sits on the ephemeral volume Lux mounts at `~/.local/share/docker`, so `diskGiB` (or, on a
+  route with `size`, that size's disk) must also hold the job's images and build cache.
 - `egressHosts` or `unrestrictedEgress: true`, never both. With neither, the Run has no network and the
   runner cannot reach GitHub. For the pilot, see [Pilot egress](#pilot-egress).
 
