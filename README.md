@@ -15,7 +15,7 @@ process.
   - repository JIT config
   - workflow job and run reads
   - listing and deleting repository runners
-  - creating and listing check runs, and force-cancelling a workflow run
+  - creating and listing check runs, force-cancelling a workflow run, and re-running a job
 - `luxclient`: thin HTTP client for Lux Runs:
   - create (with `Idempotency-Key`), get, paged list and terminate
   - a startup compatibility check
@@ -45,7 +45,8 @@ state from GitHub.
 A repository read costs `2 + active workflow runs + ⌈runners/100⌉` GitHub
 requests (active = `queued` or `in_progress`, including runs with only
 GitHub-hosted jobs), plus one per provisioned runner. A job whose Lux Run
-ended under it adds two or three more, once
+ended under it adds two or three more, once, and a job re-run after host
+loss one workflow-run read per pass until it is re-run, plus the re-run
 ([When Lux stops a job](#when-lux-stops-a-job)). With a `repositories`
 list every listed repository is read every pass; size `interval` against the
 installation's hourly limit and the number of repositories. Without one, a
@@ -115,11 +116,14 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    registered (it ran its job and deregistered) is terminated if still live
    `idleGrace` later. An offline managed runner with no live Run (lost before
    pickup, or a submission whose outcome stayed unknown) is deleted `idleGrace` after it was
-   first seen. A Run lost mid-job is never rerun: GitHub fails the job, and
-   step 6 explains it and makes sure it does not hang.
+   first seen. A Run lost mid-job is never resubmitted for the same job
+   attempt: GitHub fails the job, and step 6 explains it, makes sure it does
+   not hang, and re-runs it if its Run's host was lost.
 6. **Stopped jobs.** An `in_progress` job whose runner is one of this
    instance's and whose Run has ended gets a check run, and is
-   force-cancelled if it stays stuck ([When Lux stops a job](#when-lux-stops-a-job)).
+   force-cancelled if it stays stuck. If the Run's host was lost, the job
+   is re-run once its workflow run completes, within
+   `reconcile.hostLossReruns` ([When Lux stops a job](#when-lux-stops-a-job)).
 
 Steps 3 to 6 act only on repositories read successfully this pass. A
 repository not read this pass, because it was not selected, its read
@@ -343,7 +347,7 @@ timers, which delays cleanup but never duplicates a Run.
 (a category: `github_rate_limited`, `github`, `github_permission`, `lux`,
 `lux_resume_policy_not_echoed`, `lux_run_mismatch`, `lux_size_refused`), `rateLimitedUntil`, `demand` and `live` per
 route, `idle`, `busy`, and `provisioned`, `terminated`, `deleted`,
-`checkRuns` and `forceCancelled` in that pass. It holds no credentials or
+`checkRuns`, `forceCancelled` and `rerun` in that pass. It holds no credentials or
 JIT configuration.
 
 ## When Lux stops a job
@@ -408,6 +412,34 @@ labels, any state; one Run per runner name). If the Run has ended:
   sibling is cancelled before it started, so no job work is lost, and its Run
   is reclaimed. A job that completes on its own
   within the grace is left alone.
+- **Re-run after host loss.** When the reason says the host was taken away
+  (it contains `preempt`, `drain` or `host lost`), the job did nothing
+  wrong, so the bridge re-runs it. It waits until the workflow run is
+  `completed` (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`), with
+  conclusion `failure` or `cancelled` (the unstick force-cancel makes it
+  `cancelled`). It then calls
+  `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`, which starts a new
+  attempt of the workflow run that runs that job and the jobs that depend on
+  it again, and logs it at `WARN`. `disk limit exceeded`, `timeout`,
+  `terminated` and any other reason are never re-run.
+
+  **The bound is per workflow run, not per job.** Every re-run, by anyone,
+  increments the workflow run's `run_attempt`, and GitHub has no attempt
+  count of a job apart from its run's. A job is re-run only if its
+  `run_attempt` is at most `reconcile.hostLossReruns` (default 2, so at most
+  3 attempts), and only while it belongs to the latest attempt. Before the
+  call the bridge reads the workflow run again; if its `run_attempt` has
+  moved past the job's, it was re-run already (by this bridge before a
+  restart, by a second bridge, or by a person) and nothing is posted. A
+  `409`, `422`, or a `403` saying the run is already running or re-run,
+  counts as done. The count needs no local state and survives restarts. A
+  workflow run re-run by hand for another reason uses up attempts too.
+
+  The check run's hint says what will happen, since it is posted when the job
+  is seen stopped, before the re-run: "lux-gha re-runs the job automatically
+  (attempt N of M)", or, past the bound, "re-run the job. Automatic re-runs
+  are used up (M attempts)." With `hostLossReruns: 0` it says "Automatic
+  re-runs are off." and the job is left failed, as before.
 
 `in_progress` workflow runs are listed before `queued` ones so a queued
 backlog cannot hide stopped jobs. Reading their Lux Runs has its own per-pass
@@ -417,10 +449,11 @@ previous pass's live Runs. An ended Run is cached, so later passes do not
 read it again. When the allowance runs out, uncached jobs wait, but cached
 jobs still get their explanation and cancellation. Cache pruning waits for
 a complete pass; removed repositories are forgotten after `idleGrace`.
-A `403` from either call means the App lacks Checks or Actions write. It is
+A `403` from any of these calls means the App lacks Checks or Actions write. It is
 logged once per pass and reported in `GET /status` as `github_permission`.
-The pass goes on: provisioning and cleanup are not affected, and the
-runner's own cancellation still applies.
+The pass goes on: provisioning and cleanup are not affected, the
+runner's own cancellation still applies, and a job waiting for a re-run is
+retried on a later pass.
 
 ## Runner entrypoint contract
 
@@ -449,7 +482,7 @@ also starts rootless Docker first when the image has it.
   "maxRunners": 20,
   "reconcile": {"interval": "60s", "idleGrace": "2m", "maxJobsPerPass": 200, "maxGensPerJob": 5,
                 "repositoryRefresh": "10m", "hotWindow": "2m", "coldSweep": "10m",
-                "stopGrace": "60s", "stuckJobGrace": "2m"},
+                "stopGrace": "60s", "stuckJobGrace": "2m", "hostLossReruns": 2},
   "github": {
     "appID": "Iv1.0123456789abcdef",
     "installationID": 12345678,
@@ -472,7 +505,7 @@ also starts rootless Docker first when the image has it.
 
 - **`instance`**: required, 1-20 of `a-z`, `0-9` and `-`. It names this bridge in Run labels and runner names; two bridges sharing a GitHub repository or Lux tenant need different instances.
 - **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
-- **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every tick pass while the runs API does not yet list its job (GitHub's lag between delivery and API), and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass. `stopGrace` (15 s to 10 m) is each Run's Lux `workload.grace`, the time between SIGTERM and SIGKILL in which the runner cancels its job and uploads the log. Every stop of a runner Run, a surplus terminate included, can take that long. `stuckJobGrace` (30 s to 1 h) is how long a job may stay `in_progress` after its Run ended before its workflow run is force-cancelled ([When Lux stops a job](#when-lux-stops-a-job)).
+- **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every tick pass while the runs API does not yet list its job (GitHub's lag between delivery and API), and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass. `stopGrace` (15 s to 10 m) is each Run's Lux `workload.grace`, the time between SIGTERM and SIGKILL in which the runner cancels its job and uploads the log. Every stop of a runner Run, a surplus terminate included, can take that long. `stuckJobGrace` (30 s to 1 h) is how long a job may stay `in_progress` after its Run ended before its workflow run is force-cancelled ([When Lux stops a job](#when-lux-stops-a-job)). `hostLossReruns` (0 to 5; 0 turns it off) is the highest `run_attempt` of a workflow run whose job lost its Run's host and is still re-run automatically. It is counted per workflow run, not per job ([When Lux stops a job](#when-lux-stops-a-job)).
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
 - **Resources** (route): either `size` or the raw `cpus`, `memoryMiB` and `diskGiB`, never both ([Sizes](#sizes)). Raw fields left out or `0` are not sent. On an unshaped pool, luxd's defaults fill them; on a shaped pool, the fields given are rounded up to the smallest size that covers all of them, and a route with none of them gets the pool's default size. `size` must be a name luxd can give a size: `<family>-<cpus>-<arch>`, the family a lowercase slug of `a-z`, `0-9` and `-` that starts and ends with a letter or digit, cpus `05` or a power of two, arch `arm64` or `amd64`, at most 63 characters.
 - **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
@@ -548,7 +581,7 @@ Repository permissions, and nothing else:
 | Permission | Access | Used for |
 |---|---|---|
 | Administration | Read and write | `generate-jitconfig`, listing and deleting repository runners |
-| Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs; force-cancelling a workflow run whose job's Lux Run was stopped |
+| Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs; force-cancelling a workflow run whose job's Lux Run was stopped, and re-running a job whose Run's host was lost |
 | Checks | Read and write | A check run explaining why Lux stopped a job, and listing it so it is posted once |
 | Metadata | Read-only | Granted to every App; `GET /installation/repositories` |
 
@@ -557,7 +590,7 @@ Subscribe to the **Workflow job** webhook event.
 Actions and Checks write serve only [When Lux stops a job](#when-lux-stops-a-job).
 With Actions read-only and no Checks permission, the bridge still
 provisions and cleans up as before, and the runner still cancels its own
-job on a stop. Only the check run and the force-cancel are skipped, and
+job on a stop. Only the check run, the force-cancel and the re-run are skipped, and
 `GET /status` reports `github_permission`.
 
 Without `repositories`, install the App with **Only select repositories**:
