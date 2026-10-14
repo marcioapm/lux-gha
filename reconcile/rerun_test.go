@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/luxclient"
 )
 
 var noReruns = replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 0}`)
@@ -161,6 +162,7 @@ func TestLostRunThatNeverHeldTheJobIsNotRerun(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.gh.complete(7, "failure")
+	e.lux.end(e.runID("7"), "exit code 1")
 	ops := countOps(e, nil)
 	e.pass()
 	e.pass()
@@ -170,7 +172,7 @@ func TestLostRunThatNeverHeldTheJobIsNotRerun(t *testing.T) {
 }
 
 func TestJobCausedStopsAreNeverRerun(t *testing.T) {
-	for _, reason := range []string{diskStop, "timeout; resumePolicy never", "terminated", "exit code 3"} {
+	for _, reason := range []string{diskStop, "timeout; resumePolicy never", "terminated", "terminated; host lost", "exit code 3"} {
 		t.Run(reason, func(t *testing.T) {
 			e := newEnv(t)
 			e.loseHost(1, reason)
@@ -213,6 +215,10 @@ func TestHostLossRerunBound(t *testing.T) {
 			_, reqs := e.gh.checks()
 			if len(e.gh.rerunJobs()) != tc.reruns || len(reqs) != 1 || !strings.HasSuffix(reqs[0].Output.Summary, tc.hint+"\n") {
 				t.Fatalf("reruns %v checks %+v", e.gh.rerunJobs(), reqs)
+			}
+			// A Run past the bound is not read when it ends.
+			if gets := e.lux.getCalls(); tc.reruns == 0 && len(gets) != 0 {
+				t.Fatalf("gets %v", gets)
 			}
 		})
 	}
@@ -292,49 +298,222 @@ func TestLostRunsOutsideTheHorizonOrWithoutLabelsAreSkipped(t *testing.T) {
 	}
 }
 
-// Each pass lists only the ended Runs created since the oldest Run live in
-// the previous one, not the whole horizon.
-func TestLostRunListingStartsAtTheOldestLiveRun(t *testing.T) {
+// After the first pass's listing, discovery reads each Run that left the live
+// set once, and lists nothing; a Run still live is not read.
+func TestLostRunDiscoveryReadsEachEndedRunOnce(t *testing.T) {
 	e := newEnv(t)
 	created := e.clock.Now()
+	e.gh.queueIn(widgets, 71, 9, "queued", lux3...)
 	e.lose(1, preempt, 7)
 	e.clock.Add(time.Hour)
 	e.pass()
 	e.pass()
-	got := e.lux.sinceListCalls()
-	horizon := created.Add(-hostLossHorizon - 2*time.Hour)
-	if len(got) != 3 || !got[0].Equal(horizon) || !got[1].Equal(created.Add(-lostCursorSkew)) || !got[2].Equal(created.Add(time.Hour-lostCursorSkew)) {
-		t.Fatalf("since %v", got)
+	lists := e.lux.sinceListCalls()
+	if len(lists) != 1 || !lists[0].Equal(created.Add(-hostLossHorizon-2*time.Hour)) {
+		t.Fatalf("since %v", lists)
+	}
+	if gets := e.lux.getCalls(); len(gets) != 1 || len(e.lux.liveForJob("9")) != 1 {
+		t.Fatalf("gets %v", gets)
 	}
 }
 
-func TestLostRunListingFailureIsALuxError(t *testing.T) {
+// A Run live across passes and clock advances that then loses its host is
+// re-run, whether its end is read directly or found by a listing from the
+// cursor after a failed read: the cursor stays at the oldest live Run.
+func TestLostRunLiveAcrossPassesIsRerun(t *testing.T) {
+	for _, failGet := range []bool{false, true} {
+		t.Run(map[bool]string{false: "get", true: "listing"}[failGet], func(t *testing.T) {
+			e := newEnv(t)
+			e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+			e.pass()
+			id := e.runID("7")
+			if err := e.gh.pick(runner("7", 0), 7); err != nil {
+				t.Fatal(err)
+			}
+			e.clock.Add(time.Hour)
+			e.pass()
+			e.clock.Add(time.Hour)
+			e.pass()
+			e.lux.end(id, preempt)
+			e.gh.complete(7, "cancelled")
+			e.lux.failGet = failGet
+			e.pass()
+			e.lux.failGet = false
+			e.pass()
+			if !slices.Equal(e.gh.rerunJobs(), []int64{7}) {
+				t.Fatalf("reruns %v since %v", e.gh.rerunJobs(), e.lux.sinceListCalls())
+			}
+		})
+	}
+}
+
+// A Run whose submission was unresolved in one pass may commit and end before
+// the next without being live in either, so the next pass lists. Its Lux
+// creation time precedes the bridge's clock at the pass that listed nothing
+// live, which lostCursorSkew allows for.
+func TestLostRunOfAnUnresolvedSubmissionIsFound(t *testing.T) {
+	for _, unread := range []bool{false, true} {
+		t.Run(map[bool]string{false: "classified", true: "repository unread"}[unread], func(t *testing.T) {
+			e := newEnv(t)
+			e.lux.lateCommit = 1 << 20
+			e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+			e.pass()
+			e.clock.Add(30 * time.Second)
+			if unread {
+				// The submission is not classified, so it is not counted unresolved.
+				countOps(e, failing(opRuns, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+			}
+			e.pass()
+			countOps(e, nil)
+			e.lux.mu.Lock()
+			hook := e.lux.commitPending()
+			e.lux.mu.Unlock()
+			hook()
+			if err := e.gh.pick(runner("7", 0), 7); err != nil {
+				t.Fatal(err)
+			}
+			e.lux.end(e.lux.all()[0].run.ID, preempt)
+			e.gh.complete(7, "cancelled")
+			e.pass()
+			e.pass()
+			if !slices.Equal(e.gh.rerunJobs(), []int64{7}) {
+				t.Fatalf("reruns %v since %v", e.gh.rerunJobs(), e.lux.sinceListCalls())
+			}
+		})
+	}
+}
+
+// A listing after a failed read finds Runs whose jobs were settled already;
+// they are not queued or read again.
+func TestLostRunSettledIsNotQueuedAgain(t *testing.T) {
 	e := newEnv(t)
 	e.runnerCancels()
-	e.lux.failSinceList = true
-	if st := e.pass(); st.Error != ErrLux || st.Rerun != 0 {
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{7}) {
+		t.Fatalf("reruns %v", e.gh.rerunJobs())
+	}
+	next := e.gh.rerunOf(7)
+	e.pass()
+	ops := countOps(e, nil)
+	if err := e.gh.pick(runner(itoa(next), 0), next); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.complete(next, "failure")
+	e.lux.end(e.runID(itoa(next)), "exit code 1")
+	e.lux.failGet = true
+	e.pass()
+	e.lux.failGet = false
+	lists := len(e.lux.sinceListCalls())
+	e.pass()
+	if len(e.lux.sinceListCalls()) != lists+1 || ops[opGetJob]+ops[opGetRun] != 0 {
+		t.Fatalf("lists %v ops %v", e.lux.sinceListCalls(), ops)
+	}
+}
+
+// Two jobs of one attempt lose one host; one Run exits at once, the other is
+// still stopping when the workflow run completes. Both are re-run together
+// once the second Run has ended.
+func TestLostSiblingWhoseRunIsStillStoppingIsRerunTogether(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.gh.queueIn(widgets, 70, 8, "queued", lux3...)
+	e.pass()
+	id7, id8 := e.runID("7"), e.runID("8")
+	for _, job := range []int64{7, 8} {
+		if err := e.gh.pick(runner(itoa(job), 0), job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.lux.end(id7, preempt)
+	e.lux.setState(id8, "stopping")
+	e.gh.complete(7, "cancelled")
+	e.gh.complete(8, "cancelled")
+	ops := countOps(e, nil)
+	e.pass()
+	if len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("re-ran while a sibling's Run was stopping: %v", e.gh.rerunJobs())
+	}
+	e.lux.end(id8, preempt)
+	e.pass()
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{7, 8}) || ops[opRerunFailed] != 1 || ops[opRerun] != 0 {
+		t.Fatalf("reruns %v ops %v", e.gh.rerunJobs(), ops)
+	}
+}
+
+// A failed read of the ended Runs is a Lux error; the next pass lists from
+// the unchanged cursor and finds the lost job.
+func TestLostRunListingFailureIsALuxError(t *testing.T) {
+	t.Run("get", func(t *testing.T) {
+		e := newEnv(t)
+		e.runnerCancels()
+		e.lux.failGet = true
+		if st := e.pass(); st.Error != ErrLux || st.Rerun != 0 || len(e.lux.getCalls()) != 1 {
+			t.Fatalf("status %+v gets %v", st, e.lux.getCalls())
+		}
+		e.lux.failGet = false
+		lists := len(e.lux.sinceListCalls())
+		if st := e.pass(); st.Rerun != 1 || len(e.lux.sinceListCalls()) != lists+1 {
+			t.Fatalf("after recovery: %+v lists %v", st, e.lux.sinceListCalls())
+		}
+	})
+	t.Run("list", func(t *testing.T) {
+		e := newEnv(t)
+		e.lux.failSinceList = true
+		e.runnerCancels()
+		if st := e.pass(); st.Error != ErrLux || st.Rerun != 0 {
+			t.Fatalf("status %+v", st)
+		}
+		e.lux.failSinceList = false
+		if st := e.pass(); st.Rerun != 1 {
+			t.Fatalf("after recovery: %+v", st)
+		}
+	})
+}
+
+// Past the client's page limit the window is skipped, not failed for good:
+// later Run ends are found although the listing would fail again.
+func TestLostRunListingPastThePageLimitIsSkipped(t *testing.T) {
+	e := newEnv(t)
+	e.runnerCancels()
+	e.rec = e.newReconciler()
+	e.lux.sinceListErr = luxclient.ErrTooManyPages
+	if st := e.pass(); st.Error != "" || st.Rerun != 0 {
 		t.Fatalf("status %+v", st)
 	}
-	e.lux.failSinceList = false
-	if st := e.pass(); st.Rerun != 1 {
-		t.Fatalf("after recovery: %+v", st)
+	e.lose(1, preempt, 8)
+	e.gh.complete(8, "cancelled")
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("reruns %v", e.gh.rerunJobs())
 	}
 }
 
 func TestSupersededWorkflowRunIsNotRerun(t *testing.T) {
 	main, prBranch := "main", "feat/x"
 	ours := githubapp.WorkflowRun{ID: 70, WorkflowID: 3, HeadBranch: &main, Event: "push", RunNumber: 5}
+	pr := func(id, number, headRepo int64) githubapp.WorkflowRun {
+		return githubapp.WorkflowRun{ID: id, WorkflowID: 3, HeadBranch: &main, Event: "pull_request", RunNumber: number,
+			HeadRepository: &githubapp.HeadRepository{ID: headRepo}}
+	}
+	dispatch := func(id, number int64) githubapp.WorkflowRun {
+		return githubapp.WorkflowRun{ID: id, WorkflowID: 3, HeadBranch: &main, Event: "workflow_dispatch", RunNumber: number}
+	}
 	for _, tc := range []struct {
-		name   string
-		other  *githubapp.WorkflowRun
-		ours   githubapp.WorkflowRun
-		reruns int
+		name    string
+		other   *githubapp.WorkflowRun
+		ours    githubapp.WorkflowRun
+		reruns  int
+		latests int
 	}{
-		{"newer push", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &main, Event: "push", RunNumber: 6}, ours, 0},
-		{"older run", &githubapp.WorkflowRun{ID: 60, WorkflowID: 3, HeadBranch: &main, Event: "push", RunNumber: 4}, ours, 1},
-		{"other branch", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &prBranch, Event: "push", RunNumber: 6}, ours, 1},
-		{"other event", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &main, Event: "pull_request", RunNumber: 6}, ours, 1},
-		{"no head branch", nil, githubapp.WorkflowRun{ID: 70, WorkflowID: 3, Event: "push", RunNumber: 5}, 1},
+		{"newer push", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &main, Event: "push", RunNumber: 6}, ours, 0, 1},
+		{"older run", &githubapp.WorkflowRun{ID: 60, WorkflowID: 3, HeadBranch: &main, Event: "push", RunNumber: 4}, ours, 1, 1},
+		{"other branch", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &prBranch, Event: "push", RunNumber: 6}, ours, 1, 1},
+		{"other event", &githubapp.WorkflowRun{ID: 90, WorkflowID: 3, HeadBranch: &main, Event: "pull_request", RunNumber: 6}, ours, 1, 1},
+		{"no head branch", nil, githubapp.WorkflowRun{ID: 70, WorkflowID: 3, Event: "push", RunNumber: 5}, 1, 0},
+		{"newer pull request run", ptr(pr(90, 6, 2002)), pr(70, 5, 2002), 0, 1},
+		{"fork pull request on the same branch name", ptr(pr(90, 6, 3003)), pr(70, 5, 2002), 1, 1},
+		{"newer workflow_dispatch", ptr(dispatch(90, 6)), dispatch(70, 5), 1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
@@ -348,7 +527,7 @@ func TestSupersededWorkflowRunIsNotRerun(t *testing.T) {
 			if len(e.gh.rerunJobs()) != tc.reruns || st.Error != "" {
 				t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
 			}
-			if want := map[bool]int{true: 1, false: 0}[tc.ours.HeadBranch != nil]; ops[opLatestRun] != want {
+			if ops[opLatestRun] != tc.latests {
 				t.Fatalf("ops %v", ops)
 			}
 			e.pass()
@@ -393,6 +572,22 @@ func TestLostSiblingsAreRerunTogether(t *testing.T) {
 		if j := e.gh.job(e.gh.rerunOf(job)); j == nil || j.status != "queued" || j.attempt != 2 {
 			t.Fatalf("job %d: %+v", job, j)
 		}
+	}
+}
+
+// A job that succeeded on the lost Run (the host went during runner teardown)
+// is not re-run although a sibling's failure failed the workflow run.
+func TestLostJobThatSucceededIsNotRerun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 8, "completed", "ubuntu-latest")
+	e.gh.editJob(8, func(j *fakeJob) { j.conclusion, j.runner = "failure", "GitHub Actions 2" })
+	e.lose(1, preempt, 7)
+	e.gh.complete(7, "success")
+	ops := countOps(e, nil)
+	e.pass()
+	e.pass()
+	if len(e.gh.rerunJobs()) != 0 || ops[opRerun]+ops[opRerunFailed] != 0 || ops[opGetJob] != 1 {
+		t.Fatalf("reruns %v ops %v", e.gh.rerunJobs(), ops)
 	}
 }
 

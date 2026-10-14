@@ -768,6 +768,11 @@ type fakeLux struct {
 	// fails them.
 	sinceLists    []time.Time
 	failSinceList bool
+	// sinceListErr, when set, is what ListCreatedSince returns.
+	sinceListErr error
+	// gets records each Get's id; failGet fails them.
+	gets    []string
+	failGet bool
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -922,8 +927,11 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 func (l *fakeLux) ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]luxclient.Run, error) {
 	l.mu.Lock()
 	l.sinceLists = append(l.sinceLists, since)
-	fail := l.failSinceList
+	fail, failErr := l.failSinceList, l.sinceListErr
 	l.mu.Unlock()
+	if failErr != nil {
+		return nil, failErr
+	}
 	if fail {
 		return nil, &luxclient.APIError{Op: "list runs", Status: 503}
 	}
@@ -935,6 +943,28 @@ func (l *fakeLux) sinceListCalls() []time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.sinceLists)
+}
+
+func (l *fakeLux) Get(_ context.Context, id string) (*luxclient.Run, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.gets = append(l.gets, id)
+	if l.failGet {
+		return nil, &luxclient.APIError{Op: "get run", Status: 503}
+	}
+	for _, r := range l.runs {
+		if r.run.ID == id {
+			run := r.run
+			return &run, nil
+		}
+	}
+	return nil, &luxclient.APIError{Op: "get run", Status: 404}
+}
+
+func (l *fakeLux) getCalls() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.gets)
 }
 
 // seed stores a Run under key as if another client had submitted it.

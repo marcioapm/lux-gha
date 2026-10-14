@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/luxclient"
 )
 
 const (
@@ -41,8 +42,13 @@ type lostJob struct {
 }
 
 // hostLost reports whether Lux's stateReason says the Run's host was taken
-// away (preemption, drain or loss) rather than the job causing the stop.
+// away (preemption, drain or loss) rather than the job causing the stop. A
+// Run terminated on request ("terminated; host lost" when its host went
+// during the terminate) is not: its job had ended or was not wanted.
 func hostLost(reason string) bool {
+	if strings.HasPrefix(reason, "terminated") {
+		return false
+	}
 	return strings.Contains(reason, "preempt") || strings.Contains(reason, "drain") || strings.Contains(reason, "host lost")
 }
 
@@ -50,7 +56,11 @@ func hostLost(reason string) bool {
 // reason is re-run: each re-run increments the workflow run's run_attempt,
 // so the attempt bounds the re-runs per workflow run with no local state.
 func (r *Reconciler) rerunEligible(reason string, attempt int64) bool {
-	return hostLost(reason) && attempt >= 1 && attempt <= int64(r.cfg.Reconcile.Reruns())
+	return hostLost(reason) && r.attemptEligible(attempt)
+}
+
+func (r *Reconciler) attemptEligible(attempt int64) bool {
+	return attempt >= 1 && attempt <= int64(r.cfg.Reconcile.Reruns())
 }
 
 // queueLost queues the job of ended Run runID that lost its host, once per
@@ -76,49 +86,106 @@ func (l *lostJob) key() string {
 // discoverLost queues the jobs of this instance's Runs that lost their host
 // and ended within hostLossHorizon, whether or not the bridge saw the job
 // in_progress under an ended Run: a runner that cancels its job within the
-// stop grace leaves nothing for closeStopped. Lux filters by state and label
-// but not by finishedAt, so Runs are listed newest first down to
-// r.lostCursor. A Run ending after this pass was live in it or is created
-// after it, so the next listing starts at the oldest live Run's creation.
-// The first pass after a start reaches back hostLossHorizon plus the longest
-// route timeout.
+// stop grace leaves nothing for closeStopped.
+//
+// In steady state a candidate is a Run live in the previous pass's
+// discovery (r.lostLive) and absent from p.live now; each is read with one
+// Get. Otherwise the ended Runs are listed newest first down to
+// r.lostCursor, since Lux cannot filter by finishedAt: on the first pass
+// after a start, after a failed read or an aborted pass, and after a pass
+// with an unresolved submission or an unread repository, whose Run may
+// commit and end between two passes without being live in either. A Run
+// ending after this pass was live in it or is created after it, so the
+// cursor is the oldest live Run's creation; the first pass after a start
+// reaches back hostLossHorizon plus the longest route timeout.
 func (p *pass) discoverLost() {
 	r := p.r
 	if r.cfg.Reconcile.Reruns() == 0 {
 		return
 	}
 	now := r.now()
+	var ok bool
+	if p.lostPrev == nil {
+		ok = p.listEnded(now)
+	} else {
+		ok = p.readEnded(p.lostPrev, now)
+	}
+	if !ok {
+		return
+	}
+	next := now
+	live := map[string]bool{}
+	for _, run := range p.live {
+		if run.CreatedAt.Before(next) {
+			next = run.CreatedAt
+		}
+		if l, ok := lostFromLabels(run.Labels); ok && r.attemptEligible(l.attempt) {
+			live[run.ID] = true
+		}
+	}
+	r.lostCursor = next.Add(-lostCursorSkew)
+	if p.unresolved == 0 && !p.unread {
+		r.lostLive = live
+	}
+	maps.DeleteFunc(r.lostSeen, func(_ string, at time.Time) bool { return now.Sub(at) > hostLossHorizon })
+}
+
+// listEnded lists the ended Runs created since r.lostCursor. Past the
+// client's page limit the window's candidates are skipped with a WARN and
+// the cursor still advances, so the next pass does not fail the same way.
+func (p *pass) listEnded(now time.Time) bool {
+	r := p.r
 	since := r.lostCursor
 	if since.IsZero() {
 		since = now.Add(-hostLossHorizon - r.longestTimeout())
 	}
 	runs, err := r.lux.ListCreatedSince(p.ctx, map[string]string{LabelManaged: r.cfg.Instance}, since, endedStates...)
-	if err != nil {
+	switch {
+	case errors.Is(err, luxclient.ErrTooManyPages):
+		r.log.Warn("too many ended Lux Runs to look for lost hosts; skipping them", "since", since)
+		return true
+	case err != nil:
 		r.log.Error("listing ended Lux Runs for lost hosts failed", "error", err)
 		p.setError(ErrLux)
+		return false
+	}
+	for _, run := range runs {
+		p.considerEnded(run, now)
+	}
+	return true
+}
+
+// readEnded reads each Run of prev that is no longer live. On a failed read
+// the next pass lists from the unchanged cursor, which covers every Run of
+// prev; Runs already queued are not queued again (lostSeen).
+func (p *pass) readEnded(prev map[string]bool, now time.Time) bool {
+	r := p.r
+	for _, run := range p.live {
+		delete(prev, run.ID)
+	}
+	for _, id := range sortedKeys(prev) {
+		run, err := r.lux.Get(p.ctx, id)
+		if err != nil {
+			r.log.Error("reading an ended Lux Run for a lost host failed", "run", id, "error", err)
+			p.setError(ErrLux)
+			return false
+		}
+		p.considerEnded(*run, now)
+	}
+	return true
+}
+
+func (p *pass) considerEnded(run luxclient.Run, now time.Time) {
+	finished := now
+	if run.FinishedAt != nil {
+		finished = *run.FinishedAt
+	}
+	if now.Sub(finished) > hostLossHorizon {
 		return
 	}
-	next := now
-	for _, run := range p.live {
-		if run.CreatedAt.Before(next) {
-			next = run.CreatedAt
-		}
+	if l, ok := lostFromLabels(run.Labels); ok && p.r.rerunEligible(run.StateReason, l.attempt) {
+		p.r.queueLost(run.ID, finished, l)
 	}
-	r.lostCursor = next.Add(-lostCursorSkew)
-	for _, run := range runs {
-		finished := now
-		if run.FinishedAt != nil {
-			finished = *run.FinishedAt
-		}
-		if !hostLost(run.StateReason) || now.Sub(finished) > hostLossHorizon {
-			continue
-		}
-		l, ok := lostFromLabels(run.Labels)
-		if ok && r.rerunEligible(run.StateReason, l.attempt) {
-			r.queueLost(run.ID, finished, l)
-		}
-	}
-	maps.DeleteFunc(r.lostSeen, func(_ string, at time.Time) bool { return now.Sub(at) > hostLossHorizon })
 }
 
 // lostFromLabels reads a Run's job identity; a Run missing any of it is
@@ -166,11 +233,16 @@ func (p *pass) rerunLost() error {
 	r := p.r
 	p.discoverLost()
 	repos := map[int64]*repoView{}
-	stuck := map[string]bool{}
 	for _, v := range p.repos {
 		repos[v.id] = v
-		for _, j := range v.stuck {
-			stuck[jobKey(v, j.ID)] = true
+	}
+	// A sibling's Run still live (stopping, uploading its log) may end lost
+	// in a later pass; re-running now would start a new attempt it is not
+	// part of, so the workflow run waits for all of its Runs.
+	runLive := map[int64]bool{}
+	for _, run := range p.live {
+		if id, err := strconv.ParseInt(run.Labels[LabelRunID], 10, 64); err == nil {
+			runLive[id] = true
 		}
 	}
 	now := r.now()
@@ -187,8 +259,9 @@ func (p *pass) rerunLost() error {
 			continue
 		}
 		log := r.log.With("repository", v.full, "workflowRun", l.runID, "job", l.jobID, "attempt", l.attempt)
-		// A run listed active, or a job listed in_progress, is not completed.
-		if v.active[l.runID] || stuck[key] {
+		// A run listed active is not completed; one with a live Run may
+		// still lose a sibling.
+		if v.active[l.runID] || runLive[l.runID] {
 			continue
 		}
 		step, err := p.checkLost(v, l, log)
@@ -285,11 +358,29 @@ func failedOrCancelled(c *string) bool {
 	return c != nil && (*c == "failure" || *c == "cancelled")
 }
 
+// supersedable: only a push or pull_request run is replaced by a newer run of
+// its branch; a newer workflow_dispatch or schedule run may differ in inputs
+// or be unrelated. The listing is newest first, so any other id is newer.
+func supersedable(run githubapp.WorkflowRun) bool {
+	return run.HeadBranch != nil && *run.HeadBranch != "" && run.WorkflowID > 0 &&
+		(run.Event == "push" || run.Event == "pull_request")
+}
+
+// sameHead: pull_request runs of forks share branch names (main, patch-1),
+// so a newer run supersedes ours only from the same head repository.
+func sameHead(latest, run githubapp.WorkflowRun) bool {
+	if run.Event != "pull_request" {
+		return true
+	}
+	return latest.HeadRepository != nil && run.HeadRepository != nil && latest.HeadRepository.ID == run.HeadRepository.ID
+}
+
 // rerunRun re-runs the due lost jobs of workflow run runID, unless a newer
-// run of the same workflow, branch and event superseded it (a new push, or
-// concurrency cancel-in-progress). One job is re-run with jobs/{id}/rerun,
-// which also re-runs its dependents but not its siblings; several with
-// rerun-failed-jobs, which re-runs every failed or cancelled job of the run.
+// push or pull_request run of the same workflow, branch, event (and, for a
+// pull request, head repository) superseded it. One job is re-run with
+// jobs/{id}/rerun, which also re-runs its dependents but not its siblings;
+// several with rerun-failed-jobs, which re-runs every failed or cancelled job
+// of the run.
 func (p *pass) rerunRun(runID int64, keys []string, repos map[int64]*repoView) error {
 	r := p.r
 	first := r.lost[keys[0]]
@@ -305,7 +396,7 @@ func (p *pass) rerunRun(runID int64, keys []string, repos map[int64]*repoView) e
 			p.retryLost(k, log)
 		}
 	}
-	if run.HeadBranch != nil && *run.HeadBranch != "" && run.Event != "" && run.WorkflowID > 0 {
+	if supersedable(run) {
 		latest, ok, err := r.gh.LatestWorkflowRun(p.ctx, v.ref, run.WorkflowID, *run.HeadBranch, run.Event)
 		switch {
 		case p.rateLimited(err):
@@ -315,7 +406,7 @@ func (p *pass) rerunRun(runID int64, keys []string, repos map[int64]*repoView) e
 			p.setError(ErrGitHub)
 			retry()
 			return nil
-		case ok && latest.ID != runID && latest.RunNumber > run.RunNumber:
+		case ok && latest.ID != runID && sameHead(latest, run):
 			log.Info("workflow run was superseded by a newer run; not re-running it", "newerRun", latest.ID)
 			drop()
 			return nil

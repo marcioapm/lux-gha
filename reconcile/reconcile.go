@@ -78,6 +78,7 @@ type GitHub interface {
 type Lux interface {
 	Create(ctx context.Context, idempotencyKey string, spec luxclient.RunSpec) (*luxclient.Run, error)
 	Terminate(ctx context.Context, id string) (*luxclient.Run, error)
+	Get(ctx context.Context, id string) (*luxclient.Run, error)
 	List(ctx context.Context, labels map[string]string, states ...string) ([]luxclient.Run, error)
 	ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]luxclient.Run, error)
 }
@@ -153,6 +154,7 @@ type Reconciler struct {
 	lost             map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
 	lostSeen         map[string]time.Time   // Run id: lost Run already queued, by its end
 	lostCursor       time.Time              // discoverLost lists Runs created since; zero after a start
+	lostLive         map[string]bool        // Run id: live at the last discoverLost; nil makes the next one list
 	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
@@ -278,6 +280,9 @@ func (r *Reconciler) runPass(ctx context.Context, woken bool) Status {
 	start := r.now()
 	p := &pass{r: r, ctx: ctx, woken: woken, ended: map[string]bool{}, workflowRuns: map[int64]githubapp.WorkflowRun{},
 		st: Status{Time: start, Demand: map[string]int{}, Live: map[string]int{}}}
+	// A pass that ends before discoverLost may have created Runs that are
+	// in no lostLive set, so the next discovery lists instead.
+	p.lostPrev, r.lostLive = r.lostLive, nil
 	if start.Before(r.rateLimitedUntil) {
 		p.st.Error = ErrRateLimited
 	} else if err := p.run(); err != nil {
@@ -350,6 +355,8 @@ type pass struct {
 	unresolvedRoute map[string]int
 	// workflowRuns: workflow runs rerunLost read this pass, by id.
 	workflowRuns map[int64]githubapp.WorkflowRun
+	// lostPrev: the previous pass's lostLive, for discoverLost.
+	lostPrev map[string]bool
 }
 
 func (p *pass) fail(err error) {
