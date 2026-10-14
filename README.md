@@ -48,9 +48,12 @@ GitHub-hosted jobs), plus one per provisioned runner. A job whose Lux Run
 ended under it adds two or three more, once. A job lost to host loss adds
 one job read when it is found, one workflow-run read once its workflow run
 is no longer listed active, one workflow listing to check that the run was
-not superseded, and the re-run; nothing while it waits. Each pass also
-lists the instance's ended Lux Runs created since the oldest Run live in the
-previous pass
+not superseded, and the re-run; nothing while its workflow run is listed
+active (a run not listed because `maxJobsPerPass` truncated the
+`in_progress` listing costs one workflow-run read per pass while it waits).
+Each pass also reads each Lux Run that has ended since the previous pass,
+one `GET /v1/runs/{id}` per Run end, and sometimes lists the instance's
+ended Lux Runs
 ([When Lux stops a job](#when-lux-stops-a-job)). With a `repositories`
 list every listed repository is read every pass; size `interval` against the
 installation's hourly limit and the number of repositories. Without one, a
@@ -425,12 +428,20 @@ labels, any state; one Run per runner name). If the Run has ended:
   wrong, so the bridge re-runs it. On a preemption or drain the runner
   usually cancels the job itself within `stopGrace`, before its Run ends,
   so the bridge does not rely on seeing the job `in_progress`. Every pass
-  also lists the instance's Runs in `stopped`, `failed`, `terminated` or
-  `lost` (`GET /v1/runs?label=lux-gha/managed=<instance>&state=…&sort=created`)
-  created since the oldest Run live in the previous pass; Lux has no
-  `finishedAt` filter, and a Run that ends later was live then or is
-  created later. The first pass after a start reaches back 24 hours plus
-  the longest route `timeout`. A Run that lost its host, ended within the
+  reads each Run of the instance that was live in the previous pass and is
+  no longer live (`GET /v1/runs/{id}`, one request per Run end; Runs whose
+  `lux-gha/run-attempt` is past the bound are not read). Instead, a pass
+  lists the instance's Runs in `stopped`, `failed`, `terminated` or `lost`
+  (`GET /v1/runs?label=lux-gha/managed=<instance>&state=…&sort=created`)
+  created since the oldest Run live in the previous pass when it cannot rely
+  on that set: the first pass after a start, after a pass that failed before
+  this step or whose Lux read failed, and after a pass with a submission of
+  unknown outcome or an unread repository, whose Run may start and end
+  between two passes. Lux has no `finishedAt` filter, and a Run that ends
+  later was live then or is created later. The first pass after a start
+  reaches back 24 hours plus the longest route `timeout`. A listing past
+  the Lux client's page limit (20,000 Runs) is skipped with a `WARN`, and
+  host losses in it are not re-run. A Run that lost its host, ended within the
   last 24 hours and carries the `lux-gha/repo`, `lux-gha/job`,
   `lux-gha/run-id`, `lux-gha/run-attempt` and `lux-gha/runner` labels is a
   candidate. Once per candidate the bridge reads the job
@@ -440,21 +451,30 @@ labels, any state; one Run per runner name). If the Run has ended:
   the job fails this: the job ran on a later Run.
 
   The bridge waits while the workflow run is listed `queued` or
-  `in_progress`, then reads it once
+  `in_progress`, or while any of its Lux Runs is live (a sibling's runner
+  can still be uploading its log after the run completed), then reads it once
   (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`). It must be
-  `completed` with conclusion `failure` or `cancelled`. If a newer run of
-  the same workflow, branch and event exists
+  `completed` with conclusion `failure` or `cancelled`. For a `push` or
+  `pull_request` run, if a newer run of the same workflow, branch and event
+  exists
   (`GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?branch=…&event=…&per_page=1`),
-  the run was superseded (a new push, or `concurrency: cancel-in-progress`)
-  and is not re-run; a run with no head branch skips this check. The bridge
+  and for `pull_request` from the same head repository (forks share branch
+  names such as `main`), the run was superseded (a new push, or
+  `concurrency: cancel-in-progress`) and is not re-run. Runs of other
+  events (`workflow_dispatch` with other inputs, `schedule`) and runs with no
+  head branch skip this check. The bridge
   then calls `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`, which
   starts a new attempt that runs that job and the jobs that depend on it
-  again, but not its siblings. When several jobs of the same attempt were
-  lost, it calls `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`
+  again, but not its siblings. When several jobs of the same attempt are due
+  in the same pass, it calls `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`
   once instead, since after one job re-run the others are no longer in the
   latest attempt. That also re-runs any other failed or cancelled job of the
-  run. Re-runs are logged at `WARN`. `disk limit exceeded`, `timeout`,
-  `terminated` and any other reason are never re-run.
+  run. A sibling found only in a later pass, because reading its job failed
+  in the pass that re-ran the others, is not re-run. Re-runs are logged at
+  `WARN`. `disk limit exceeded`, `timeout`,
+  `terminated` (including `terminated; host lost`, a host lost while the
+  bridge or an operator terminated the Run) and any other reason are never
+  re-run.
 
   A person pressing Cancel on a run that was not superseded looks the same
   to the bridge as the runner's own cancel, so the job is re-run. That is
@@ -482,7 +502,8 @@ labels, any state; one Run per runner name). If the Run has ended:
   are used up (this was attempt N; lux-gha re-runs up to attempt M)." With
   `hostLossReruns: 0` it says "Automatic re-runs are off." and the job is
   left failed, as before. The hint can promise a re-run that is then not
-  made: the run succeeded, was superseded, or is gone.
+  made: the run succeeded, was superseded by a newer run, or is gone. The
+  check run is not updated in that case.
 
 `in_progress` workflow runs are listed before `queued` ones so a queued
 backlog cannot hide stopped jobs. Reading their Lux Runs has its own per-pass
