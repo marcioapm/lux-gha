@@ -201,11 +201,10 @@ func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) erro
 // cancelRun force-cancels workflow run runID and reports whether that is
 // settled (cancelled, or already completed). It is held back while the pass
 // did not list all of the run's jobs, or one of them is running on a runner
-// of this instance with a live Run. A queued sibling has no runner assigned
-// yet, so its fresh, idle Run does not hold the cancel back: the sibling is
-// cancelled with the workflow run before it started, so no job work is lost,
-// and its Run is reclaimed as surplus. Actions denied
-// or a GitHub error leaves it for a later pass, and a rate limit aborts.
+// of this instance with a live Run. A queued sibling has no runner yet, so its
+// idle Run does not hold the cancel back; it is cancelled before it starts and
+// its Run is reclaimed. Actions denied or a GitHub error leaves it for a later
+// pass, and a rate limit aborts.
 func (p *pass) cancelRun(v *repoView, runID int64, log *slog.Logger) (bool, error) {
 	if v.partial[runID] {
 		log.Info("not force-cancelling: the workflow run's jobs were not all listed this pass")

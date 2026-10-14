@@ -643,6 +643,11 @@ func TestCheckCompatibility(t *testing.T) {
 		{"Resources without size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"}}}`, Compatibility{Version: "v0.1.23"}},
 		{"size not a schema", `,"Resources":{"type":"object","properties":{"size":true}}`, Compatibility{Version: "v0.1.23"}},
 		{"Resources with size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"},"size":{"type":"string"}}}`, Compatibility{Version: "v0.1.23", Sizes: true}},
+		{"size as $ref", `,"Resources":{"type":"object","properties":{"size":{"$ref":"#/components/schemas/SizeName"}}}`, Compatibility{Version: "v0.1.23", Sizes: true}},
+		// luxd v0.1.24's own shape of the property.
+		{"size with description", `,"Resources":{"additionalProperties":false,"properties":{"cpus":{"format":"double","type":"number"},` +
+			`"size":{"description":"A size of a shaped pool's ladder (e.g. m-2-arm64; GET /v1/pools lists each pool's sizes).","type":"string"}},"type":"object"}`,
+			Compatibility{Version: "v0.1.23", Sizes: true}},
 	}
 	for _, tc := range sizeCases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -174,6 +174,29 @@ func TestRefusedJobsDoNotUseTheQueuedBudget(t *testing.T) {
 	}
 }
 
+// A refused job listed after the job that spends the last of the queued
+// budget stays demand, and its workflow run is not marked partially read,
+// so its pending cancel is retried.
+func TestRefusedJobAfterExhaustedBudgetIsStillClosed(t *testing.T) {
+	e := newEnv(t, withSizeRoute)
+	refuseKeptQueued(t, e)
+	// Job 6 is listed before job 7 in workflow run 70 and takes the one
+	// queued slot of maxJobsPerPass 2.
+	e.gh.queueIn(widgets, 70, 6, "queued", lux3...)
+	e.cfg.Reconcile.MaxJobsPerPass = 2
+	e.gh.fail = nil
+	st := e.pass()
+	if st.Provisioned != 1 || len(e.lux.liveForJob("6")) != 1 {
+		t.Fatalf("status %+v live %+v", st, e.lux.live())
+	}
+	if !slices.Equal(e.gh.cancels(), []int64{70}) || e.gh.job(7).conclusion != "cancelled" {
+		t.Fatalf("cancels %v job %+v", e.gh.cancels(), e.gh.job(7))
+	}
+	if e.lux.refusedCount() != 1 {
+		t.Fatalf("job 7 submitted again: refused %d", e.lux.refusedCount())
+	}
+}
+
 // A refused job's runner left registered by a failed delete holds no cap
 // slot, and orphan cleanup still deletes it.
 func TestLeftoverRunnerOfRefusedJobHoldsNoCapSlot(t *testing.T) {
