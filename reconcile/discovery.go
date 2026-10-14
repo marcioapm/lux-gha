@@ -175,7 +175,7 @@ func (p *pass) refreshRepositories() error {
 }
 
 // forgetRemoved drops what is remembered of a repository idleGrace after it
-// left the set, its stopped jobs included. Until then its registrations
+// left the set, its stopped and refused jobs included. Until then its registrations
 // keep holding cap slots: it can no longer be read, so they cannot be
 // resolved or deleted, and idleGrace is how long orphan cleanup holds one
 // in a readable repository.
@@ -209,6 +209,7 @@ func (p *pass) forgetRemoved() {
 			delete(d.gone, id)
 			prefix := r.runnerPrefix(id)
 			maps.DeleteFunc(r.stopped, func(name string, _ *stoppedRun) bool { return strings.HasPrefix(name, prefix) })
+			maps.DeleteFunc(r.refused, func(_ string, f *refusal) bool { return f.repoID == id })
 		}
 	}
 }

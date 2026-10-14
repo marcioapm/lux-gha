@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,12 +70,39 @@ type FileSecret struct {
 	Path  string
 }
 
-// Memory and Disk are bytes. Zero fields take luxd's defaults.
+// Memory and Disk are bytes. Zero fields take luxd's defaults on an
+// unshaped pool; on a shaped pool the given ones are rounded up to a size.
+// Size names a shaped pool's size and excludes CPUs, Memory and Disk.
 type Resources struct {
 	CPUs   float64 `json:"cpus,omitempty"`
 	Memory int64   `json:"memory,omitempty"`
 	Disk   int64   `json:"disk,omitempty"`
 	Pids   int64   `json:"pids,omitempty"`
+	Size   string  `json:"size,omitempty"`
+}
+
+// maxSizeName and sizeNameRe are the names luxd gives a shaped pool's sizes
+// (its internal/sizing): <family>-<cpus>-<arch>, the family a lowercase
+// slug, cpus "05" or a power of two in decimal, arch arm64 or amd64, at most
+// 63 bytes. luxd itself only looks a requested name up in the pool's ladder.
+const maxSizeName = 63
+
+var sizeNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-(05|[1-9][0-9]*)-(?:arm64|amd64)$`)
+
+// maxSizeCPUs is luxd's cap on a shape's CPUs, 2^53.
+const maxSizeCPUs = 1 << 53
+
+// ValidSizeName reports whether name is one luxd can give a size.
+func ValidSizeName(name string) bool {
+	m := sizeNameRe.FindStringSubmatch(name)
+	if m == nil || len(name) > maxSizeName {
+		return false
+	}
+	if m[1] == "05" {
+		return true
+	}
+	n, err := strconv.ParseUint(m[1], 10, 64)
+	return err == nil && n <= maxSizeCPUs && n&(n-1) == 0
 }
 
 // EgressRule is exactly one of Host (a name, or "*.<domain>") or CIDR.
@@ -196,6 +224,15 @@ func (s RunSpec) Validate() error {
 	r := s.Resources
 	if r.CPUs < 0 || r.Memory < 0 || r.Disk < 0 || r.Pids < 0 {
 		fail("resources must not be negative")
+	}
+	if r.Size != "" {
+		// luxd refuses this mix with 422 size_conflict.
+		if r.CPUs != 0 || r.Memory != 0 || r.Disk != 0 {
+			fail("resources.size excludes cpus, memory and disk")
+		}
+		if !ValidSizeName(r.Size) {
+			fail("resources.size is not a Lux size name")
+		}
 	}
 	for k, v := range s.Labels {
 		// Neither the key nor the value is quoted: either could hold a secret.

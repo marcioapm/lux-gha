@@ -582,7 +582,10 @@ type fakeLux struct {
 	failCreate    int      // fail the next n Creates before they reach state
 	failTerminate int      // fail the next n Terminates
 	noEcho        bool
-	onCreate      func(luxclient.Run)
+	// failCreateCode, when set, makes failCreate's failures a 422 with this
+	// code instead of a 503.
+	failCreateCode string
+	onCreate       func(luxclient.Run)
 	// lateCommit, when >= 0, makes the next Create answer a transport error
 	// while its Run stays pending; the pending Run commits at the
 	// (lateCommit+1)th List after that, or when its key is submitted again.
@@ -596,6 +599,10 @@ type fakeLux struct {
 	// in, as a Run that went live after the pass's live listing would be.
 	failRunnerList  int
 	runnerListState string
+	// sizes, when set, are each shaped pool's size names, as luxd resolves
+	// resources.size at submit: a pool absent from it is unshaped.
+	sizes   map[string][]string
+	refused int
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -637,9 +644,24 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 			return &run, nil
 		}
 	}
+	if size := spec.Resources.Size; size != "" && l.sizes != nil {
+		ladder, shaped := l.sizes[spec.Pool]
+		if !slices.Contains(ladder, size) {
+			code := "unknown_size"
+			if !shaped {
+				code = "size_unsupported"
+			}
+			l.refused++
+			l.mu.Unlock()
+			return nil, &luxclient.APIError{Op: "create run", Status: http.StatusUnprocessableEntity, Code: code}
+		}
+	}
 	if l.failCreate > 0 {
 		l.failCreate--
 		l.mu.Unlock()
+		if l.failCreateCode != "" {
+			return nil, &luxclient.APIError{Op: "create run", Status: http.StatusUnprocessableEntity, Code: l.failCreateCode}
+		}
 		return nil, &luxclient.APIError{Op: "create run", Status: 503}
 	}
 	r := l.newRun(key, spec)
@@ -813,4 +835,5 @@ func (l *fakeLux) terminatedIDs() []string {
 	return slices.Clone(l.terminated)
 }
 
-func (l *fakeLux) createCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.creates }
+func (l *fakeLux) createCount() int  { l.mu.Lock(); defer l.mu.Unlock(); return l.creates }
+func (l *fakeLux) refusedCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.refused }

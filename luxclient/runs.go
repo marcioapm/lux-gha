@@ -20,13 +20,21 @@ var MinVersion = [3]uint64{0, 1, 14}
 
 var releaseRe = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
+// Compatibility is what CheckCompatibility learned about a compatible luxd.
+type Compatibility struct {
+	Version string
+	// Sizes: the Resources schema declares size, so a Run may name one
+	// (luxd v0.1.24 and later). An older luxd answers it with a 400.
+	Sizes bool
+}
+
 // CheckCompatibility reads GET /openapi.json (unauthenticated in Lux) and
 // requires info.version to be a release tag vX.Y.Z >= MinVersion and the
 // RunSpec schema to declare resumePolicy. "dev", git-describe builds
 // (v0.1.16-1-gabc), prereleases and anything unparseable are refused.
 // The schema has no enum for resumePolicy, so presence alone does not prove
 // "never" support: the version gate is what does.
-func (c *Client) CheckCompatibility(ctx context.Context) (string, error) {
+func (c *Client) CheckCompatibility(ctx context.Context) (Compatibility, error) {
 	var doc struct {
 		Info struct {
 			Version string `json:"version"`
@@ -36,34 +44,42 @@ func (c *Client) CheckCompatibility(ctx context.Context) (string, error) {
 				RunSpec struct {
 					Properties map[string]json.RawMessage `json:"properties"`
 				} `json:"RunSpec"`
+				Resources struct {
+					Properties map[string]json.RawMessage `json:"properties"`
+				} `json:"Resources"`
 			} `json:"schemas"`
 		} `json:"components"`
 	}
 	if err := c.do(ctx, request{op: "openapi", method: http.MethodGet, path: "/openapi.json", anonymous: true, want: []int{http.StatusOK}}, &doc); err != nil {
-		return "", err
+		return Compatibility{}, err
 	}
 	v := doc.Info.Version
 	m := releaseRe.FindStringSubmatch(v)
 	if m == nil {
-		return "", fmt.Errorf("%w: version is not a release tag", ErrIncompatible)
+		return Compatibility{}, fmt.Errorf("%w: version is not a release tag", ErrIncompatible)
 	}
 	var got [3]uint64
 	for i := range got {
 		n, perr := strconv.ParseUint(m[i+1], 10, 64)
 		if perr != nil {
-			return "", fmt.Errorf("%w: version is not a release tag", ErrIncompatible)
+			return Compatibility{}, fmt.Errorf("%w: version is not a release tag", ErrIncompatible)
 		}
 		got[i] = n
 	}
 	if slices.Compare(got[:], MinVersion[:]) < 0 {
-		return "", fmt.Errorf("%w: version %s is older than v%d.%d.%d", ErrIncompatible, v, MinVersion[0], MinVersion[1], MinVersion[2])
+		return Compatibility{}, fmt.Errorf("%w: version %s is older than v%d.%d.%d", ErrIncompatible, v, MinVersion[0], MinVersion[1], MinVersion[2])
 	}
-	prop, ok := doc.Components.Schemas.RunSpec.Properties["resumePolicy"]
+	if !schemaProperty(doc.Components.Schemas.RunSpec.Properties, "resumePolicy") {
+		return Compatibility{}, fmt.Errorf("%w: RunSpec schema has no resumePolicy", ErrIncompatible)
+	}
+	return Compatibility{Version: v, Sizes: schemaProperty(doc.Components.Schemas.Resources.Properties, "size")}, nil
+}
+
+// schemaProperty reports whether props declares name as a schema object.
+func schemaProperty(props map[string]json.RawMessage, name string) bool {
+	prop, ok := props[name]
 	var obj map[string]json.RawMessage
-	if !ok || json.Unmarshal(prop, &obj) != nil {
-		return "", fmt.Errorf("%w: RunSpec schema has no resumePolicy", ErrIncompatible)
-	}
-	return v, nil
+	return ok && json.Unmarshal(prop, &obj) == nil
 }
 
 // Create submits spec with POST /v1/runs. idempotencyKey is required: Lux

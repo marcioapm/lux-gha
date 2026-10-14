@@ -242,6 +242,62 @@ func TestRouteSpecificCommandAndShape(t *testing.T) {
 	}
 }
 
+// rawRouteWire is the request body for job 7 on the default route, a route
+// with raw cpus, memoryMiB and diskGiB.
+const rawRouteWire = `{"name":"widgets · build-7","labels":{"app":"lux-gha","lux-gha/gen":"0","lux-gha/job":"7",` +
+	`"lux-gha/job-name":"build-7","lux-gha/managed":"t1","lux-gha/repo":"1001","lux-gha/repo-name":"acme/widgets",` +
+	`"lux-gha/route":"default","lux-gha/run-id":"70","lux-gha/runner":"lux-gha-t1-1001-7-0","lux-gha/sha":"000000000000"},` +
+	`"image":{"ref":"ghcr.io/acme/runner@sha256:abc"},"workload":{"adapter":"generic","command":["/usr/local/bin/lux-gha-runner"],"grace":"1m0s"},` +
+	`"env":{"LUXGHA_JITCONFIG_FILE":"/run/lux-gha/jitconfig"},` +
+	`"secrets":[{"name":"jitconfig","value":"SECRET-JIT-501-lux-gha-t1-1001-7-0","as":"file","path":"/run/lux-gha/jitconfig"}],` +
+	`"resources":{"cpus":2,"memory":4294967296,"disk":21474836480},"timeout":"1h30m0s","placement":{"pool":"gha"},` +
+	`"network":{"egress":[{"host":"github.com"},{"host":"*.actions.githubusercontent.com"}]},"sandbox":{},"resumePolicy":"never"}`
+
+func TestRawRouteRequestIsByteForByte(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", "self-hosted", "lux")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	r := e.lux.all()[0]
+	wire, err := json.Marshal(r.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wire) != rawRouteWire {
+		t.Fatalf("wire\n got: %s\nwant: %s", wire, rawRouteWire)
+	}
+}
+
+// withSizeRoute adds route "m-2", which asks the shaped pool for size
+// m-2-arm64 and serves runs-on: lux-m-2-arm64.
+var withSizeRoute = replace(`"routes": [`, `"routes": [
+    {"name": "m-2", "labels": ["lux-m-2-arm64"], "pool": "shaped",
+     "image": "ghcr.io/acme/runner@sha256:abc", "size": "m-2-arm64", "timeout": "1h", "unrestrictedEgress": true},`)
+
+func TestSizeRouteRequestsSizeAndNoRawResources(t *testing.T) {
+	e := newEnv(t, withSizeRoute)
+	e.gh.queue(7, "queued", "lux-m-2-arm64")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	r := e.lux.all()[0]
+	wire, err := json.Marshal(r.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w struct {
+		Resources map[string]any
+		Placement struct{ Pool string }
+	}
+	if err := json.Unmarshal(wire, &w); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Resources) != 1 || w.Resources["size"] != "m-2-arm64" || w.Placement.Pool != "shaped" || r.run.Labels[LabelRoute] != "m-2" {
+		t.Fatalf("wire %s", wire)
+	}
+}
+
 func TestRepeatedWakesAndStaleEventsNeverDuplicateARun(t *testing.T) {
 	e := newEnv(t)
 	e.gh.queue(7, "queued", lux3...)

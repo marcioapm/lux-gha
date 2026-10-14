@@ -69,12 +69,20 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 		return fmt.Errorf("lux client: %w", err)
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	version, err := lux.CheckCompatibility(checkCtx)
+	compat, err := lux.CheckCompatibility(checkCtx)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("lux compatibility: %w", err)
 	}
-	log.Info("lux compatible", "version", version)
+	if !compat.Sizes {
+		// An older luxd answers a size with a 400, which looks like an outage.
+		for _, route := range cfg.Routes {
+			if route.Size != "" {
+				return fmt.Errorf("lux compatibility: route %q asks for a size; luxd %s predates sizes (v0.1.24)", route.Name, compat.Version)
+			}
+		}
+	}
+	log.Info("lux compatible", "version", compat.Version, "sizes", compat.Sizes)
 
 	rec, err := reconcile.New(reconcile.Options{Config: cfg, GitHub: gh, Lux: lux, Host: u.Host, Log: log})
 	if err != nil {

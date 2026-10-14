@@ -277,6 +277,38 @@ func TestCreateIsNeverRetried(t *testing.T) {
 	})
 }
 
+func TestCreateSizeSendsOnlySize(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		jsonEqual(t, body, `{"image":{"ref":"img"},"workload":{"adapter":"generic","command":["run"]},
+			"resources":{"size":"m-2-arm64","pids":512},"placement":{"pool":"shaped"},"network":{},"sandbox":{},"resumePolicy":"never"}`)
+		writeJSON(w, http.StatusCreated, createdRun)
+	})
+	spec := RunSpec{ImageRef: "img", Command: []string{"run"}, Pool: "shaped", Resources: Resources{Size: "m-2-arm64", Pids: 512}}
+	if _, err := c.Create(context.Background(), "k", spec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The names a shape's ladder can have: luxd's internal/sizing builds
+// <family>-<cpus>-<arch> and accepts no other spelling.
+func TestValidSizeName(t *testing.T) {
+	long := strings.Repeat("f", maxSizeName-len("-1-arm64"))
+	for _, name := range []string{"m-05-arm64", "m-1-arm64", "m-2-arm64", "m-8-amd64", "c-1024-arm64", "gp-2-4-arm64",
+		"0-1-arm64", long + "-1-arm64", "m-9007199254740992-arm64"} {
+		if !ValidSizeName(name) {
+			t.Errorf("%q refused", name)
+		}
+	}
+	for _, name := range []string{"", "m-2", "m2-arm64", "M-2-arm64", "m-2-ARM64", "m-2-x86_64", "m-2-arm", "lux-m-2", "-m-2-arm64",
+		"m--2-arm64", "m- -2-arm64", "m-0.5-arm64", "m-005-arm64", "m-02-arm64", "m-0-arm64", "m-3-arm64", "m-6-arm64", "m-2.0-arm64",
+		"m-+2-arm64", " m-2-arm64", "m-2-arm64\n", "m_x-2-arm64", long + "f-1-arm64", "m-18014398509481984-arm64"} {
+		if ValidSizeName(name) {
+			t.Errorf("%q accepted", name)
+		}
+	}
+}
+
 func TestCreateRefusesBeforeSending(t *testing.T) {
 	var calls atomic.Int32
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
@@ -310,6 +342,10 @@ func TestCreateRefusesBeforeSending(t *testing.T) {
 		"label key starts -":  {"k", leak(func(s *RunSpec) { s.Labels["-x"] = "x" })},
 		"label key 65":        {"k", leak(func(s *RunSpec) { s.Labels["KEY-SENTINEL"+strings.Repeat("a", 65-len("KEY-SENTINEL"))] = "x" })},
 		"label value 257":     {"k", leak(func(s *RunSpec) { s.Labels["lux-gha/x"] = "VALUE-SENTINEL" + strings.Repeat("é", 128) })},
+		"size with cpus":      {"k", leak(func(s *RunSpec) { s.Resources = Resources{Size: "m-2-arm64", CPUs: 2} })},
+		"size with memory":    {"k", leak(func(s *RunSpec) { s.Resources = Resources{Size: "m-2-arm64", Memory: 1} })},
+		"size with disk":      {"k", leak(func(s *RunSpec) { s.Resources = Resources{Size: "m-2-arm64", Disk: 1} })},
+		"size bad name":       {"k", leak(func(s *RunSpec) { s.Resources = Resources{Size: "M-2-arm64"} })},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -588,12 +624,40 @@ func TestCheckCompatibility(t *testing.T) {
 				}
 				writeJSON(w, tc.status, tc.body)
 			})
-			v, err := c.CheckCompatibility(context.Background())
+			got, err := c.CheckCompatibility(context.Background())
 			if tc.ok != (err == nil) {
-				t.Fatalf("version %q err %v", v, err)
+				t.Fatalf("compatibility %+v err %v", got, err)
 			}
 			if tc.status == 200 && !tc.ok && !errors.Is(err, ErrIncompatible) && !strings.Contains(err.Error(), "malformed") {
 				t.Fatalf("err %v", err)
+			}
+		})
+	}
+	// Sizes is reported, never required: an older luxd stays compatible.
+	sizeCases := []struct {
+		name      string
+		resources string
+		want      Compatibility
+	}{
+		{"no Resources schema", "", Compatibility{Version: "v0.1.23"}},
+		{"Resources without size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"}}}`, Compatibility{Version: "v0.1.23"}},
+		{"size not a schema", `,"Resources":{"type":"object","properties":{"size":true}}`, Compatibility{Version: "v0.1.23"}},
+		{"Resources with size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"},"size":{"type":"string"}}}`, Compatibility{Version: "v0.1.23", Sizes: true}},
+		{"size as $ref", `,"Resources":{"type":"object","properties":{"size":{"$ref":"#/components/schemas/SizeName"}}}`, Compatibility{Version: "v0.1.23", Sizes: true}},
+		// luxd v0.1.24's own shape of the property.
+		{"size with description", `,"Resources":{"additionalProperties":false,"properties":{"cpus":{"format":"double","type":"number"},` +
+			`"size":{"description":"A size of a shaped pool's ladder (e.g. m-2-arm64; GET /v1/pools lists each pool's sizes).","type":"string"}},"type":"object"}`,
+			Compatibility{Version: "v0.1.23", Sizes: true}},
+	}
+	for _, tc := range sizeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, 200, `{"openapi":"3.1.0","info":{"version":"v0.1.23"},
+					"components":{"schemas":{"RunSpec":{"type":"object","properties":`+withResumePolicy+`}`+tc.resources+`}}}`)
+			})
+			got, err := c.CheckCompatibility(context.Background())
+			if err != nil || got != tc.want {
+				t.Fatalf("compatibility %+v err %v, want %+v", got, err, tc.want)
 			}
 		})
 	}

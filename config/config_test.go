@@ -98,6 +98,57 @@ func TestParseRejectsInvalidInputs(t *testing.T) {
 	}
 }
 
+// sizeRoute is a route on a shaped pool selected by its size label.
+const sizeRoute = `{"name": "m-2", "labels": ["lux-m-2-arm64"], "pool": "shaped",
+     "image": "ghcr.io/acme/runner@sha256:abc", "size": "m-2-arm64", "timeout": "1h"},
+    {"name": "docker"`
+
+func TestParseSizeRoute(t *testing.T) {
+	c, err := Parse(mutate(`{"name": "docker"`, sizeRoute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.MatchRoute([]string{"LUX-M-2-ARM64"})
+	if err != nil || r.Name != "m-2" || r.Size != "m-2-arm64" || r.CPUs != 0 || r.MemoryMiB != 0 || r.DiskGiB != 0 {
+		t.Fatalf("route %+v err=%v", r, err)
+	}
+	// Raw routes are unchanged and carry no size.
+	if c.Routes[0].Size != "" || c.Routes[0].CPUs != 2 {
+		t.Fatalf("raw route %+v", c.Routes[0])
+	}
+}
+
+func TestParseRejectsSizeWithRawResources(t *testing.T) {
+	for _, raw := range []string{`"cpus": 2`, `"memoryMiB": 4096`, `"diskGiB": 20`} {
+		_, err := Parse(mutate(`{"name": "docker"`, strings.Replace(sizeRoute, `"size": "m-2-arm64"`, `"size": "m-2-arm64", `+raw, 1)))
+		want := `route "m-2": size and cpus, memoryMiB or diskGiB are mutually exclusive`
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", raw, err, want)
+		}
+	}
+}
+
+func TestParseRejectsBadSizeName(t *testing.T) {
+	for _, name := range []string{"M-2-arm64", "m-2", "lux-m-2", "m-3-arm64", "m-0.5-arm64", "m-2-x86_64", strings.Repeat("m", 56) + "-2-arm64"} {
+		_, err := Parse(mutate(`{"name": "docker"`, strings.Replace(sizeRoute, `"m-2-arm64"`, `"`+name+`"`, 1)))
+		want := `route "m-2": size "` + name + `" is not a Lux size name`
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: err = %v, want %q", name, err, want)
+		}
+	}
+}
+
+func TestParseSizeRoutesAreCheckedForAmbiguity(t *testing.T) {
+	two := strings.Replace(sizeRoute, `{"name": "docker"`, `{"name": "m-4", "labels": ["lux-m-2-arm64", "big"], "pool": "shaped",
+     "image": "ghcr.io/acme/runner@sha256:abc", "size": "m-4-arm64", "timeout": "1h"},
+    {"name": "docker"`, 1)
+	_, err := Parse(mutate(`{"name": "docker"`, two))
+	want := `routes "m-2" and "m-4" are ambiguous`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
 func TestParseRejectsUnrestrictedEgressWithHosts(t *testing.T) {
 	_, err := Parse(mutate(`"egressHosts": [`, `"unrestrictedEgress": true, "egressHosts": [`))
 	want := `route "default": unrestrictedEgress and egressHosts are mutually exclusive`

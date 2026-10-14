@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/marcioapm/lux-gha/luxclient"
 )
 
 type Config struct {
@@ -91,12 +93,14 @@ type Lux struct {
 }
 
 // Route maps a set of runner labels to a Lux Run shape. A job uses the route
-// only when every label it requests is in Labels.
+// only when every label it requests is in Labels. Size names a shaped pool's
+// size and excludes CPUs, MemoryMiB and DiskGiB.
 type Route struct {
 	Name             string   `json:"name"`
 	Labels           []string `json:"labels"`
 	Pool             string   `json:"pool"`
 	Image            string   `json:"image"`
+	Size             string   `json:"size"`
 	CPUs             float64  `json:"cpus"`
 	MemoryMiB        int64    `json:"memoryMiB"`
 	DiskGiB          int64    `json:"diskGiB"`
@@ -300,6 +304,14 @@ func (c *Config) validate() error {
 		}
 		if r.CPUs < 0 || r.MemoryMiB < 0 || r.DiskGiB < 0 {
 			add("route %q: resources must not be negative", r.Name)
+		}
+		if r.Size != "" {
+			if r.CPUs != 0 || r.MemoryMiB != 0 || r.DiskGiB != 0 {
+				add("route %q: size and cpus, memoryMiB or diskGiB are mutually exclusive", r.Name)
+			}
+			if !luxclient.ValidSizeName(r.Size) {
+				add("route %q: size %q is not a Lux size name (<family>-<cpus>-<arch>, e.g. m-2-arm64)", r.Name, r.Size)
+			}
 		}
 		if r.Timeout.Duration <= 0 {
 			add("route %q: timeout must be positive", r.Name)

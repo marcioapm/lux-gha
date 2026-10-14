@@ -92,7 +92,8 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    `409` (a runner of that name already exists: the bridge stopped between JIT
    and Run submission) deletes that runner; the job is provisioned next pass.
    If Lux does not echo `resumePolicy: never`, the Run is terminated and
-   provisioning stops for the pass.
+   provisioning stops for the pass. If Lux refuses the Run's size, the job
+   fails at once and is not resubmitted ([Sizes](#sizes)).
    Every managed runner whose job was not looked at this way (cancelled,
    picked by another runner, or beyond `maxJobsPerPass`) is checked too: a
    live Run is counted, and a runner with no Run holds a slot against the
@@ -340,7 +341,7 @@ timers, which delays cleanup but never duplicates a Run.
 
 `GET /status` returns the last pass as JSON: `time`, `durationMs`, `error`
 (a category: `github_rate_limited`, `github`, `github_permission`, `lux`,
-`lux_resume_policy_not_echoed`, `lux_run_mismatch`), `rateLimitedUntil`, `demand` and `live` per
+`lux_resume_policy_not_echoed`, `lux_run_mismatch`, `lux_size_refused`), `rateLimitedUntil`, `demand` and `live` per
 route, `idle`, `busy`, and `provisioned`, `terminated`, `deleted`,
 `checkRuns` and `forceCancelled` in that pass. It holds no credentials or
 JIT configuration.
@@ -351,7 +352,7 @@ Lux can end a Run while its runner is running a job:
 
 | Lux `stateReason` (each with `; resumePolicy never`) | Cause |
 |---|---|
-| `disk limit exceeded` | The job wrote more than the route's `diskGiB`. Lux measures disk every 15 s, so a job can overshoot by that much before the stop. |
+| `disk limit exceeded` | The job wrote more than the route's `diskGiB`, or its `size`'s disk. Lux measures disk every 15 s, so a job can overshoot by that much before the stop. |
 | `timeout` | The Run reached the route's `timeout`. |
 | `preempt: not resumed (...)`, `drain: not resumed (...)` | A spot preemption or a force-evicting drain took the host. |
 | `host lost: missed heartbeats` | The host stopped answering. |
@@ -384,8 +385,9 @@ labels, any state; one Run per runner name). If the Run has ended:
   commit, with conclusion `failure`, title `Lux stopped job "<job name>":
   <reason>`, and a summary with the route, Lux Run id, state and reason,
   exit code, finish time, and a hint. For `disk limit exceeded` the hint
-  names the route with the next larger disk ("use a larger-disk profile
-  such as `<route>` ... or reduce disk use"). Its `external_id` is the Lux
+  names the raw route with the next larger disk ("use a larger-disk profile
+  such as `<route>` ... or reduce disk use"); on a size route it asks for a
+  larger size. Its `external_id` is the Lux
   Run id. Before posting, the bridge lists the commit's `lux-gha` check
   runs, so neither a later pass nor a restarted bridge posts it twice. A
   Run that ended `succeeded` (the job finished, and GitHub's listing lags)
@@ -399,8 +401,12 @@ labels, any state; one Run per runner name). If the Run has ended:
   run, not only the stuck one.** That is the trade-off for not waiting out
   the job's timeout. Queued siblings and siblings running on GitHub-hosted
   runners are cancelled too. It is never done while another listed job of the
-  workflow run holds a runner of this instance with a live Run, or when the
-  pass did not list all of the run's jobs. A job that completes on its own
+  workflow run is running on a runner of this instance with a live Run, or
+  when the pass did not list all of the run's jobs. The guard protects
+  siblings that are running a job: a queued sibling has no runner assigned,
+  so a fresh, idle Run provisioned for it does not hold the cancel back. That
+  sibling is cancelled before it started, so no job work is lost, and its Run
+  is reclaimed. A job that completes on its own
   within the grace is left alone.
 
 `in_progress` workflow runs are listed before `queued` ones so a queued
@@ -456,7 +462,10 @@ also starts rootless Docker first when the image has it.
     {"name": "default", "labels": ["self-hosted", "linux", "lux"], "pool": "gha",
      "image": "ghcr.io/acme/gha-runner@sha256:...", "cpus": 2, "memoryMiB": 4096, "diskGiB": 20,
      "timeout": "90m", "egressHosts": ["github.com", "*.actions.githubusercontent.com"],
-     "nestedContainers": false, "maxRunners": 10}
+     "nestedContainers": false, "maxRunners": 10},
+    {"name": "m-2", "labels": ["lux-m-2-arm64"], "pool": "gha-shaped",
+     "image": "ghcr.io/acme/gha-runner@sha256:...", "size": "m-2-arm64",
+     "timeout": "90m", "egressHosts": ["github.com", "*.actions.githubusercontent.com"]}
   ]
 }
 ```
@@ -465,6 +474,7 @@ also starts rootless Docker first when the image has it.
 - **`maxRunners`**: required global cap on live Runs. A route's optional `maxRunners` caps that route too.
 - **`reconcile`**: optional; the values shown are the defaults. `repositoryRefresh`, `hotWindow` and `coldSweep` apply only without `repositories` ([Repository discovery](#repository-discovery)): how often the installation's repositories are re-listed, how long a `queued` delivery keeps its repository read every tick pass while the runs API does not yet list its job (GitHub's lag between delivery and API), and the longest a cold repository goes unread. `coldSweep` should exceed `interval`; at or below it every repository is read every pass. `stopGrace` (15 s to 10 m) is each Run's Lux `workload.grace`, the time between SIGTERM and SIGKILL in which the runner cancels its job and uploads the log. Every stop of a runner Run, a surplus terminate included, can take that long. `stuckJobGrace` (30 s to 1 h) is how long a job may stay `in_progress` after its Run ended before its workflow run is force-cancelled ([When Lux stops a job](#when-lux-stops-a-job)).
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
+- **Resources** (route): either `size` or the raw `cpus`, `memoryMiB` and `diskGiB`, never both ([Sizes](#sizes)). Raw fields left out or `0` are not sent. On an unshaped pool, luxd's defaults fill them; on a shaped pool, the fields given are rounded up to the smallest size that covers all of them, and a route with none of them gets the pool's default size. `size` must be a name luxd can give a size: `<family>-<cpus>-<arch>`, the family a lowercase slug of `a-z`, `0-9` and `-` that starts and ends with a letter or digit, cpus `05` or a power of two, arch `arm64` or `amd64`, at most 63 characters.
 - **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.
 - **`runnerGroupID`**: required by `generate-jitconfig`. Read the repository's runner group ID from GitHub rather than assuming `1`.
@@ -472,6 +482,64 @@ also starts rootless Docker first when the image has it.
 - **Routing**: a job is routed only when **every** label it requests is in exactly one route's label set. Label comparison is case-insensitive. Configuration is rejected if one route's label set contains another's, because a job could then match both.
 - **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
+
+### Sizes
+
+A Lux pool with a shape (Lux `v0.1.24` or later) sizes every Run as a
+power-of-two fraction of one nominal host, named
+`<family>-<cpus>-<arch>`: for an 8-CPU `m` arm64 host, `m-05-arm64`
+(half a CPU), `m-1-arm64`, `m-2-arm64`, `m-4-arm64` and `m-8-arm64`.
+`lux pools sizes <pool>` lists a pool's sizes, and `GET /v1/pools` lists them
+as each pool's `sizes`.
+
+A route with `size` sends `resources.size` and no cpus, memory or disk; the
+Run gets that size's cpus, memory and disk. By convention its runner label is
+the size prefixed with `lux-`, so a job selects a size with
+`runs-on: lux-<family>-<cpus>-<arch>`:
+
+```yaml
+jobs:
+  build:
+    runs-on: lux-m-2-arm64
+```
+
+```json
+{"name": "m-2", "labels": ["lux-m-2-arm64"], "pool": "gha-shaped",
+ "image": "ghcr.io/acme/gha-runner@sha256:...", "size": "m-2-arm64", "timeout": "90m",
+ "egressHosts": ["github.com", "*.actions.githubusercontent.com"]}
+```
+
+The bridge does not derive routes from labels: each size a job may ask for
+needs its own route. The label is only a convention, and routes with sizes
+go through the same routing and ambiguity checks as any other.
+
+A route with raw `cpus`, `memoryMiB` and `diskGiB` works on any pool. On an
+unshaped pool the Run gets them as given. On a shaped pool Lux rounds them up
+to the smallest size covering every one given, so the Run can get more than
+the route asks for (on the pool above, `"cpus": 3` gets `m-4-arm64`).
+
+**When Lux refuses a size.** Lux answers `422` when the pool has no size of
+that name (`unknown_size`), the pool has no shape (`size_unsupported`), the
+raw resources exceed the largest size (`size_too_large`), or a size comes with
+cpus, memory or disk (`size_conflict`). Configuration validation rules out
+the last one. The same submission would be refused every time, so the bridge
+does not resubmit it:
+
+- it deletes the runner it registered for the job, and `GET /status` reports
+  `lux_size_refused` for that pass;
+- it posts a `lux-gha` check run on the job's commit with conclusion
+  `failure`, title `Lux refused job "<job name>": <code>`, the route, pool,
+  size and Lux error code, and what to change. Its `external_id` is
+  `job-<job id>`, so it is posted once;
+- it force-cancels the job's workflow run, under the same conditions as for
+  [a stopped job](#when-lux-stops-a-job): never while another listed job of
+  the run is running on a runner of this instance with a live Run, nor when
+  the pass did not list all of the run's jobs. A queued sibling's fresh, idle
+  Run does not hold it back; that sibling is cancelled before it started.
+
+The job is not submitted again while it stays queued. A restarted bridge
+submits it once more and is refused once more. Without Checks or Actions
+write, the check run or the force-cancel is skipped, as for stopped jobs.
 
 ## GitHub App permissions
 
@@ -521,6 +589,12 @@ Each submission sends `resumePolicy: "never"`. The client rejects a response tha
 Each submission also sends `workload.grace` (`reconcile.stopGrace`). Lux
 decodes RunSpecs strictly, and `workload.grace` is in its RunSpec from
 `v0.1.14`, so the minimum version is unchanged.
+
+A route with `size` sends `resources.size`, which Lux accepts from
+`v0.1.24`. The minimum version stays `v0.1.14` for raw routes, but if any
+route sets `size` and the `Resources` schema does not declare `size`, the
+bridge refuses to start: `lux compatibility: route "<name>" asks for a size;
+luxd <version> predates sizes (v0.1.24)`.
 
 A `never` Run ends `terminated` even when it succeeds. The outcome is in `exitCode` and `stateReason`, so `terminated` alone is not treated as failure.
 

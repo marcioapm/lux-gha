@@ -116,6 +116,7 @@ const (
 	ErrLux            = "lux"
 	ErrNeverNotEchoed = "lux_resume_policy_not_echoed"
 	ErrRunMismatch    = "lux_run_mismatch"
+	ErrSizeRefused    = "lux_size_refused"
 )
 
 type Reconciler struct {
@@ -140,6 +141,7 @@ type Reconciler struct {
 	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
 	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
 	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
+	refused          map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
 	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
@@ -167,6 +169,7 @@ func New(o Options) (*Reconciler, error) {
 		missingSince: map[string]time.Time{},
 		offlineSince: map[string]time.Time{},
 		stopped:      map[string]*stoppedRun{},
+		refused:      map[string]*refusal{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -406,7 +409,10 @@ func (p *pass) act() error {
 	if err := p.cleanUp(); err != nil {
 		return err
 	}
-	return p.closeStopped()
+	if err := p.closeStopped(); err != nil {
+		return err
+	}
+	return p.closeRefused()
 }
 
 // readGitHub reads each named repository. Every later step acts only on
@@ -543,12 +549,16 @@ func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 				continue
 			}
 			if _, seen := v.demand[j.ID]; !seen {
-				if p.budget <= 0 {
-					p.truncated = true
-					v.partial[runID] = true
-					return nil
+				// A refused job is kept as demand for closeRefused but is
+				// never provisioned, so it does not use the budget.
+				if p.r.refused[jobKey(v, j.ID)] == nil {
+					if p.budget <= 0 {
+						p.truncated = true
+						v.partial[runID] = true
+						return nil
+					}
+					p.budget--
 				}
-				p.budget--
 				v.demand[j.ID] = route
 				v.meta[j.ID] = newJobMeta(v.id, run, j)
 			}
@@ -602,6 +612,11 @@ func (p *pass) provision() error {
 				continue
 			}
 			classified[jobKey(v, jobID)] = true
+			if p.r.refused[jobKey(v, jobID)] != nil {
+				// Lux created no Run for it: a leftover runner holds no cap
+				// slot, and orphan cleanup deletes it.
+				continue
+			}
 			run, gen, err := p.classifyJob(v, jobID, route)
 			if err != nil {
 				return err
@@ -856,7 +871,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		Command:            route.Command,
 		Env:                map[string]string{JITConfigEnv: JITConfigPath},
 		Secrets:            []luxclient.FileSecret{{Name: jitSecretName, Value: jit.EncodedJITConfig, Path: JITConfigPath}},
-		Resources:          luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30},
+		Resources:          routeResources(route),
 		Timeout:            route.Timeout.Duration,
 		Grace:              r.cfg.Reconcile.StopGrace.Duration,
 		Pool:               route.Pool,
@@ -881,6 +896,10 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		p.setError(ErrNeverNotEchoed)
 		return nil, errAbort
 	}
+	if code, ok := sizeRefusal(err); ok {
+		// A 4xx: no Run exists, and the same submission is refused again.
+		return nil, p.refuse(j, code, name, jit.Runner.ID, log)
+	}
 	if err != nil {
 		// The outcome is unknown: the Run may still appear. Until it does or
 		// orphan cleanup deletes the runner, this job is not provisioned again.
@@ -895,6 +914,14 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
 	return run, nil
+}
+
+// routeResources is a size route's size, or a raw route's cpus, memory and disk.
+func routeResources(route *config.Route) luxclient.Resources {
+	if route.Size != "" {
+		return luxclient.Resources{Size: route.Size}
+	}
+	return luxclient.Resources{CPUs: route.CPUs, Memory: route.MemoryMiB << 20, Disk: route.DiskGiB << 30}
 }
 
 // carries reports whether run has the ownership labels and the gen and
