@@ -74,8 +74,8 @@ func TestHostLossRerunWaitsForTheWorkflowRunToComplete(t *testing.T) {
 	e.loseHost(1, hostLoss)
 	ops := countOps(e, nil)
 	st := e.pass()
-	if st.Rerun != 0 || st.Error != "" {
-		t.Fatalf("re-ran an in_progress workflow run: %+v ops %v", st, ops)
+	if st.Rerun != 0 || st.Error != "" || ops[opGetRun]+ops[opGetJob] != 0 {
+		t.Fatalf("read or re-ran an in_progress workflow run: %+v ops %v", st, ops)
 	}
 	_, reqs := e.gh.checks()
 	if len(reqs) != 1 || !strings.HasSuffix(reqs[0].Output.Summary,
