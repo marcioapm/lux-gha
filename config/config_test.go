@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -238,6 +239,35 @@ func TestStopGraceAndStuckJobGrace(t *testing.T) {
 	} {
 		if _, err := Parse(with(fields)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: err = %v, want %q", fields, err, want)
+		}
+	}
+}
+
+func TestHostLossReruns(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil || c.Reconcile.Reruns() != DefaultHostLossReruns || *c.Reconcile.HostLossReruns != 2 {
+		t.Fatalf("default: %+v err=%v", c, err)
+	}
+	if (Reconcile{}).Reruns() != 2 {
+		t.Fatal("unvalidated default")
+	}
+	with := func(n string) []byte {
+		return mutate(`"maxRunners": 10,`, `"maxRunners": 10, "reconcile": {"hostLossReruns": `+n+`},`)
+	}
+	for _, n := range []int{0, 1, 5} {
+		c, err := Parse(with(strconv.Itoa(n)))
+		if err != nil || c.Reconcile.Reruns() != n {
+			t.Errorf("%d: got %v err=%v", n, c, err)
+		}
+	}
+	for n, want := range map[string]string{
+		"-1":  "reconcile.hostLossReruns -1 must be between 0 and 5",
+		"6":   "reconcile.hostLossReruns 6 must be between 0 and 5",
+		`"2"`: "hostLossReruns",
+		"1.5": "hostLossReruns",
+	} {
+		if _, err := Parse(with(n)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", n, err, want)
 		}
 	}
 }

@@ -50,6 +50,18 @@ type Reconcile struct {
 	// StuckJobGrace is how long a job may stay in_progress after its
 	// runner's Run ended before its workflow run is force-cancelled.
 	StuckJobGrace Duration `json:"stuckJobGrace"`
+	// HostLossReruns bounds the attempts of a workflow run that lux-gha
+	// re-runs after a job lost its Run's host; 0 turns it off. A pointer,
+	// since an absent field takes DefaultHostLossReruns; validate sets it.
+	HostLossReruns *int `json:"hostLossReruns"`
+}
+
+// Reruns is HostLossReruns, or its default before validation.
+func (rc Reconcile) Reruns() int {
+	if rc.HostLossReruns == nil {
+		return DefaultHostLossReruns
+	}
+	return *rc.HostLossReruns
 }
 
 const (
@@ -62,6 +74,8 @@ const (
 	DefaultColdSweep         = 10 * time.Minute
 	DefaultStopGrace         = 60 * time.Second
 	DefaultStuckJobGrace     = 2 * time.Minute
+	DefaultHostLossReruns    = 2
+	MaxHostLossReruns        = 5
 )
 
 // Bounds of StopGrace and StuckJobGrace. Below MinStopGrace the runner
@@ -230,6 +244,11 @@ func (c *Config) validate() error {
 	if g := rc.StuckJobGrace.Duration; g < MinStuckJobGrace || g > MaxStuckJobGrace {
 		add("reconcile.stuckJobGrace %s must be between %s and %s", g, MinStuckJobGrace, MaxStuckJobGrace)
 	}
+	n := rc.Reruns()
+	if n < 0 || n > MaxHostLossReruns {
+		add("reconcile.hostLossReruns %d must be between 0 and %d", n, MaxHostLossReruns)
+	}
+	rc.HostLossReruns = &n
 	g := c.GitHub
 	if strings.TrimSpace(g.AppID) == "" {
 		add("github.appID is required")

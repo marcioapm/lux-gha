@@ -210,6 +210,7 @@ func (p *pass) forgetRemoved() {
 			prefix := r.runnerPrefix(id)
 			maps.DeleteFunc(r.stopped, func(name string, _ *stoppedRun) bool { return strings.HasPrefix(name, prefix) })
 			maps.DeleteFunc(r.refused, func(_ string, f *refusal) bool { return f.repoID == id })
+			maps.DeleteFunc(r.lost, func(_ string, l *lostJob) bool { return l.repoID == id })
 		}
 	}
 }

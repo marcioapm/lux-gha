@@ -99,7 +99,7 @@ func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 }
 
 func TestStuckJobIsForceCancelledOnceAfterStuckJobGrace(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, noReruns)
 	id := e.startJob(7)
 	e.lux.end(id, "host lost: missed heartbeats; resumePolicy never")
 	e.pass()
@@ -659,33 +659,39 @@ func TestPerRunnerLiveListingBlocksExplainAndCancel(t *testing.T) {
 }
 
 func TestStoppedHints(t *testing.T) {
+	const lost = "The Run's host was taken away (preemption, drain or loss); "
 	e := newEnv(t, bigDisk)
 	for _, tc := range []struct {
-		reason string
-		route  int
-		want   string
+		reason  string
+		route   int
+		attempt int64
+		want    string
 	}{
-		{"disk limit exceeded", 0, "The job wrote more than the route's 20 GiB disk: use a larger-disk profile such as `big` (runs-on: `linux, lux-big, self-hosted`, 40 GiB) or reduce disk use."},
-		{"disk limit exceeded", 1, "The job wrote more than the route's 40 GiB disk, the largest configured: reduce disk use."},
-		{"disk limit exceeded", -1, "The job wrote more than its disk limit: reduce disk use."},
-		{"timeout", 0, "The Run reached the route's Lux timeout (1h30m0s): shorten the job, or raise the route's timeout."},
-		{"preempt: not resumed (resumePolicy never)", 0, "The Run's host was taken away (preemption, drain or loss); re-run the job."},
-		{"drain: not resumed (resumePolicy never)", 0, "The Run's host was taken away (preemption, drain or loss); re-run the job."},
-		{"host lost: missed heartbeats", 0, "The Run's host was taken away (preemption, drain or loss); re-run the job."},
-		{"terminated", 0, "The Run was terminated through the Lux API."},
-		{"exit code 3", 0, ""},
+		{"disk limit exceeded", 0, 1, "The job wrote more than the route's 20 GiB disk: use a larger-disk profile such as `big` (runs-on: `linux, lux-big, self-hosted`, 40 GiB) or reduce disk use."},
+		{"disk limit exceeded", 1, 1, "The job wrote more than the route's 40 GiB disk, the largest configured: reduce disk use."},
+		{"disk limit exceeded", -1, 1, "The job wrote more than its disk limit: reduce disk use."},
+		{"timeout", 0, 1, "The Run reached the route's Lux timeout (1h30m0s): shorten the job, or raise the route's timeout."},
+		{"preempt: not resumed (resumePolicy never)", 0, 1, lost + "lux-gha re-runs the job automatically (attempt 2 of 3)."},
+		{"drain: not resumed (resumePolicy never)", 0, 2, lost + "lux-gha re-runs the job automatically (attempt 3 of 3)."},
+		{"host lost: missed heartbeats", 0, 3, lost + "re-run the job. Automatic re-runs are used up (this was attempt 3; lux-gha re-runs up to attempt 3)."},
+		{"terminated", 0, 1, "The Run was terminated through the Lux API."},
+		{"exit code 3", 0, 1, ""},
 	} {
-		t.Run(fmt.Sprintf("%s/%d", tc.reason, tc.route), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%d/%d", tc.reason, tc.route, tc.attempt), func(t *testing.T) {
 			var got string
 			if tc.route < 0 {
-				got = e.rec.hint(tc.reason, nil)
+				got = e.rec.hint(tc.reason, nil, tc.attempt)
 			} else {
-				got = e.rec.hint(tc.reason, &e.cfg.Routes[tc.route])
+				got = e.rec.hint(tc.reason, &e.cfg.Routes[tc.route], tc.attempt)
 			}
 			if got != tc.want {
 				t.Fatalf("got %q want %q", got, tc.want)
 			}
 		})
+	}
+	off := newEnv(t, bigDisk, noReruns)
+	if got, want := off.rec.hint("host lost", nil, 1), lost+"re-run the job. Automatic re-runs are off."; got != want {
+		t.Fatalf("off: got %q want %q", got, want)
 	}
 }
 
@@ -693,11 +699,11 @@ func TestStoppedHints(t *testing.T) {
 // names no route, and it is never offered as a larger-disk route.
 func TestStoppedHintsForSizeRoutes(t *testing.T) {
 	e := newEnv(t, bigDisk, withSizeRoute, replace(`"diskGiB": 20`, `"diskGiB": 10`))
-	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[0]),
+	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[0], 1),
 		"The job wrote more than size `m-2-arm64`'s disk: ask for a larger size in `runs-on` or reduce disk use."; got != want {
 		t.Fatalf("size route: got %q want %q", got, want)
 	}
-	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[1]),
+	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[1], 1),
 		"The job wrote more than the route's 10 GiB disk: use a larger-disk profile such as `big` (runs-on: `linux, lux-big, self-hosted`, 40 GiB) or reduce disk use."; got != want {
 		t.Fatalf("raw route: got %q want %q", got, want)
 	}

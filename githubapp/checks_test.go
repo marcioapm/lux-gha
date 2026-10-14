@@ -183,6 +183,123 @@ func TestForceCancelWorkflowRun(t *testing.T) {
 	}
 }
 
+func TestGetWorkflowRun(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/actions/runs/5":
+			w.Write([]byte(`{"id":5,"run_attempt":2,"status":"completed","conclusion":"cancelled"}`))
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/actions/runs/6":
+			w.Write([]byte(`{"id":6,"run_attempt":0,"status":"completed"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	run, err := c.GetWorkflowRun(context.Background(), repo, 5)
+	if err != nil || run.RunAttempt != 2 || *run.Status != "completed" || *run.Conclusion != "cancelled" {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	if _, err := c.GetWorkflowRun(context.Background(), repo, 6); err == nil {
+		t.Fatal("accepted run_attempt 0")
+	}
+	var apiErr *APIError
+	if _, err := c.GetWorkflowRun(context.Background(), repo, 7); !errors.As(err, &apiErr) || apiErr.StatusCode != 404 {
+		t.Fatalf("missing run: err=%v", err)
+	}
+	if _, err := c.GetWorkflowRun(context.Background(), repo, 0); err == nil {
+		t.Fatal("accepted run 0")
+	}
+}
+
+func TestRerunJob(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		switch r.URL.Path {
+		case "/repos/octo-org/app.repo/actions/jobs/5/rerun":
+			if r.Method != "POST" {
+				t.Errorf("method %s", r.Method)
+			}
+			w.WriteHeader(201)
+			w.Write([]byte(`{}`))
+		case "/repos/octo-org/app.repo/actions/jobs/6/rerun":
+			http.Error(w, `{"message":"This workflow is already running"}`, 403)
+		case "/repos/octo-org/app.repo/actions/jobs/7/rerun":
+			http.Error(w, `{"message":"Resource not accessible by integration"}`, 403)
+		case "/repos/octo-org/app.repo/actions/jobs/8/rerun":
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			http.Error(w, `{"message":"API rate limit exceeded; resource not accessible by integration"}`, 403)
+		case "/repos/octo-org/app.repo/actions/jobs/9/rerun":
+			http.Error(w, `{"message":"Unprocessable"}`, 422)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	if err := c.RerunJob(context.Background(), repo, 5); err != nil {
+		t.Fatal(err)
+	}
+	var apiErr *APIError
+	if err := c.RerunJob(context.Background(), repo, 6); !errors.As(err, &apiErr) || apiErr.StatusCode != 403 || apiErr.NotAccessible || apiErr.RateLimited {
+		t.Fatalf("refused: err=%+v", apiErr)
+	}
+	if err := c.RerunJob(context.Background(), repo, 7); !errors.As(err, &apiErr) || apiErr.StatusCode != 403 || !apiErr.NotAccessible || apiErr.RateLimited {
+		t.Fatalf("missing permission: err=%+v", apiErr)
+	}
+	if err := c.RerunJob(context.Background(), repo, 8); !errors.As(err, &apiErr) || !apiErr.RateLimited || apiErr.NotAccessible {
+		t.Fatalf("rate limit: err=%+v", apiErr)
+	}
+	if err := c.RerunJob(context.Background(), repo, 9); !errors.As(err, &apiErr) || apiErr.StatusCode != 422 {
+		t.Fatalf("unprocessable: err=%v", err)
+	}
+	if err := c.RerunJob(context.Background(), repo, 0); err == nil {
+		t.Fatal("accepted job 0")
+	}
+}
+
+func TestRerunFailedJobs(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		if r.Method == "POST" && r.URL.Path == "/repos/octo-org/app.repo/actions/runs/5/rerun-failed-jobs" {
+			w.WriteHeader(201)
+			w.Write([]byte(`{}`))
+			return
+		}
+		http.Error(w, `{"message":"Resource not accessible by integration"}`, 403)
+	})
+	if err := c.RerunFailedJobs(context.Background(), repo, 5); err != nil {
+		t.Fatal(err)
+	}
+	var apiErr *APIError
+	if err := c.RerunFailedJobs(context.Background(), repo, 6); !errors.As(err, &apiErr) || !apiErr.NotAccessible {
+		t.Fatalf("missing permission: err=%v", err)
+	}
+	if err := c.RerunFailedJobs(context.Background(), repo, 0); err == nil {
+		t.Fatal("accepted run 0")
+	}
+}
+
+func TestLatestWorkflowRun(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.URL.Path == "/repos/octo-org/app.repo/actions/workflows/3/runs" && q.Get("branch") == "feat/x" && q.Get("event") == "push" && q.Get("per_page") == "1":
+			w.Write([]byte(`{"total_count":9,"workflow_runs":[{"id":12,"run_number":4,"workflow_id":3}]}`))
+		case r.URL.Path == "/repos/octo-org/app.repo/actions/workflows/4/runs":
+			w.Write([]byte(`{"total_count":0,"workflow_runs":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	run, ok, err := c.LatestWorkflowRun(context.Background(), repo, 3, "feat/x", "push")
+	if err != nil || !ok || run.ID != 12 || run.RunNumber != 4 {
+		t.Fatalf("run=%+v ok=%t err=%v", run, ok, err)
+	}
+	if _, ok, err := c.LatestWorkflowRun(context.Background(), repo, 4, "main", "push"); err != nil || ok {
+		t.Fatalf("empty: ok=%t err=%v", ok, err)
+	}
+	if _, _, err := c.LatestWorkflowRun(context.Background(), repo, 3, "", "push"); err == nil {
+		t.Fatal("accepted an empty branch")
+	}
+}
+
 func TestCheckRunEndpointsReturnAPIErrors(t *testing.T) {
 	for _, status := range []int{403, 422} {
 		for _, method := range []string{"GET", "POST"} {

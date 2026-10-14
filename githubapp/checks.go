@@ -115,3 +115,72 @@ func (c *Client) ForceCancelWorkflowRun(ctx context.Context, repo Repository, ru
 	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodPost, path, nil, http.StatusAccepted, nil)
 	return err
 }
+
+// GetWorkflowRun is GET /repos/{owner}/{repo}/actions/runs/{id} (Actions:
+// read): the run's latest attempt, its run_attempt and status.
+func (c *Client) GetWorkflowRun(ctx context.Context, repo Repository, runID int64) (WorkflowRun, error) {
+	var out WorkflowRun
+	if runID <= 0 {
+		return out, errors.New("githubapp: run ID must be positive")
+	}
+	path, err := repo.path(fmt.Sprintf("/actions/runs/%d", runID))
+	if err != nil {
+		return out, err
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	if err == nil && (out.ID != runID || out.RunAttempt <= 0 || out.Status == nil) {
+		return WorkflowRun{}, errors.New("githubapp: invalid workflow run response")
+	}
+	return out, err
+}
+
+// RerunJob is POST /repos/{owner}/{repo}/actions/jobs/{id}/rerun (Actions:
+// write): it starts a new attempt of the job's workflow run that re-runs the
+// job and the jobs that depend on it, not its siblings. GitHub documents 201
+// and 403 only; callers handle 409/422 defensively.
+func (c *Client) RerunJob(ctx context.Context, repo Repository, jobID int64) error {
+	if jobID <= 0 {
+		return errors.New("githubapp: job ID must be positive")
+	}
+	return c.rerun(ctx, repo, fmt.Sprintf("/actions/jobs/%d/rerun", jobID))
+}
+
+// RerunFailedJobs is POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs
+// (Actions: write): one new attempt that re-runs every failed or cancelled
+// job of the run and the jobs that depend on them.
+func (c *Client) RerunFailedJobs(ctx context.Context, repo Repository, runID int64) error {
+	if runID <= 0 {
+		return errors.New("githubapp: run ID must be positive")
+	}
+	return c.rerun(ctx, repo, fmt.Sprintf("/actions/runs/%d/rerun-failed-jobs", runID))
+}
+
+func (c *Client) rerun(ctx context.Context, repo Repository, suffix string) error {
+	path, err := repo.path(suffix)
+	if err != nil {
+		return err
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodPost, path, nil, http.StatusCreated, nil)
+	return err
+}
+
+// LatestWorkflowRun is GET /repos/{owner}/{repo}/actions/workflows/{id}/runs
+// with branch and event and per_page=1: the newest run of the workflow for
+// that branch and event, or ok false when there is none.
+func (c *Client) LatestWorkflowRun(ctx context.Context, repo Repository, workflowID int64, branch, event string) (run WorkflowRun, ok bool, err error) {
+	if workflowID <= 0 || branch == "" || event == "" {
+		return run, false, errors.New("githubapp: workflow ID, branch and event are required")
+	}
+	q := url.Values{"branch": {branch}, "event": {event}, "per_page": {"1"}}
+	var page WorkflowRunPage
+	if _, err := c.list(ctx, repo, fmt.Sprintf("/actions/workflows/%d/runs", workflowID), q, &page); err != nil {
+		return run, false, err
+	}
+	if len(page.Runs) == 0 {
+		return run, false, nil
+	}
+	if page.Runs[0].ID <= 0 {
+		return run, false, errors.New("githubapp: invalid workflow run listing")
+	}
+	return page.Runs[0], true, nil
+}
