@@ -549,12 +549,17 @@ func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 				continue
 			}
 			if _, seen := v.demand[j.ID]; !seen {
-				if p.budget <= 0 {
+				// A refused job is kept as demand for closeRefused but is
+				// never provisioned, so it does not use the budget.
+				refused := p.r.refused[jobKey(v, j.ID)] != nil
+				if p.budget <= 0 && !refused {
 					p.truncated = true
 					v.partial[runID] = true
 					return nil
 				}
-				p.budget--
+				if !refused {
+					p.budget--
+				}
 				v.demand[j.ID] = route
 				v.meta[j.ID] = newJobMeta(v.id, run, j)
 			}
@@ -604,10 +609,15 @@ func (p *pass) provision() error {
 	for _, v := range p.repos {
 		for _, jobID := range sortedKeys(v.demand) {
 			route := v.demand[jobID]
-			if p.liveByJob[jobKey(v, jobID)] || p.r.refused[jobKey(v, jobID)] != nil {
+			if p.liveByJob[jobKey(v, jobID)] {
 				continue
 			}
 			classified[jobKey(v, jobID)] = true
+			if p.r.refused[jobKey(v, jobID)] != nil {
+				// Lux created no Run for it: a leftover runner holds no cap
+				// slot, and orphan cleanup deletes it.
+				continue
+			}
 			run, gen, err := p.classifyJob(v, jobID, route)
 			if err != nil {
 				return err

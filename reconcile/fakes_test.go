@@ -582,7 +582,10 @@ type fakeLux struct {
 	failCreate    int      // fail the next n Creates before they reach state
 	failTerminate int      // fail the next n Terminates
 	noEcho        bool
-	onCreate      func(luxclient.Run)
+	// failCreateCode, when set, makes failCreate's failures a 422 with this
+	// code instead of a 503.
+	failCreateCode string
+	onCreate       func(luxclient.Run)
 	// lateCommit, when >= 0, makes the next Create answer a transport error
 	// while its Run stays pending; the pending Run commits at the
 	// (lateCommit+1)th List after that, or when its key is submitted again.
@@ -653,6 +656,9 @@ func (l *fakeLux) Create(_ context.Context, key string, spec luxclient.RunSpec) 
 	if l.failCreate > 0 {
 		l.failCreate--
 		l.mu.Unlock()
+		if l.failCreateCode != "" {
+			return nil, &luxclient.APIError{Op: "create run", Status: http.StatusUnprocessableEntity, Code: l.failCreateCode}
+		}
 		return nil, &luxclient.APIError{Op: "create run", Status: 503}
 	}
 	r := l.newRun(key, spec)

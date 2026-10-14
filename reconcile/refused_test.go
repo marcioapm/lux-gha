@@ -132,3 +132,109 @@ func TestSizeRefusalCheckAndCancelRetryWithoutResubmitting(t *testing.T) {
 		t.Fatalf("checks %d cancels %v refused %d", len(checks), e.gh.cancels(), e.lux.refusedCount())
 	}
 }
+
+// refuseKeptQueued refuses job 7 with Actions write denied, so the job
+// stays queued with its refusal remembered.
+func refuseKeptQueued(t *testing.T, e *env) {
+	t.Helper()
+	e.lux.sizes = shapedPool
+	e.gh.fail = failOp(opCancel, 403)
+	e.gh.queue(7, "queued", "lux-m-2-arm64")
+	e.pass()
+	if e.lux.refusedCount() != 1 || len(e.rec.refused) != 1 || e.gh.job(7).status != "queued" {
+		t.Fatalf("refused %d records %d job %+v", e.lux.refusedCount(), len(e.rec.refused), e.gh.job(7))
+	}
+}
+
+func TestRemovedRepositoryForgetsRefusals(t *testing.T) {
+	e := newDiscoveryEnv(t, 0, withSizeRoute)
+	refuseKeptQueued(t, e)
+	e.gh.repo(widgets).uninstalled = true
+	e.rec.RequestRepositoryRefresh()
+	e.pass()
+	e.clock.Add(e.cfg.Reconcile.IdleGrace.Duration)
+	e.pass()
+	if len(e.rec.refused) != 0 {
+		t.Fatalf("removed repository retained %d refusals", len(e.rec.refused))
+	}
+}
+
+// Refused jobs stay demand but take none of the queued budget, so a job
+// listed after them is still provisioned.
+func TestRefusedJobsDoNotUseTheQueuedBudget(t *testing.T) {
+	e := newEnv(t, withSizeRoute, replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"maxJobsPerPass": 2}`))
+	refuseKeptQueued(t, e)
+	e.gh.queue(8, "queued", lux3...)
+	st := e.pass()
+	if st.Provisioned != 1 || len(e.lux.liveForJob("8")) != 1 {
+		t.Fatalf("status %+v live %+v", st, e.lux.live())
+	}
+	if e.lux.refusedCount() != 1 || len(e.rec.refused) != 1 {
+		t.Fatalf("refused %d records %d", e.lux.refusedCount(), len(e.rec.refused))
+	}
+}
+
+// A refused job's runner left registered by a failed delete holds no cap
+// slot, and orphan cleanup still deletes it.
+func TestLeftoverRunnerOfRefusedJobHoldsNoCapSlot(t *testing.T) {
+	e := newEnv(t, withSizeRoute, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	e.lux.sizes = shapedPool
+	e.gh.fail = func(op, _ string, _ int) error {
+		switch op {
+		case opCancel:
+			return &githubapp.APIError{StatusCode: 403}
+		case opDelete:
+			return &githubapp.APIError{StatusCode: 500}
+		}
+		return nil
+	}
+	e.gh.queue(7, "queued", "lux-m-2-arm64")
+	e.pass()
+	if e.lux.refusedCount() != 1 || !slices.Contains(e.gh.runnerNames(), runner("7", 0)) {
+		t.Fatalf("refused %d runners %v", e.lux.refusedCount(), e.gh.runnerNames())
+	}
+	e.gh.queue(8, "queued", lux3...)
+	if st := e.pass(); st.Provisioned != 1 || len(e.lux.liveForJob("8")) != 1 {
+		t.Fatalf("status %+v live %+v", st, e.lux.live())
+	}
+	e.gh.fail = failOp(opCancel, 403)
+	e.clock.Add(e.cfg.Reconcile.IdleGrace.Duration)
+	e.pass()
+	if !slices.Equal(e.gh.deletedNames(), []string{runner("7", 0)}) || e.lux.refusedCount() != 1 {
+		t.Fatalf("deleted %v refused %d", e.gh.deletedNames(), e.lux.refusedCount())
+	}
+}
+
+// A pass truncated before job 7 keeps its refusal, so the next complete
+// pass does not submit it again.
+func TestTruncatedPassKeepsRefusal(t *testing.T) {
+	e := newEnv(t, withSizeRoute)
+	refuseKeptQueued(t, e)
+	// An earlier workflow run's jobs use the whole queued budget.
+	e.gh.queueIn(widgets, 10, 1, "queued", lux3...)
+	e.gh.queueIn(widgets, 10, 2, "queued", lux3...)
+	e.cfg.Reconcile.MaxJobsPerPass = 2
+	e.pass()
+	e.cfg.Reconcile.MaxJobsPerPass = 200
+	e.pass()
+	if e.lux.refusedCount() != 1 {
+		t.Fatalf("job 7 submitted again: refused %d", e.lux.refusedCount())
+	}
+}
+
+// A 422 with a code other than a size refusal leaves the outcome unknown:
+// the runner is kept for orphan cleanup, and the job is neither explained
+// nor cancelled.
+func TestNonSize422KeepsUnknownOutcomePath(t *testing.T) {
+	e := newEnv(t)
+	e.lux.failCreate = 1
+	e.lux.failCreateCode = "invalid_spec"
+	e.gh.queue(7, "queued", lux3...)
+	st := e.pass()
+	if st.Error != ErrLux || !slices.Contains(e.gh.runnerNames(), runner("7", 0)) || len(e.gh.deletedNames()) != 0 {
+		t.Fatalf("status %+v runners %v deleted %v", st, e.gh.runnerNames(), e.gh.deletedNames())
+	}
+	if checks, _ := e.gh.checks(); len(checks) != 0 || len(e.gh.cancels()) != 0 || len(e.rec.refused) != 0 {
+		t.Fatalf("checks %d cancels %v refusals %d", len(checks), e.gh.cancels(), len(e.rec.refused))
+	}
+}
