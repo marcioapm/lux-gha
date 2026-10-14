@@ -34,6 +34,9 @@ type fakeJob struct {
 	name       string // defaults to build-<id>
 	workflow   string // workflow_name; empty sends null
 	attempt    int64
+	// superseded: a later attempt re-runs this job under a new id; the
+	// latest-attempt listing leaves it out.
+	superseded bool
 }
 
 // fakeRepo is one repository's Actions state.
@@ -67,7 +70,10 @@ const (
 	opCreateCheck = "create-check"
 	opCancel      = "force-cancel"
 	opGetRun      = "get-run"
+	opGetJob      = "get-job"
+	opLatestRun   = "latest-run"
 	opRerun       = "rerun"
+	opRerunFailed = "rerun-failed"
 )
 
 // fakeGitHub models one installation's repositories: workflow jobs with
@@ -102,13 +108,14 @@ type fakeGitHub struct {
 	// beforeDelete runs once, under the lock, before the next runner deletion.
 	beforeDelete func()
 	checkOutputs []githubapp.CheckRunRequest
-	reruns       []int64 // job ids re-run
+	reruns       []int64         // job ids re-run
+	replaced     map[int64]int64 // re-run job id: the id of its new attempt
 }
 
 const widgets = "acme/widgets"
 
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
-	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2, reads: map[string]int{}}
+	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2, reads: map[string]int{}, replaced: map[int64]int64{}}
 	f.addRepo(widgets, 1001)
 	return f
 }
@@ -151,7 +158,7 @@ func (f *fakeGitHub) GetRepository(_ context.Context, repo githubapp.Repository)
 func (r *fakeRepo) runStatus(runID int64) string {
 	var queued, active, done int
 	for _, j := range r.jobs {
-		if j.runID != runID {
+		if j.runID != runID || j.superseded {
 			continue
 		}
 		switch j.status {
@@ -221,7 +228,7 @@ func (f *fakeGitHub) ListWorkflowRunJobs(_ context.Context, repo githubapp.Repos
 	var jobs []githubapp.WorkflowJob
 	for _, id := range sortedKeys(r.jobs) {
 		j := r.jobs[id]
-		if j.runID != runID {
+		if j.runID != runID || j.superseded {
 			continue
 		}
 		out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, Status: j.status, Labels: j.labels,
@@ -414,7 +421,7 @@ func (f *fakeGitHub) ForceCancelWorkflowRun(_ context.Context, repo githubapp.Re
 }
 
 // GetWorkflowRun reports the run's latest attempt (its jobs' highest) and
-// the status derived from its jobs.
+// the status derived from its jobs, with what describeRun set.
 func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository, runID int64) (githubapp.WorkflowRun, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -422,7 +429,8 @@ func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository
 	if err != nil {
 		return githubapp.WorkflowRun{}, err
 	}
-	run := githubapp.WorkflowRun{ID: runID}
+	run := r.runs[runID]
+	run.ID, run.RunAttempt = runID, 0
 	for _, j := range r.jobs {
 		if j.runID == runID {
 			run.RunAttempt = max(run.RunAttempt, attemptOf(j))
@@ -437,7 +445,7 @@ func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository
 	if s == "completed" {
 		c := "success"
 		for _, j := range r.jobs {
-			if j.runID == runID && (j.conclusion == "failure" || j.conclusion == "cancelled" && c != "failure") {
+			if j.runID == runID && !j.superseded && (j.conclusion == "failure" || j.conclusion == "cancelled" && c != "failure") {
 				c = j.conclusion
 			}
 		}
@@ -446,8 +454,49 @@ func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository
 	return run, nil
 }
 
-// RerunJob starts the run's next attempt with the job queued again; GitHub
-// refuses a run that is not completed with 403 "already running".
+func (f *fakeGitHub) GetWorkflowJob(_ context.Context, repo githubapp.Repository, jobID int64) (githubapp.WorkflowJob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opGetJob, repo, 0)
+	if err != nil {
+		return githubapp.WorkflowJob{}, err
+	}
+	j := r.jobs[jobID]
+	if j == nil {
+		return githubapp.WorkflowJob{}, &githubapp.APIError{StatusCode: http.StatusNotFound}
+	}
+	out := githubapp.WorkflowJob{ID: j.id, RunID: j.runID, RunAttempt: attemptOf(j), Status: j.status}
+	if j.conclusion != "" {
+		c := j.conclusion
+		out.Conclusion = &c
+	}
+	if j.runner != "" {
+		name := j.runner
+		out.RunnerName = &name
+	}
+	return out, nil
+}
+
+// LatestWorkflowRun returns the described run of the workflow, branch and
+// event with the highest run number.
+func (f *fakeGitHub) LatestWorkflowRun(_ context.Context, repo githubapp.Repository, workflowID int64, branch, event string) (githubapp.WorkflowRun, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opLatestRun, repo, 0)
+	if err != nil {
+		return githubapp.WorkflowRun{}, false, err
+	}
+	var latest githubapp.WorkflowRun
+	for _, run := range r.runs {
+		if run.WorkflowID == workflowID && run.HeadBranch != nil && *run.HeadBranch == branch && run.Event == event && run.RunNumber > latest.RunNumber {
+			latest = run
+		}
+	}
+	return latest, latest.ID != 0, nil
+}
+
+// RerunJob starts the run's next attempt with the job queued again under a
+// new id, as GitHub does; it refuses a run that is not completed with a 403.
 func (f *fakeGitHub) RerunJob(_ context.Context, repo githubapp.Repository, jobID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -456,23 +505,65 @@ func (f *fakeGitHub) RerunJob(_ context.Context, repo githubapp.Repository, jobI
 		return err
 	}
 	j := r.jobs[jobID]
-	if j == nil {
+	if j == nil || j.superseded {
 		return &githubapp.APIError{StatusCode: http.StatusNotFound}
 	}
 	if r.runStatus(j.runID) != "completed" {
-		return &githubapp.APIError{StatusCode: http.StatusForbidden, Already: true}
+		return &githubapp.APIError{StatusCode: http.StatusForbidden}
 	}
 	f.reruns = append(f.reruns, jobID)
-	for _, o := range r.jobs {
-		if o.runID == j.runID {
-			o.attempt = attemptOf(o) + 1
-		}
-	}
-	j.status, j.conclusion, j.runner, j.runnerID = "queued", "", "", 0
+	f.newAttempt(r, j.runID, []*fakeJob{j})
 	return nil
 }
 
+// RerunFailedJobs re-runs every failed or cancelled job of a completed run
+// in one new attempt.
+func (f *fakeGitHub) RerunFailedJobs(_ context.Context, repo githubapp.Repository, runID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opRerunFailed, repo, 0)
+	if err != nil {
+		return err
+	}
+	if r.runStatus(runID) != "completed" {
+		return &githubapp.APIError{StatusCode: http.StatusForbidden}
+	}
+	var failed []*fakeJob
+	for _, id := range sortedKeys(r.jobs) {
+		j := r.jobs[id]
+		if j.runID == runID && !j.superseded && (j.conclusion == "failure" || j.conclusion == "cancelled") {
+			failed = append(failed, j)
+			f.reruns = append(f.reruns, id)
+		}
+	}
+	f.newAttempt(r, runID, failed)
+	return nil
+}
+
+// newAttempt moves every job of the run to the next attempt; each re-run job
+// is replaced by a queued copy with a new id. The caller holds mu.
+func (f *fakeGitHub) newAttempt(r *fakeRepo, runID int64, rerun []*fakeJob) {
+	for _, o := range r.jobs {
+		if o.runID == runID && !o.superseded {
+			o.attempt = attemptOf(o) + 1
+		}
+	}
+	for _, j := range rerun {
+		f.nextID++
+		r.jobs[f.nextID] = &fakeJob{id: f.nextID, runID: runID, status: "queued", labels: j.labels, name: j.name, workflow: j.workflow, attempt: j.attempt}
+		j.superseded, j.attempt = true, j.attempt-1
+		f.replaced[j.id] = f.nextID
+	}
+}
+
 func attemptOf(j *fakeJob) int64 { return max(j.attempt, 1) }
+
+// rerunOf returns the id of the job that re-runs jobID, or 0.
+func (f *fakeGitHub) rerunOf(jobID int64) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.replaced[jobID]
+}
 
 func (f *fakeGitHub) rerunJobs() []int64 {
 	f.mu.Lock()
@@ -673,6 +764,10 @@ type fakeLux struct {
 	// resources.size at submit: a pool absent from it is unshaped.
 	sizes   map[string][]string
 	refused int
+	// sinceLists records each ListCreatedSince's since; failSinceList
+	// fails them.
+	sinceLists    []time.Time
+	failSinceList bool
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -821,6 +916,25 @@ func (l *fakeLux) List(_ context.Context, labels map[string]string, states ...st
 	}
 	l.mu.Unlock()
 	return out, nil
+}
+
+// ListCreatedSince is List of the Runs created at or after since.
+func (l *fakeLux) ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]luxclient.Run, error) {
+	l.mu.Lock()
+	l.sinceLists = append(l.sinceLists, since)
+	fail := l.failSinceList
+	l.mu.Unlock()
+	if fail {
+		return nil, &luxclient.APIError{Op: "list runs", Status: 503}
+	}
+	runs, err := l.List(ctx, labels, states...)
+	return slices.DeleteFunc(runs, func(r luxclient.Run) bool { return r.CreatedAt.Before(since) }), err
+}
+
+func (l *fakeLux) sinceListCalls() []time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.sinceLists)
 }
 
 // seed stores a Run under key as if another client had submitted it.

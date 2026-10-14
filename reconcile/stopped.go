@@ -55,14 +55,14 @@ func (p *pass) closeStopped() error {
 					continue
 				}
 				// A Run without finishedAt counts from when it was seen ended.
-				s = &stoppedRun{run: *run, finished: r.now(), rerunEligible: r.rerunEligible(run.StateReason, j.RunAttempt)}
+				s = &stoppedRun{run: *run, finished: r.now()}
 				if run.FinishedAt != nil {
 					s.finished = *run.FinishedAt
 				}
 				r.stopped[name] = s
-				// Queued once per Run; rerunLost drops it when settled.
-				if s.rerunEligible {
-					r.lost[jobKey(v, j.ID)] = &lostJob{repoID: v.id, jobID: j.ID, runID: j.RunID, attempt: j.RunAttempt}
+				// The job ran on this Run's runner, so it needs no check.
+				if r.rerunEligible(run.StateReason, j.RunAttempt) {
+					r.queueLost(run.ID, s.finished, &lostJob{repoID: v.id, jobID: j.ID, runID: j.RunID, attempt: j.RunAttempt, runner: name, verified: true})
 				}
 			}
 			observed[name] = true
@@ -85,13 +85,10 @@ func (p *pass) closeStopped() error {
 
 // stoppedRun is the ended Run of a runner whose job is still in_progress,
 // and what was done about it. A resumePolicy never Run stays ended.
-// rerunEligible: the Run's host was lost and the job's attempt is within
-// reconcile.hostLossReruns, so the job is queued for rerunLost.
 type stoppedRun struct {
 	run                  luxclient.Run
 	finished             time.Time
 	explained, cancelled bool
-	rerunEligible        bool
 }
 
 // endedRun reads the Runs labelled with the runner's name, in any state:
@@ -344,7 +341,7 @@ func (r *Reconciler) hint(reason string, route *config.Route, attempt int64) str
 		case n == 0:
 			return "The Run's host was taken away (preemption, drain or loss); re-run the job. Automatic re-runs are off."
 		}
-		return fmt.Sprintf("The Run's host was taken away (preemption, drain or loss); re-run the job. Automatic re-runs are used up (%d attempts).", n+1)
+		return fmt.Sprintf("The Run's host was taken away (preemption, drain or loss); re-run the job. Automatic re-runs are used up (this was attempt %d; lux-gha re-runs up to attempt %d).", attempt, n+1)
 	case strings.HasPrefix(reason, "terminated"):
 		return "The Run was terminated through the Lux API."
 	}

@@ -673,7 +673,7 @@ func TestStoppedHints(t *testing.T) {
 		{"timeout", 0, 1, "The Run reached the route's Lux timeout (1h30m0s): shorten the job, or raise the route's timeout."},
 		{"preempt: not resumed (resumePolicy never)", 0, 1, lost + "lux-gha re-runs the job automatically (attempt 2 of 3)."},
 		{"drain: not resumed (resumePolicy never)", 0, 2, lost + "lux-gha re-runs the job automatically (attempt 3 of 3)."},
-		{"host lost: missed heartbeats", 0, 3, lost + "re-run the job. Automatic re-runs are used up (3 attempts)."},
+		{"host lost: missed heartbeats", 0, 3, lost + "re-run the job. Automatic re-runs are used up (this was attempt 3; lux-gha re-runs up to attempt 3)."},
 		{"terminated", 0, 1, "The Run was terminated through the Lux API."},
 		{"exit code 3", 0, 1, ""},
 	} {

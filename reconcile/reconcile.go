@@ -69,13 +69,17 @@ type GitHub interface {
 	ListCheckRunsForRef(context.Context, githubapp.Repository, string, githubapp.CheckRunListOptions) (githubapp.CheckRunPage, error)
 	ForceCancelWorkflowRun(context.Context, githubapp.Repository, int64) error
 	GetWorkflowRun(context.Context, githubapp.Repository, int64) (githubapp.WorkflowRun, error)
+	GetWorkflowJob(context.Context, githubapp.Repository, int64) (githubapp.WorkflowJob, error)
+	LatestWorkflowRun(ctx context.Context, repo githubapp.Repository, workflowID int64, branch, event string) (githubapp.WorkflowRun, bool, error)
 	RerunJob(context.Context, githubapp.Repository, int64) error
+	RerunFailedJobs(context.Context, githubapp.Repository, int64) error
 }
 
 type Lux interface {
 	Create(ctx context.Context, idempotencyKey string, spec luxclient.RunSpec) (*luxclient.Run, error)
 	Terminate(ctx context.Context, id string) (*luxclient.Run, error)
 	List(ctx context.Context, labels map[string]string, states ...string) ([]luxclient.Run, error)
+	ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]luxclient.Run, error)
 }
 
 type Options struct {
@@ -147,6 +151,8 @@ type Reconciler struct {
 	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
 	refused          map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
 	lost             map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
+	lostSeen         map[string]time.Time   // Run id: lost Run already queued, by its end
+	lostCursor       time.Time              // discoverLost lists Runs created since; zero after a start
 	disc             *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
@@ -176,6 +182,7 @@ func New(o Options) (*Reconciler, error) {
 		stopped:      map[string]*stoppedRun{},
 		refused:      map[string]*refusal{},
 		lost:         map[string]*lostJob{},
+		lostSeen:     map[string]time.Time{},
 		ticker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -269,7 +276,8 @@ func (r *Reconciler) Pass(ctx context.Context) Status {
 // list, woken and tick passes are the same.
 func (r *Reconciler) runPass(ctx context.Context, woken bool) Status {
 	start := r.now()
-	p := &pass{r: r, ctx: ctx, woken: woken, ended: map[string]bool{}, st: Status{Time: start, Demand: map[string]int{}, Live: map[string]int{}}}
+	p := &pass{r: r, ctx: ctx, woken: woken, ended: map[string]bool{}, workflowRuns: map[int64]githubapp.WorkflowRun{},
+		st: Status{Time: start, Demand: map[string]int{}, Live: map[string]int{}}}
 	if start.Before(r.rateLimitedUntil) {
 		p.st.Error = ErrRateLimited
 	} else if err := p.run(); err != nil {
@@ -301,10 +309,12 @@ type repoView struct {
 	// stuck: in_progress jobs on this instance's runners, candidates for
 	// closeStopped. runRunners: workflow run id: the runner names its
 	// listed jobs hold; partial: workflow runs whose job listing the
-	// budget or page bound cut short.
+	// budget or page bound cut short; active: workflow runs listed queued
+	// or in_progress this pass, so not completed.
 	stuck      []githubapp.WorkflowJob
 	runRunners map[int64][]string
 	partial    map[int64]bool
+	active     map[int64]bool
 }
 
 type pass struct {
@@ -338,6 +348,8 @@ type pass struct {
 	// total and by route; their Runs may commit at any moment.
 	unresolved      int
 	unresolvedRoute map[string]int
+	// workflowRuns: workflow runs rerunLost read this pass, by id.
+	workflowRuns map[int64]githubapp.WorkflowRun
 }
 
 func (p *pass) fail(err error) {
@@ -440,7 +452,7 @@ func (p *pass) readGitHub(repositories []string) error {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
 			demand: map[int64]*config.Route{}, meta: map[int64]jobMeta{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
-			runRunners: map[int64][]string{}, partial: map[int64]bool{}}
+			runRunners: map[int64][]string{}, partial: map[int64]bool{}, active: map[int64]bool{}}
 		err := p.readRepo(v)
 		if p.rateLimited(err) {
 			return errAbort
@@ -531,6 +543,7 @@ func (p *pass) readDemand(v *repoView) error {
 
 func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 	runID := run.ID
+	v.active[runID] = true
 	for page := 1; ; page++ {
 		if page > maxRunPages || p.budget <= 0 {
 			p.truncated = true
