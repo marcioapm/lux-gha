@@ -115,3 +115,37 @@ func (c *Client) ForceCancelWorkflowRun(ctx context.Context, repo Repository, ru
 	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodPost, path, nil, http.StatusAccepted, nil)
 	return err
 }
+
+// GetWorkflowRun is GET /repos/{owner}/{repo}/actions/runs/{id} (Actions:
+// read): the run's latest attempt, its run_attempt and status.
+func (c *Client) GetWorkflowRun(ctx context.Context, repo Repository, runID int64) (WorkflowRun, error) {
+	var out WorkflowRun
+	if runID <= 0 {
+		return out, errors.New("githubapp: run ID must be positive")
+	}
+	path, err := repo.path(fmt.Sprintf("/actions/runs/%d", runID))
+	if err != nil {
+		return out, err
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	if err == nil && (out.ID != runID || out.RunAttempt <= 0 || out.Status == nil) {
+		return WorkflowRun{}, errors.New("githubapp: invalid workflow run response")
+	}
+	return out, err
+}
+
+// RerunJob is POST /repos/{owner}/{repo}/actions/jobs/{id}/rerun (Actions:
+// write): it starts a new attempt of the job's workflow run that re-runs the
+// job and the jobs that depend on it. GitHub refuses a run that is not
+// completed or was already re-run with 403 (APIError.Already) or 409/422.
+func (c *Client) RerunJob(ctx context.Context, repo Repository, jobID int64) error {
+	if jobID <= 0 {
+		return errors.New("githubapp: job ID must be positive")
+	}
+	path, err := repo.path(fmt.Sprintf("/actions/jobs/%d/rerun", jobID))
+	if err != nil {
+		return err
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodPost, path, nil, http.StatusCreated, nil)
+	return err
+}

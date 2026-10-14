@@ -177,25 +177,30 @@ func (c *Client) createToken(ctx context.Context, id int64) (cachedToken, error)
 type APIError struct {
 	StatusCode  int
 	RateLimited bool
-	RetryAt     time.Time
+	// Already is a 403 whose message says the run is already running or
+	// re-run: a state conflict, not a missing permission.
+	Already bool
+	RetryAt time.Time
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("githubapp: API returned HTTP %d (rate limited: %t)", e.StatusCode, e.RateLimited)
 }
 
-// secondaryLimitMessage reports whether a 403 body is GitHub's secondary rate
-// limit error, which may arrive with quota remaining and no Retry-After. The
-// message can echo request content, so it is only classified, never kept.
-func secondaryLimitMessage(body io.Reader) bool {
+// errorMessage reads a 403 body's message and classifies it: GitHub's
+// secondary rate limit, which may arrive with quota remaining and no
+// Retry-After, or a refusal because the run is already running or re-run.
+// The message can echo request content, so it is only classified, never kept.
+func errorMessage(body io.Reader) (secondaryLimit, already bool) {
 	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBody))
 	var env struct {
 		Message string `json:"message"`
 	}
 	if json.Unmarshal(data, &env) != nil {
-		return false
+		return false, false
 	}
-	return strings.Contains(strings.ToLower(env.Message), "secondary rate limit")
+	m := strings.ToLower(env.Message)
+	return strings.Contains(m, "secondary rate limit"), strings.Contains(m, "already")
 }
 
 func (c *Client) request(ctx context.Context, method, path, token string, body any, status int, out any) (http.Header, error) {
@@ -234,7 +239,12 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 	if resp.StatusCode != status {
 		e := &APIError{StatusCode: resp.StatusCode}
 		remaining := resp.Header.Get("X-RateLimit-Remaining")
-		e.RateLimited = resp.StatusCode == 429 || (resp.StatusCode == 403 && (remaining == "0" || resp.Header.Get("Retry-After") != "" || secondaryLimitMessage(resp.Body)))
+		if resp.StatusCode == 403 {
+			secondary, already := errorMessage(resp.Body)
+			e.RateLimited = remaining == "0" || resp.Header.Get("Retry-After") != "" || secondary
+			e.Already = already && !e.RateLimited
+		}
+		e.RateLimited = e.RateLimited || resp.StatusCode == 429
 		if e.RateLimited {
 			e.RetryAt = c.now().Add(time.Minute)
 		}
