@@ -312,6 +312,9 @@ func (r *Reconciler) hint(reason string, route *config.Route) string {
 		if route == nil {
 			return "The job wrote more than its disk limit: reduce disk use."
 		}
+		if route.Size != "" {
+			return fmt.Sprintf("The job wrote more than size `%s`'s disk: ask for a larger size in `runs-on` or reduce disk use.", route.Size)
+		}
 		if next := r.largerDisk(route); next != nil {
 			return fmt.Sprintf("The job wrote more than the route's %d GiB disk: use a larger-disk profile such as `%s` (runs-on: `%s`, %d GiB) or reduce disk use.",
 				diskGiB(route), next.Name, strings.Join(next.Labels, ", "), diskGiB(next))
@@ -330,12 +333,13 @@ func (r *Reconciler) hint(reason string, route *config.Route) string {
 	return ""
 }
 
-// largerDisk returns the route with the smallest disk larger than route's.
+// largerDisk returns the raw route with the smallest disk larger than
+// route's; a size route's disk is its pool's, not in the config.
 func (r *Reconciler) largerDisk(route *config.Route) *config.Route {
 	var best *config.Route
 	for i := range r.cfg.Routes {
 		c := &r.cfg.Routes[i]
-		if diskGiB(c) > diskGiB(route) && (best == nil || diskGiB(c) < diskGiB(best)) {
+		if c.Size == "" && diskGiB(c) > diskGiB(route) && (best == nil || diskGiB(c) < diskGiB(best)) {
 			best = c
 		}
 	}

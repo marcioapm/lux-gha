@@ -689,6 +689,20 @@ func TestStoppedHints(t *testing.T) {
 	}
 }
 
+// A size route's disk is its pool's size, unknown to the config: its hint
+// names no route, and it is never offered as a larger-disk route.
+func TestStoppedHintsForSizeRoutes(t *testing.T) {
+	e := newEnv(t, bigDisk, withSizeRoute, replace(`"diskGiB": 20`, `"diskGiB": 10`))
+	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[0]),
+		"The job wrote more than size `m-2-arm64`'s disk: ask for a larger size in `runs-on` or reduce disk use."; got != want {
+		t.Fatalf("size route: got %q want %q", got, want)
+	}
+	if got, want := e.rec.hint("disk limit exceeded", &e.cfg.Routes[1]),
+		"The job wrote more than the route's 10 GiB disk: use a larger-disk profile such as `big` (runs-on: `linux, lux-big, self-hosted`, 40 GiB) or reduce disk use."; got != want {
+		t.Fatalf("raw route: got %q want %q", got, want)
+	}
+}
+
 func TestMultibyteJobTitleIsBoundedAndValidUTF8(t *testing.T) {
 	e := newEnv(t)
 	id := e.startJob(7)
