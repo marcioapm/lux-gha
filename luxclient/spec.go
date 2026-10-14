@@ -81,11 +81,11 @@ type Resources struct {
 	Size   string  `json:"size,omitempty"`
 }
 
-// MaxSizeName and sizeNameRe are the names luxd gives a shaped pool's sizes
+// maxSizeName and sizeNameRe are the names luxd gives a shaped pool's sizes
 // (its internal/sizing): <family>-<cpus>-<arch>, the family a lowercase
 // slug, cpus "05" or a power of two in decimal, arch arm64 or amd64, at most
 // 63 bytes. luxd itself only looks a requested name up in the pool's ladder.
-const MaxSizeName = 63
+const maxSizeName = 63
 
 var sizeNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-(05|[1-9][0-9]*)-(?:arm64|amd64)$`)
 
@@ -95,7 +95,7 @@ const maxSizeCPUs = 1 << 53
 // ValidSizeName reports whether name is one luxd can give a size.
 func ValidSizeName(name string) bool {
 	m := sizeNameRe.FindStringSubmatch(name)
-	if m == nil || len(name) > MaxSizeName {
+	if m == nil || len(name) > maxSizeName {
 		return false
 	}
 	if m[1] == "05" {

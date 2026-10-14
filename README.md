@@ -401,8 +401,12 @@ labels, any state; one Run per runner name). If the Run has ended:
   run, not only the stuck one.** That is the trade-off for not waiting out
   the job's timeout. Queued siblings and siblings running on GitHub-hosted
   runners are cancelled too. It is never done while another listed job of the
-  workflow run holds a runner of this instance with a live Run, or when the
-  pass did not list all of the run's jobs. A job that completes on its own
+  workflow run is running on a runner of this instance with a live Run, or
+  when the pass did not list all of the run's jobs. The guard protects
+  siblings that are running a job: a queued sibling has no runner assigned,
+  so a fresh, idle Run provisioned for it does not hold the cancel back. That
+  sibling is cancelled before it started, so no job work is lost, and its Run
+  is reclaimed. A job that completes on its own
   within the grace is left alone.
 
 `in_progress` workflow runs are listed before `queued` ones so a queued
@@ -529,8 +533,9 @@ does not resubmit it:
   `job-<job id>`, so it is posted once;
 - it force-cancels the job's workflow run, under the same conditions as for
   [a stopped job](#when-lux-stops-a-job): never while another listed job of
-  the run holds a runner of this instance with a live Run, nor when the pass
-  did not list all of the run's jobs.
+  the run is running on a runner of this instance with a live Run, nor when
+  the pass did not list all of the run's jobs. A queued sibling's fresh, idle
+  Run does not hold it back; that sibling is cancelled before it started.
 
 The job is not submitted again while it stays queued. A restarted bridge
 submits it once more and is refused once more. Without Checks or Actions

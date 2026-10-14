@@ -18,8 +18,8 @@ import (
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
-// CheckName is the name of the check run that explains a job whose Lux Run
-// ended under it; its external_id is the Lux Run id.
+// CheckName is the name of lux-gha's check runs; external_id is the Lux Run
+// id, or job-<id> for a job Lux refused to create.
 const CheckName = "lux-gha"
 
 // luxDefaultDiskGiB is Lux's default resources.disk, which a route without
@@ -156,9 +156,9 @@ func (p *pass) postCheck(v *repoView, req githubapp.CheckRunRequest, log *slog.L
 }
 
 // checkPosted pages the commit's lux-gha check runs for one whose
-// external_id is runID. A listing past the page bound counts as posted:
+// external_id is externalID. A listing past the page bound counts as posted:
 // a duplicate would be worse than a missing explanation.
-func (p *pass) checkPosted(v *repoView, sha, runID string) (bool, error) {
+func (p *pass) checkPosted(v *repoView, sha, externalID string) (bool, error) {
 	for page := 1; page <= maxRunPages; page++ {
 		cp, err := p.r.gh.ListCheckRunsForRef(p.ctx, v.ref, sha, githubapp.CheckRunListOptions{
 			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, CheckName: CheckName})
@@ -166,7 +166,7 @@ func (p *pass) checkPosted(v *repoView, sha, runID string) (bool, error) {
 			return false, err
 		}
 		for _, c := range cp.CheckRuns {
-			if c.ExternalID == runID {
+			if c.ExternalID == externalID {
 				return true, nil
 			}
 		}
@@ -174,7 +174,7 @@ func (p *pass) checkPosted(v *repoView, sha, runID string) (bool, error) {
 			return false, nil
 		}
 	}
-	p.r.log.Warn("check run listing exceeds page bound; not posting", "repository", v.full, "sha", sha, "run", runID)
+	p.r.log.Warn("check run listing exceeds page bound; not posting", "repository", v.full, "sha", sha, "externalID", externalID)
 	return true, nil
 }
 
@@ -200,9 +200,12 @@ func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) erro
 
 // cancelRun force-cancels workflow run runID and reports whether that is
 // settled (cancelled, or already completed). It is held back while the pass
-// did not list all of the run's jobs, or one of them holds a runner of this
-// instance with a live Run; Actions denied or a GitHub error leaves it for a
-// later pass, and a rate limit aborts.
+// did not list all of the run's jobs, or one of them is running on a runner
+// of this instance with a live Run. A queued sibling has no runner assigned
+// yet, so its fresh, idle Run does not hold the cancel back: the sibling is
+// cancelled with the workflow run before it started, so no job work is lost,
+// and its Run is reclaimed as surplus. Actions denied
+// or a GitHub error leaves it for a later pass, and a rate limit aborts.
 func (p *pass) cancelRun(v *repoView, runID int64, log *slog.Logger) (bool, error) {
 	if v.partial[runID] {
 		log.Info("not force-cancelling: the workflow run's jobs were not all listed this pass")

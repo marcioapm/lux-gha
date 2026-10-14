@@ -136,6 +136,8 @@ func refusalHint(code string, route *config.Route) string {
 			route.Pool, route.Name)
 	case "size_too_large":
 		return fmt.Sprintf("Route `%s` asks for more than the largest size of pool `%s`.", route.Name, route.Pool)
+	case "size_conflict":
+		return fmt.Sprintf("Route `%s` asks pool `%s` for a size together with cpus, memory or disk.", route.Name, route.Pool)
 	}
-	return fmt.Sprintf("Route `%s` asks pool `%s` for a size together with cpus, memory or disk.", route.Name, route.Pool)
+	return fmt.Sprintf("Lux refused route `%s`'s resources on pool `%s`.", route.Name, route.Pool)
 }

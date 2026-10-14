@@ -293,7 +293,7 @@ func TestCreateSizeSendsOnlySize(t *testing.T) {
 // The names a shape's ladder can have: luxd's internal/sizing builds
 // <family>-<cpus>-<arch> and accepts no other spelling.
 func TestValidSizeName(t *testing.T) {
-	long := strings.Repeat("f", MaxSizeName-len("-1-arm64"))
+	long := strings.Repeat("f", maxSizeName-len("-1-arm64"))
 	for _, name := range []string{"m-05-arm64", "m-1-arm64", "m-2-arm64", "m-8-amd64", "c-1024-arm64", "gp-2-4-arm64",
 		"0-1-arm64", long + "-1-arm64", "m-9007199254740992-arm64"} {
 		if !ValidSizeName(name) {
