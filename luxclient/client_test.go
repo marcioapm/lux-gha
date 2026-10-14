@@ -624,12 +624,35 @@ func TestCheckCompatibility(t *testing.T) {
 				}
 				writeJSON(w, tc.status, tc.body)
 			})
-			v, err := c.CheckCompatibility(context.Background())
+			got, err := c.CheckCompatibility(context.Background())
 			if tc.ok != (err == nil) {
-				t.Fatalf("version %q err %v", v, err)
+				t.Fatalf("compatibility %+v err %v", got, err)
 			}
 			if tc.status == 200 && !tc.ok && !errors.Is(err, ErrIncompatible) && !strings.Contains(err.Error(), "malformed") {
 				t.Fatalf("err %v", err)
+			}
+		})
+	}
+	// Sizes is reported, never required: an older luxd stays compatible.
+	sizeCases := []struct {
+		name      string
+		resources string
+		want      Compatibility
+	}{
+		{"no Resources schema", "", Compatibility{Version: "v0.1.23"}},
+		{"Resources without size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"}}}`, Compatibility{Version: "v0.1.23"}},
+		{"size not a schema", `,"Resources":{"type":"object","properties":{"size":true}}`, Compatibility{Version: "v0.1.23"}},
+		{"Resources with size", `,"Resources":{"type":"object","properties":{"cpus":{"type":"number"},"size":{"type":"string"}}}`, Compatibility{Version: "v0.1.23", Sizes: true}},
+	}
+	for _, tc := range sizeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, 200, `{"openapi":"3.1.0","info":{"version":"v0.1.23"},
+					"components":{"schemas":{"RunSpec":{"type":"object","properties":`+withResumePolicy+`}`+tc.resources+`}}}`)
+			})
+			got, err := c.CheckCompatibility(context.Background())
+			if err != nil || got != tc.want {
+				t.Fatalf("compatibility %+v err %v, want %+v", got, err, tc.want)
 			}
 		})
 	}

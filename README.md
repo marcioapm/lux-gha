@@ -586,8 +586,10 @@ decodes RunSpecs strictly, and `workload.grace` is in its RunSpec from
 `v0.1.14`, so the minimum version is unchanged.
 
 A route with `size` sends `resources.size`, which Lux accepts from
-`v0.1.24`. The startup check does not require that version, so deploy Lux
-`v0.1.24` or later before configuring a size route.
+`v0.1.24`. The minimum version stays `v0.1.14` for raw routes, but if any
+route sets `size` and the `Resources` schema does not declare `size`, the
+bridge refuses to start: `lux compatibility: route "<name>" asks for a size;
+luxd <version> predates sizes (v0.1.24)`.
 
 A `never` Run ends `terminated` even when it succeeds. The outcome is in `exitCode` and `stateReason`, so `terminated` alone is not treated as failure.
 

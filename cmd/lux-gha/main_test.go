@@ -31,8 +31,14 @@ const webhookSecret = "cmd-test-webhook-secret"
 
 // fakeLux serves GET /openapi.json, reporting version, and an empty
 // GET /v1/runs for the reconciler; any other request, such as a Run
-// submission, fails the test.
+// submission, fails the test. Its Resources schema declares size.
 func fakeLux(t *testing.T, version string) string {
+	return fakeLuxSchemas(t, version, `,"Resources":{"type":"object","properties":{"size":{"type":"string"}}}`)
+}
+
+// fakeLuxSchemas is fakeLux with extra appended to components.schemas
+// after RunSpec.
+func fakeLuxSchemas(t *testing.T, version, extra string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs" {
@@ -46,10 +52,18 @@ func fakeLux(t *testing.T, version string) string {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"openapi":"3.1.0","info":{"version":"`+version+`"},
-			"components":{"schemas":{"RunSpec":{"type":"object","properties":{"resumePolicy":{"type":"string"}}}}}}`)
+			"components":{"schemas":{"RunSpec":{"type":"object","properties":{"resumePolicy":{"type":"string"}}}`+extra+`}}}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+// withSizeRoute adds route "m-2", which asks for a size, after the raw one.
+func withSizeRoute(c map[string]any) {
+	c["routes"] = append(c["routes"].([]map[string]any), map[string]any{
+		"name": "m-2", "labels": []string{"lux-m-2-arm64"}, "pool": "shaped", "size": "m-2-arm64",
+		"image": "ghcr.io/acme/runner@sha256:abc", "timeout": "90m",
+	})
 }
 
 // fakeGitHub serves an installation token, acme/widgets with no workflow
@@ -206,6 +220,57 @@ func TestRunRefusesIncompatibleLuxBeforeServing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunRefusesSizeRouteOnLuxWithoutSizes(t *testing.T) {
+	path := writeConfig(t, fakeLuxSchemas(t, "v0.1.23", ""), closedGitHub, withSizeRoute)
+	served := make(chan string, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := run(ctx, path, slog.New(servingHandler{served}))
+	want := `lux compatibility: route "m-2" asks for a size; luxd v0.1.23 predates sizes (v0.1.24)`
+	if err == nil || err.Error() != want {
+		t.Fatalf("err=%v, want %q", err, want)
+	}
+	select {
+	case addr := <-served:
+		t.Fatalf("served on %s despite a size route Lux cannot take", addr)
+	default:
+	}
+}
+
+// startsServing runs the bridge until it serves, then shuts it down.
+func startsServing(t *testing.T, path string) {
+	t.Helper()
+	served := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, path, slog.New(servingHandler{served})) }()
+	select {
+	case <-served:
+	case err := <-done:
+		t.Fatalf("run returned before serving: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not start serving")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown err=%v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after cancellation")
+	}
+}
+
+func TestRunStartsRawRoutesOnLuxWithoutSizes(t *testing.T) {
+	startsServing(t, writeConfig(t, fakeLuxSchemas(t, "v0.1.23", ""), closedGitHub))
+}
+
+func TestRunStartsSizeRouteOnLuxWithSizes(t *testing.T) {
+	startsServing(t, writeConfig(t, fakeLux(t, "v0.1.24"), closedGitHub, withSizeRoute))
 }
 
 func awaitPass(t *testing.T, passes <-chan struct{}, what string) {
