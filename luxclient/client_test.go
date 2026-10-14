@@ -470,6 +470,40 @@ func TestListPagesWithLabelsAndCursor(t *testing.T) {
 	}
 }
 
+func TestListCreatedSinceStopsAtTheFirstOlderRun(t *testing.T) {
+	var cursors []string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		cursors = append(cursors, q.Get("next"))
+		if q.Get("state") != "terminated,failed" || q.Get("sort") != "created" {
+			t.Errorf("query %v", q)
+		}
+		switch q.Get("next") {
+		case "":
+			writeJSON(w, 200, `{"runs":[{"id":"run_4","createdAt":"2026-10-09T12:00:00Z"},{"id":"run_3","createdAt":"2026-10-09T11:00:00Z"}],"next":"c1"}`)
+		case "c1":
+			writeJSON(w, 200, `{"runs":[{"id":"run_2","createdAt":"2026-10-09T10:00:00Z"},{"id":"run_1","createdAt":"2026-10-09T09:59:59Z"}],"next":"c2"}`)
+		default:
+			t.Errorf("paged past the cutoff: %q", q.Get("next"))
+		}
+	})
+	since := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	runs, err := c.ListCreatedSince(context.Background(), map[string]string{"lux-gha/managed": "t1"}, since, "terminated", "failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range runs {
+		ids = append(ids, r.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"run_4", "run_3", "run_2"}) || !reflect.DeepEqual(cursors, []string{"", "c1"}) {
+		t.Fatalf("ids %v cursors %q", ids, cursors)
+	}
+	if _, err := c.ListCreatedSince(context.Background(), nil, time.Time{}); err == nil {
+		t.Fatal("accepted a zero since")
+	}
+}
+
 func TestListSendsStateFilterOnEveryPage(t *testing.T) {
 	var queries []string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

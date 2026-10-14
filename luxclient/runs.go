@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // MinVersion is the first Lux release that implements resumePolicy never.
@@ -182,6 +183,20 @@ var runStates = map[string]bool{
 // bound; pass the live states to keep it bounded. It fails rather than
 // truncate: on a repeated cursor or past MaxPages.
 func (c *Client) List(ctx context.Context, labels map[string]string, states ...string) ([]Run, error) {
+	return c.list(ctx, labels, time.Time{}, states)
+}
+
+// ListCreatedSince is List restricted to Runs created at or after since:
+// Runs come newest first, so paging stops at the first older Run, and the
+// cost is the pages holding Runs created since then.
+func (c *Client) ListCreatedSince(ctx context.Context, labels map[string]string, since time.Time, states ...string) ([]Run, error) {
+	if since.IsZero() {
+		return nil, errors.New("luxclient: since is required")
+	}
+	return c.list(ctx, labels, since, states)
+}
+
+func (c *Client) list(ctx context.Context, labels map[string]string, since time.Time, states []string) ([]Run, error) {
 	q := url.Values{"sort": {"created"}, "limit": {strconv.Itoa(pageSize)}}
 	for _, s := range states {
 		if !runStates[s] {
@@ -217,13 +232,18 @@ func (c *Client) List(ctx context.Context, labels map[string]string, states ...s
 		if err := c.do(ctx, request{op: "list runs", method: http.MethodGet, path: "/v1/runs", query: q, want: []int{http.StatusOK}}, &body); err != nil {
 			return nil, err
 		}
+		older := false
 		for _, r := range body.Runs {
+			if !since.IsZero() && r.CreatedAt.Before(since) {
+				older = true
+				break
+			}
 			if !seenRuns[r.ID] {
 				seenRuns[r.ID] = true
 				runs = append(runs, r)
 			}
 		}
-		if body.Next == "" {
+		if body.Next == "" || older {
 			return runs, nil
 		}
 		if seenCursors[body.Next] {
