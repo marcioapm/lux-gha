@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
@@ -122,28 +123,36 @@ func (p *pass) explain(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) erro
 	if s.explained || p.noChecks {
 		return nil
 	}
-	log := r.log.With("repository", v.full, "job", j.ID, "runner", *j.RunnerName, "run", run.ID)
-	posted, err := p.checkPosted(v, j.HeadSHA, run.ID)
+	log := r.log.With("repository", v.full, "job", j.ID, "runner", *j.RunnerName, "run", run.ID, "reason", run.StateReason)
+	done, err := p.postCheck(v, r.checkRun(j, s), log)
+	s.explained = done
+	return err
+}
+
+// postCheck posts req unless a lux-gha check run with its external_id is
+// already on its commit. It reports whether that is settled; Checks denied
+// or a GitHub error leaves it for a later pass, and a rate limit aborts.
+func (p *pass) postCheck(v *repoView, req githubapp.CheckRunRequest, log *slog.Logger) (bool, error) {
+	posted, err := p.checkPosted(v, req.HeadSHA, req.ExternalID)
 	if err == nil && !posted {
-		_, err = r.gh.CreateCheckRun(p.ctx, v.ref, r.checkRun(j, s))
+		_, err = p.r.gh.CreateCheckRun(p.ctx, v.ref, req)
 		if err == nil {
 			p.st.CheckRuns++
-			log.Info("posted a check run for a job whose Lux Run ended", "reason", run.StateReason)
+			log.Info("posted a check run", "title", req.Output.Title)
 		}
 	}
 	if p.rateLimited(err) {
-		return errAbort
+		return false, errAbort
 	}
 	if p.denied(err, &p.noChecks, "Checks") {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		log.Error("posting the check run for a stopped job failed", "error", err)
+		log.Error("posting a check run failed", "error", err)
 		p.setError(ErrGitHub)
-		return nil
+		return false, nil
 	}
-	s.explained = true
-	return nil
+	return true, nil
 }
 
 // checkPosted pages the commit's lux-gha check runs for one whose
@@ -182,39 +191,49 @@ func (p *pass) unstick(v *repoView, j githubapp.WorkflowJob, s *stoppedRun) erro
 		return nil
 	}
 	run := s.run
-	log := r.log.With("repository", v.full, "workflowRun", j.RunID, "job", j.ID, "runner", *j.RunnerName, "run", run.ID)
-	if v.partial[j.RunID] {
+	log := r.log.With("repository", v.full, "workflowRun", j.RunID, "job", j.ID, "runner", *j.RunnerName, "run", run.ID,
+		"reason", run.StateReason, "stuckFor", now.Sub(s.finished).Round(time.Second))
+	done, err := p.cancelRun(v, j.RunID, log)
+	s.cancelled = done
+	return err
+}
+
+// cancelRun force-cancels workflow run runID and reports whether that is
+// settled (cancelled, or already completed). It is held back while the pass
+// did not list all of the run's jobs, or one of them holds a runner of this
+// instance with a live Run; Actions denied or a GitHub error leaves it for a
+// later pass, and a rate limit aborts.
+func (p *pass) cancelRun(v *repoView, runID int64, log *slog.Logger) (bool, error) {
+	if v.partial[runID] {
 		log.Info("not force-cancelling: the workflow run's jobs were not all listed this pass")
-		return nil
+		return false, nil
 	}
-	for _, sibling := range v.runRunners[j.RunID] {
+	for _, sibling := range v.runRunners[runID] {
 		if p.liveRunner[sibling] {
 			log.Info("not force-cancelling: another job of the workflow run holds a runner with a live Run", "sibling", sibling)
-			return nil
+			return false, nil
 		}
 	}
-	err := r.gh.ForceCancelWorkflowRun(p.ctx, v.ref, j.RunID)
+	err := p.r.gh.ForceCancelWorkflowRun(p.ctx, v.ref, runID)
 	if p.rateLimited(err) {
-		return errAbort
+		return false, errAbort
 	}
 	if p.denied(err, &p.noCancel, "Actions") {
-		return nil
+		return false, nil
 	}
 	var apiErr *githubapp.APIError
 	switch {
 	case err == nil:
 		p.st.ForceCancelled++
-		log.Warn("force-cancelled a workflow run whose job's Lux Run ended under it", "reason", run.StateReason,
-			"stuckFor", now.Sub(s.finished).Round(time.Second))
+		log.Warn("force-cancelled the workflow run")
 	case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict:
 		log.Info("workflow run already completed; nothing to force-cancel")
 	default:
 		log.Error("force-cancelling a workflow run failed", "error", err)
 		p.setError(ErrGitHub)
-		return nil
+		return false, nil
 	}
-	s.cancelled = true
-	return nil
+	return true, nil
 }
 
 // denied reports whether err is a 403 that is not a rate limit: the App
