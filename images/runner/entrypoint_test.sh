@@ -43,6 +43,7 @@ cat >"$root/runner/run.sh" <<'EOF'
 env >"$FAKE_CASE_DIR/runner.env"
 id -u >"$FAKE_CASE_DIR/runner.uid"
 printf '%s\n' "$@" >"$FAKE_CASE_DIR/runner.args"
+echo runner >>"$FAKE_CASE_DIR/order"
 mode=${FAKE_RUN:-exit:0}
 case $mode in
 signal-parent) kill -USR1 "$PPID" ;;
@@ -77,20 +78,36 @@ esac
 exec sleep 300
 EOF
 
+# info answers once the socket exists and records each answer in the call
+# order. load records its arguments and the call order, then succeeds, fails
+# or hangs as FAKE_DOCKER_LOAD says; a hung load ignores SIGTERM, so only
+# timeout's -k SIGKILL ends it.
 cat >"$root/bin/docker" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = load ]; then
+	printf '%s\n' "$@" >"$FAKE_CASE_DIR/load.args"
+	echo load >>"$FAKE_CASE_DIR/order"
+	case ${FAKE_DOCKER_LOAD:-ok} in
+	fail) echo "Error response from daemon: fake load failure" >&2; exit 1 ;;
+	hang) trap '' TERM; exec sleep 300 ;;
+	esac
+	printf 'Loaded image: moby/buildkit:buildx-stable-1\nLoaded image: moby/buildkit:v0.0.0\n'
+	exit 0
+fi
 [ "${1:-}" = info ] || exit 2
 case ${FAKE_DOCKER:-socket} in
 hang) exec sleep 300 ;;
 fail) exit 1 ;;
 esac
-[ -e "${DOCKER_HOST#unix://}" ]
+[ -e "${DOCKER_HOST#unix://}" ] || exit 1
+echo info >>"$FAKE_CASE_DIR/order"
 EOF
 chmod 755 "$root/runner/run.sh" "$root/bin/dockerd-rootless" "$root/bin/docker"
 
 printf %s "$sentinel" >"$root/unreadable"
 chmod 000 "$root/unreadable"
 : >"$root/empty"
+printf 'not a real archive\n' >"$root/buildkit.tar"
 
 # The supervisor exits with the entrypoint's status and records a USR1 sent
 # to it. A trapped signal interrupts wait with status >128, so it waits
@@ -122,12 +139,20 @@ while :; do
 	exit "$rc"
 done'
 
-# run_case NAME [VAR=value...]: run the entrypoint in a fresh case dir with
-# the defaults below, overridden by the arguments. Sets d, rc and elapsed.
+# run_case NAME [--default-archive] [VAR=value...]: run the entrypoint in a
+# fresh case dir with the defaults below, overridden by the arguments. Sets
+# d, rc and elapsed. LUXGHA_BUILDKIT_ARCHIVE defaults to a path that does not
+# exist, so only the buildkit-* cases load one, also when this runs inside
+# the image that ships one; --default-archive leaves it unset.
 run_case() {
 	name=$1
 	shift
 	d=$root/$name
+	bk_archive=LUXGHA_BUILDKIT_ARCHIVE=$d/no-archive.tar
+	if [ "${1:-}" = --default-archive ]; then
+		bk_archive=
+		shift
+	fi
 	mkdir -p "$d/xdg"
 	if [ "$root_case" = sigterm-root ]; then chown -R 1000:1000 "$d"; fi
 	printf %s "$sentinel" >"$d/jit"
@@ -135,7 +160,8 @@ run_case() {
 	rc=0
 	env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" RUNNER_DIR="$root/runner" \
 		XDG_RUNTIME_DIR="$d/xdg" DOCKER_HOST="unix://$d/custom.sock" \
-		LUXGHA_JITCONFIG_FILE="$d/jit" FAKE_CASE_DIR="$d" FAKE_DOCKERD=ready "$@" \
+		LUXGHA_JITCONFIG_FILE="$d/jit" FAKE_CASE_DIR="$d" FAKE_DOCKERD=ready \
+		${bk_archive:+"$bk_archive"} "$@" \
 		timeout -k 2 30 sh -c "$supervisor" supervisor "$ep" >"$d/out" 2>"$d/err" || rc=$?
 	elapsed=$(($(date +%s) - start))
 	stop_daemons
@@ -246,6 +272,75 @@ for bad in 08 010 0 x5; do
 	check "runner not reached" "$not_reached"
 	check "says why" 'grep -q "LUXGHA_DOCKER_WAIT must be" "$d/err"'
 done
+
+archive=$root/buildkit.tar
+default_archive=/usr/share/lux-gha/buildkit.tar
+loaded_then_runner='[ "$(cat "$d/order")" = "$(printf "info\nload\nrunner")" ]'
+loaded_from() { [ "$(cat "$d/load.args" 2>/dev/null)" = "$(printf "load\n-i\n%s" "$1")" ]; }
+one_warning='[ "$(wc -l <"$d/err")" = 1 ] && grep -q "^lux-gha-runner: warning: " "$d/err"'
+
+run_case buildkit-load-ok LUXGHA_BUILDKIT_ARCHIVE="$archive"
+check "exits 0" '[ "$rc" = 0 ]'
+check "docker load -i <archive>" 'loaded_from "$archive"'
+check "loads after docker info, before run.sh" "$loaded_then_runner"
+check "names both loaded tags on stdout" 'grep -q "preloaded moby/buildkit:buildx-stable-1 moby/buildkit:v0.0.0 in [0-9]*s" "$d/out"'
+check "nothing on stderr" '[ ! -s "$d/err" ]'
+check_no_leak
+
+# The image's own archive, at the path the entrypoint uses by default; it
+# exists only inside the built image, so these run under smoke.sh only.
+if [ -f "$default_archive" ]; then
+	run_case buildkit-default-path --default-archive
+	check "exits 0" '[ "$rc" = 0 ]'
+	check "LUXGHA_BUILDKIT_ARCHIVE unset: docker load -i $default_archive" 'loaded_from "$default_archive"'
+	check "loads after docker info, before run.sh" "$loaded_then_runner"
+
+	run_case buildkit-default-path-empty LUXGHA_BUILDKIT_ARCHIVE=
+	check "LUXGHA_BUILDKIT_ARCHIVE empty: docker load -i $default_archive" 'loaded_from "$default_archive"'
+fi
+
+# A file named none in the entrypoint's working directory, so that the case
+# fails if none is treated as a path.
+: >none
+run_case buildkit-none-file LUXGHA_BUILDKIT_ARCHIVE=none
+rm -f none
+check "exits 0" '[ "$rc" = 0 ]'
+check "LUXGHA_BUILDKIT_ARCHIVE=none with ./none present: load not attempted" '[ ! -f "$d/load.args" ]'
+check "runs info, then run.sh" '[ "$(cat "$d/order")" = "$(printf "info\nrunner")" ]'
+check "nothing on stderr" '[ ! -s "$d/err" ]'
+
+rm -f /tmp/buildkit-load.log
+run_case buildkit-load-fails LUXGHA_BUILDKIT_ARCHIVE="$archive" FAKE_DOCKER_LOAD=fail
+check "exits 0" '[ "$rc" = 0 ]'
+check "load attempted, then run.sh" "$loaded_then_runner"
+check "one warning line on stderr" "$one_warning"
+check "docker's error goes to the log, not stderr" '! grep -q "fake load failure" "$d/err"'
+check "the log holds docker's error" 'grep -q "fake load failure" /tmp/buildkit-load.log'
+check_no_leak
+
+# The hung fake ignores SIGTERM: only timeout -k's SIGKILL, 2 s after the
+# 2 s limit, ends it.
+run_case buildkit-load-hangs LUXGHA_BUILDKIT_ARCHIVE="$archive" FAKE_DOCKER_LOAD=hang LUXGHA_BUILDKIT_LOAD_TIMEOUT=2
+check "exits 0" '[ "$rc" = 0 ]'
+check "runner reached" "$reached"
+check "a hung load that ignores SIGTERM is killed 2s after the 2s timeout" '[ "$elapsed" -ge 4 ] && [ "$elapsed" -le 7 ]'
+check "one warning line on stderr" "$one_warning"
+
+run_case buildkit-bad-timeout LUXGHA_BUILDKIT_ARCHIVE="$archive" LUXGHA_BUILDKIT_LOAD_TIMEOUT=08
+check "exits 0" '[ "$rc" = 0 ]'
+check "runner reached" "$reached"
+check "load not attempted" '[ ! -f "$d/load.args" ]'
+check "one warning line on stderr" "$one_warning"
+
+run_case buildkit-no-archive
+check "exits 0" '[ "$rc" = 0 ]'
+check "load not attempted" '[ ! -f "$d/load.args" ]'
+check "nothing on stderr" '[ ! -s "$d/err" ]'
+
+run_case buildkit-docker-down LUXGHA_BUILDKIT_ARCHIVE="$archive" FAKE_DOCKERD=exit LUXGHA_DOCKER=optional
+check "exits 0" '[ "$rc" = 0 ]'
+check "runner reached" "$reached"
+check "load not attempted without an engine" '[ ! -f "$d/load.args" ]'
 
 if [ "$failures" -ne 0 ]; then
 	echo "entrypoint_test: $failures failed"

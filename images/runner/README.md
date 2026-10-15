@@ -21,6 +21,12 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   `no-new-privileges`, so either would let a job become root in its container.
 - The project licence at `/usr/share/lux-gha/LICENSE`, copied from `images/runner/LICENSE`, which must stay
   byte-identical to the root `LICENSE` (`scripts/check-license.sh`, also run by `smoke.sh`).
+- `moby/buildkit` v0.33.1 for the image's own architecture, as an OCI archive at
+  `/usr/share/lux-gha/buildkit.tar` (about 107 MB arm64, 113 MB amd64). The entrypoint loads it into each
+  Run's Docker store, so that `setup-buildx-action`'s builder does not pull it. See [BuildKit driver](#buildkit-driver).
+- `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY` set to `/opt/hostedtoolcache` (owned by `runner`, mode 0755), where
+  hosted runners keep it: `actions/setup-python`'s CPython has its library RUNPATH there and fails to load
+  `libpython` elsewhere once `LD_LIBRARY_PATH` is dropped. It is not on the Lux volume, so tools are still per-Run.
 
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is
@@ -31,12 +37,20 @@ lines and exits 1. Set `LUXGHA_DOCKER=optional` in the Run's env to continue wit
 `LUXGHA_DOCKER_WAIT` (whole seconds, no leading zero, default 60) changes the deadline. It exists for
 `entrypoint_test.sh`; a Run should not need it.
 
+Once `docker info` answers, the entrypoint runs `docker load -i /usr/share/lux-gha/buildkit.tar`, bounded by
+`LUXGHA_BUILDKIT_LOAD_TIMEOUT` (whole seconds, default 30), and logs `lux-gha-runner: preloaded … in Ns`. If
+the load fails or times out, it prints one warning line to stderr, leaves docker's output in
+`/tmp/buildkit-load.log`, and starts the runner anyway. The builder then pulls `moby/buildkit` as it would
+without the archive. `LUXGHA_BUILDKIT_ARCHIVE` overrides the path for `entrypoint_test.sh`; set it to `none`
+in the Run's env to skip the load silently on routes that never use buildx (unset or empty means the default
+path). If no Docker engine came up, nothing is loaded.
+
 ## Build and smoke test
 
 ```sh
 make image PLATFORM=linux/arm64            # or linux/amd64; loads lux-gha-runner:dev
 images/runner/smoke.sh                     # tools, caps, runner version, entrypoint lifecycle and failure modes
-images/runner/smoke.sh --privileged        # also rootless dockerd + a docker-container buildx build
+images/runner/smoke.sh --privileged        # also rootless dockerd, the BuildKit preload, docker-container builders offline and online
 images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail the build; rebuilds the runner layer
 PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default linux/arm64)
 ```
@@ -44,6 +58,12 @@ PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default
 `smoke.sh` builds for `PLATFORM` (`linux/arm64` by default, or `linux/amd64`) and checks that the image,
 its `dpkg` architecture and the ELF machine of the runner's `bin/Runner.Listener` match it. Run it on a host
 of that architecture; under emulation it may pass or fail for reasons that do not hold on real hardware.
+It also checks the BuildKit archive offline against the Containerfile's pins (tags, index, `PLATFORM` manifest
+and config, every blob's digest, no other platform's blobs), and that `/opt/hostedtoolcache` is owned by and
+writable as `runner` and named by `RUNNER_TOOL_CACHE`. Under `--privileged` the entrypoint must log its
+`preloaded` line, and the store must hold the pinned index and `PLATFORM` manifest under both tags. With
+`--network none`, a `docker-container` builder must bootstrap from the preloaded image. With network,
+`docker pull` of the pinned version tag must download nothing, and a builder pinned to it builds and runs an image.
 
 `entrypoint_test.sh` runs inside the image as part of `smoke.sh`, or on its own on Linux as a non-root
 user with `sh images/runner/entrypoint_test.sh`, or anywhere with Docker as `make entrypoint-test` (uid 1000
@@ -51,7 +71,11 @@ in the pinned base image, against the working tree's `entrypoint.sh`). It drives
 `dockerd-rootless`/`docker`. It checks that `run.sh` replaces the entrypoint (exec), that its exit status
 propagates, that a SIGTERM to the entrypoint's process group (how Lux stops a Run) reaches `run.sh` with
 `RUNNER_MANUALLY_TRAP_SIG=1` set and leaves dockerd running, the bad-config, daemon-exit, never-ready and
-hung-probe paths, and that the config never shows up in output or in the runner's environment.
+hung-probe paths, and that the config never shows up in output or in the runner's environment. For the
+BuildKit load it checks the order (`docker info`, `docker load`, `run.sh`), the default path when
+`LUXGHA_BUILDKIT_ARCHIVE` is unset or empty (inside the image only), one warning line for a failed load, a
+load hung past `LUXGHA_BUILDKIT_LOAD_TIMEOUT` while ignoring SIGTERM, or a bad timeout, and no load with
+`none`, without an archive or without an engine.
 
 The smoke cases that pass a fake config to the real runner only show that `run.sh` was reached with
 invalid input. The `--privileged` checks are only an approximation, because Lux never runs a nested Run
@@ -61,8 +85,9 @@ only verified live, against a real GitHub job; the signal harness uses a fake li
 `make entrypoint-test` also checks uid 0 through real `setpriv`, dropping to
 uid 1000; this path leaves Docker startup to the job.
 
-CI runs the default `smoke.sh` for every pull request twice, natively: `linux/arm64` on `ubuntu-24.04-arm`
-and `linux/amd64` on `ubuntu-24.04`. A `v*` tag builds and smoke-tests each architecture the same way, pushes
+CI runs `smoke.sh --privileged` for every pull request twice, natively: `linux/arm64` on `ubuntu-24.04-arm`
+and `linux/amd64` on `ubuntu-24.04`, after setting `kernel.apparmor_restrict_unprivileged_userns=0` where the
+key exists, so that rootlesskit can create its user namespace. A `v*` tag builds and smoke-tests each architecture the same way, pushes
 each by digest only (`push-by-digest.sh`), then publishes `ghcr.io/<owner>/lux-gha-runner:<tag>` as an image
 index over the two (`image-index.sh`; see [Releases](../../README.md#releases)). A route pins the index digest;
 each Lux host pulls the image for its own architecture.
@@ -111,7 +136,7 @@ Others were found by reading the source of the tool that uses them. Lux wildcard
 | `raw.githubusercontent.com` | setup-uv's version manifest | setup-uv v10.3.0 `src/utils/constants.ts` |
 | `releases.astral.sh` | setup-uv's mirror for downloading uv itself; uv's mirror for managed Python | setup-uv `constants.ts`; uv 0.13.0 `uv-python-managed/src/downloads.rs` |
 | `pypi.org`, `files.pythonhosted.org` | `uv sync` | uv's default index |
-| `registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com` | Docker Hub base images, and `moby/buildkit` if setup-buildx-action keeps its default `docker-container` driver | Docker allowlist; blob redirect observed |
+| `registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com` | Docker Hub base images. With the preloaded BuildKit, `setup-buildx-action`'s `docker-container` builder still asks Docker Hub for the tag's index; the blobs come from the store (see [BuildKit driver](#buildkit-driver)) | Docker allowlist; blob redirect observed |
 
 `astral.sh` itself is only the uv install script's host, and setup-uv does not use it.
 
@@ -150,11 +175,43 @@ names Lux records as `dns` events for its Runs.
 
 ### BuildKit driver
 
-`docker/setup-buildx-action` defaults to the `docker-container` driver. On every job, that driver pulls
-`moby/buildkit` (about 106 MB for arm64) anonymously from Docker Hub into the empty per-Run store. That
-pull counts against Docker Hub's anonymous pull limit, shared with every other pull from the same egress
-IP. `--load` then copies the result twice: the BuildKit container exports it, then dockerd imports it.
+`docker/setup-buildx-action` defaults to the `docker-container` driver, whose builder runs
+`moby/buildkit:buildx-stable-1`. Docker's store is the per-Run volume, so it starts empty. Without help,
+every job would pull BuildKit (about 106 MB for arm64) anonymously from Docker Hub, which took 13 s on Lux and
+counts against Docker Hub's anonymous pull limit, shared with every other pull from the same egress IP.
+
+The image therefore carries `moby/buildkit` as an OCI archive and the entrypoint loads it at
+start (above). Pulling into the store at build time would not work: Lux mounts the volume over
+`~/.local/share/docker`, which hides anything the image put there. dockerd has no read-only
+`additionalimagestores` option, which is a containers/storage feature of Podman and CRI-O. Rootless dockerd's
+managed containerd also keeps its content store under that same data root.
+The archive holds the multi-arch index that both `buildx-stable-1` and the version tag pointed to on 2026-10-15,
+plus the image's own architecture only, tagged both ways. The loaded image's ID is therefore the index digest,
+the same as after a pull from Docker Hub. The Containerfile pins the index and each architecture's
+manifest by digest (`BUILDKIT_DIGEST`, `BUILDKIT_DIGEST_ARM64`, `BUILDKIT_DIGEST_AMD64`). The build fails if
+the index's `org.opencontainers.image.version` annotation is not `BUILDKIT_VERSION`, if it lists another manifest
+for `TARGETARCH`, or if any blob does not match its digest. The fetch is an anonymous Docker Hub pull at build time. Loading it took
+about 2–3 s in `smoke.sh --privileged` on an Apple-silicon host.
+
+buildx still asks dockerd to pull the builder image when the builder bootstraps, and uses the local image only
+if that pull fails. With network, the pull resolves the tag at Docker Hub. If the tag still names the pinned
+index, nothing is downloaded (`Image is up to date`). If `buildx-stable-1` has moved to a newer BuildKit,
+the pull downloads it in full and the preload saves nothing. Workflows should therefore pin the version
+the image carries, which its label `io.github.marcioapm.lux-gha.buildkit` names
+(`moby/buildkit:<version>@<index digest>`). When a new image changes it, the workflows' pins must change too:
+
+```yaml
+- uses: docker/setup-buildx-action@v3
+  with:
+    driver-opts: image=moby/buildkit:v0.33.1
+```
+
+BuildKit version tags are not expected to move, so the pull only checks the tag; to rule that out, pin
+`image=moby/buildkit:<version>@<index digest>` from the label. The lookup still goes to Docker Hub, so keep its
+hosts in `egressHosts`. With no route to Docker Hub, the pull fails and buildx starts the preloaded image, as
+long as `BUILDX_DEFAULT_POLICY` is unset.
+
 This image runs Docker 29 with the containerd image store, so the `docker` driver uses the daemon's
-embedded BuildKit: no pull, and `--load` goes straight into the store. Setting `driver: docker` in
-a workflow's `setup-buildx-action` step is worth trying; that change belongs in the workflow. `smoke.sh
---privileged` builds with `docker-container`, setup-buildx-action's default.
+embedded BuildKit: no BuildKit image at all, and `--load` goes straight into the store instead of being
+exported by the BuildKit container and imported again by dockerd. Setting `driver: docker` in a workflow's
+`setup-buildx-action` step is worth trying where its features suffice; that change belongs in the workflow.

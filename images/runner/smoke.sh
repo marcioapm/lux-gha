@@ -1,13 +1,17 @@
 #!/bin/sh
 # Local smoke test for the runner image: builds it for $PLATFORM
 # (linux/arm64, the default, or linux/amd64) into the local Docker and checks
-# its architecture, tools, user, file capabilities, the entrypoint lifecycle
+# its architecture, tools, user, file capabilities, the BuildKit archive
+# against the Containerfile's pins, the entrypoint lifecycle
 # (entrypoint_test.sh, run inside the image) and its failure modes against the
 # real runner. Run it on a host of that architecture: under emulation the
 # results say little about the image on real hardware.
 #
-# --privileged also starts rootless dockerd and builds with a docker-container
-# buildx builder. That is an approximation only: Lux nested Runs are never
+# --privileged also starts rootless dockerd through the entrypoint, checks
+# the BuildKit image it preloads (tags, architecture, digests), bootstraps a
+# docker-container builder with no network (so from the preloaded image
+# only), and with network checks that the pinned tag pulls nothing and
+# builds. That is an approximation only: Lux nested Runs are never
 # privileged, so it does not prove the Lux nested-container contract.
 #
 # --checksum-negative only rebuilds the runner layer with a wrong runner
@@ -20,11 +24,19 @@ set -eu
 TAG=${TAG:-lux-gha-runner:smoke}
 PLATFORM=${PLATFORM:-linux/arm64}
 case $PLATFORM in
-linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 ;;
-linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e ;;
+linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 bk_arg=BUILDKIT_DIGEST_ARM64 ;;
+linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e bk_arg=BUILDKIT_DIGEST_AMD64 ;;
 *) echo "PLATFORM must be linux/arm64 or linux/amd64, not $PLATFORM" >&2; exit 2 ;;
 esac
 dir=$(cd "$(dirname "$0")" && pwd)
+# The BuildKit pins, from the Containerfile the image is built from.
+containerfile_arg() { sed -n "s/^ARG $1=//p" "$dir/Containerfile"; }
+bk_version=$(containerfile_arg BUILDKIT_VERSION)
+bk_index=$(containerfile_arg BUILDKIT_DIGEST)
+bk_manifest=$(containerfile_arg "$bk_arg")
+# docker run options passing the pins to in-container checks. The values
+# hold no whitespace, so the variable is split unquoted.
+bk_env="-e BK_VERSION=$bk_version -e BK_INDEX=$bk_index -e BK_MANIFEST=$bk_manifest"
 privileged=false keep=false checksum_negative=false
 for arg in "$@"; do
 	case $arg in
@@ -94,6 +106,14 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	[ "$(getcap /usr/bin/newgidmap)" = "/usr/bin/newgidmap cap_setgid=ep" ] || { echo "newgidmap lacks exactly cap_setgid=ep" >&2; exit 1; }
 	[ -z "$(find / -xdev -type f -perm /6000 2>/dev/null)" ] && echo "no setuid/setgid files"
 	! command -v sudo >/dev/null && echo "no sudo"
+	# The CPython that setup-python installs has its RUNPATH under /opt/hostedtoolcache.
+	t=/opt/hostedtoolcache
+	[ "${RUNNER_TOOL_CACHE:-}" = "$t" ] && [ "${AGENT_TOOLSDIRECTORY:-}" = "$t" ] ||
+		{ echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-} AGENT_TOOLSDIRECTORY=${AGENT_TOOLSDIRECTORY:-}, want $t" >&2; exit 1; }
+	[ "$(stat -c "%U:%G %a" "$t")" = "runner:runner 755" ] || { echo "$t is $(stat -c "%U:%G %a" "$t"), want runner:runner 755" >&2; exit 1; }
+	mkdir "$t/smoke"
+	rmdir "$t/smoke"
+	echo "tool cache $t: runner:runner 755, writable as $(id -un)"
 '
 
 echo "== licence"
@@ -107,6 +127,35 @@ run --entrypoint sh "$TAG" -euc '
 	cat "$f"
 ' | cmp - "$dir/LICENSE" || fail "/usr/share/lux-gha/LICENSE in the image differs from images/runner/LICENSE"
 echo "/usr/share/lux-gha/LICENSE present, mode 644, matches images/runner/LICENSE"
+
+echo "== BuildKit archive"
+[ "$(docker image inspect "$TAG" --format '{{index .Config.Labels "io.github.marcioapm.lux-gha.buildkit"}}')" = "moby/buildkit:$bk_version@$bk_index" ] ||
+	fail "image lacks the label io.github.marcioapm.lux-gha.buildkit=moby/buildkit:$bk_version@$bk_index"
+# Offline and without Docker: the archive must hold the pinned index under
+# both tags, and the pinned $PLATFORM manifest with every blob it names.
+# shellcheck disable=SC2016,SC2086 # the script expands inside the container; bk_env splits
+run --network none $bk_env -e WANT_ARCH="$arch" \
+	--entrypoint sh "$TAG" -euc '
+	a=/usr/share/lux-gha/buildkit.tar
+	[ "$(stat -c %a "$a")" = 644 ] || { echo "$a mode $(stat -c %a "$a"), want 644" >&2; exit 1; }
+	x=$(mktemp -d)
+	tar -xf "$a" -C "$x"
+	refs=$(jq -r --arg d "$BK_INDEX" ".manifests[] | select(.digest == \$d) | .annotations[\"io.containerd.image.name\"]" "$x/index.json" | sort | paste -sd " " -)
+	[ "$refs" = "docker.io/moby/buildkit:buildx-stable-1 docker.io/moby/buildkit:$BK_VERSION" ] || { echo "index.json names [$refs] for $BK_INDEX" >&2; exit 1; }
+	[ "$(jq ".manifests | length" "$x/index.json")" = 2 ] || { echo "index.json has other entries" >&2; exit 1; }
+	b=$x/blobs/sha256
+	got=$(jq -r --arg a "$WANT_ARCH" ".manifests[] | select(.platform.os == \"linux\" and .platform.architecture == \$a) | .digest" "$b/${BK_INDEX#sha256:}")
+	[ "$got" = "$BK_MANIFEST" ] || { echo "index lists $got for linux/$WANT_ARCH, pinned $BK_MANIFEST" >&2; exit 1; }
+	m=$b/${BK_MANIFEST#sha256:}
+	cfg=$(jq -r .config.digest "$m")
+	[ "$(jq -r .architecture "$b/${cfg#sha256:}")" = "$WANT_ARCH" ] || { echo "config architecture is not $WANT_ARCH" >&2; exit 1; }
+	for d in "$BK_INDEX" "$BK_MANIFEST" "$cfg" $(jq -r ".layers[].digest" "$m"); do
+		echo "${d#sha256:}  $b/${d#sha256:}"
+	done | sha256sum -c --quiet -
+	# Only the $PLATFORM image: the index, its manifest, config and layers.
+	[ "$(ls "$b" | wc -l)" = $((3 + $(jq ".layers | length" "$m"))) ] || { echo "archive holds other blobs" >&2; exit 1; }
+	echo "buildkit.tar: moby/buildkit:$BK_VERSION and :buildx-stable-1 -> $BK_INDEX, linux/$WANT_ARCH $BK_MANIFEST, $(stat -c %s "$a") bytes; blobs verified"
+'
 
 echo "== entrypoint lifecycle (entrypoint_test.sh against the installed entrypoint)"
 run -i --entrypoint sh "$TAG" -s /usr/local/bin/lux-gha-runner <"$dir/entrypoint_test.sh" ||
@@ -147,35 +196,87 @@ echo "$out" | grep -q "Base-64" || fail "run.sh was not reached"
 echo "$out" | grep -q "$secret" && fail "JIT config leaked into output"
 
 if $privileged; then
-	echo "== APPROXIMATION (--privileged, not the Lux nested contract): entrypoint starts rootless dockerd"
-	out=$(run_with_config --privileged 2>&1) || true
-	echo "$out" | tail -n 3
-	echo "$out" | grep -q "did not come up" && fail "dockerd did not come up under --privileged"
-	echo "$out" | grep -q "Base-64" || fail "run.sh was not reached"
-	echo "$out" | grep -q "$secret" && fail "JIT config leaked into output"
-
-	echo "== APPROXIMATION (--privileged, not the Lux nested contract): rootless dockerd + docker-container buildx builder"
-	marker=smoke-marker-$$-$(date +%s)
+	# privileged_entrypoint MODE [docker run options...]: the installed
+	# entrypoint under --privileged, with RUNNER_DIR holding the run.sh
+	# below in place of GitHub's runner. It runs after the entrypoint's
+	# load, checks the store against the pins, then does MODE's checks.
 	# The store gets its own volume, as Lux mounts one there: overlay on
 	# top of the container's overlay root fails to mount BuildKit's layers.
-	# shellcheck disable=SC2016 # the script expands inside the container
-	run --privileged -v /home/runner/.local/share/docker -e MARKER="$marker" --entrypoint sh "$TAG" -euc '
-		mkdir -p "$XDG_RUNTIME_DIR"
-		setsid dockerd-rootless.sh --host "$DOCKER_HOST" </dev/null >/tmp/dockerd.log 2>&1 &
-		for i in $(seq 60); do timeout 5 docker info >/dev/null 2>&1 && break; sleep 1; done
-		docker info >/dev/null 2>&1 || { tail -n 20 /tmp/dockerd.log; exit 1; }
-		echo "rootless=$(docker info --format "{{.SecurityOptions}}" | grep -o rootless) driver=$(docker info --format "{{.Driver}}")"
-		docker buildx create --name smoke --driver docker-container --use
-		docker buildx inspect --bootstrap >/tmp/bootstrap.log 2>&1 || { cat /tmp/bootstrap.log; exit 1; }
-		grep -E "^(Driver|Status):" /tmp/bootstrap.log
-		grep -Eq "^Driver: +docker-container$" /tmp/bootstrap.log || { echo "builder is not docker-container" >&2; exit 1; }
-		mkdir -p /tmp/b
-		printf "FROM busybox:1.37\nARG MARKER\nRUN printf %%s \"\$MARKER\" > /marker\nCMD [\"cat\", \"/marker\"]\n" >/tmp/b/Dockerfile
-		docker buildx build --builder smoke --load --build-arg MARKER="$MARKER" -t smoke-marker /tmp/b >/tmp/build.log 2>&1 ||
-			{ cat /tmp/build.log; exit 1; }
-		got=$(docker run --rm smoke-marker)
-		[ "$got" = "$MARKER" ] || { echo "built image printed \"$got\", want \"$MARKER\"" >&2; exit 1; }
-		echo "docker-container builder: built, loaded and ran smoke-marker; marker matches"
-	'
+	privileged_entrypoint() {
+		mode=$1
+		shift
+		# shellcheck disable=SC2016,SC2086 # the scripts expand inside the container; bk_env splits
+		run -i --privileged -v /home/runner/.local/share/docker -e MODE="$mode" -e WANT_PLATFORM="$PLATFORM" $bk_env \
+			-e MARKER="smoke-marker-$$-$(date +%s)" "$@" \
+			--entrypoint sh "$TAG" -euc '
+			mkdir -p /tmp/fake-runner
+			cat >/tmp/fake-runner/run.sh
+			chmod 755 /tmp/fake-runner/run.sh
+			echo smoke >/tmp/jit
+			RUNNER_DIR=/tmp/fake-runner LUXGHA_JITCONFIG_FILE=/tmp/jit exec lux-gha-runner
+		' <<'EOF'
+#!/bin/sh
+set -eu
+img=moby/buildkit:buildx-stable-1
+pinned=moby/buildkit:$BK_VERSION
+echo "rootless=$(docker info --format "{{.SecurityOptions}}" | grep -o rootless) driver=$(docker info --format "{{.Driver}}")"
+# With the containerd image store an image's ID is the digest of what was
+# pulled or loaded: here the multi-arch index.
+for ref in "$img" "$pinned"; do
+	got=$(docker image inspect "$ref" --format "{{.Id}}") || { echo "$ref is not in the store" >&2; exit 1; }
+	[ "$got" = "$BK_INDEX" ] || { echo "$ref is $got, pinned index $BK_INDEX" >&2; exit 1; }
+done
+got=$(docker image inspect "$img" --format "{{.Os}}/{{.Architecture}}")
+[ "$got" = "$WANT_PLATFORM" ] || { echo "$img is $got, want $WANT_PLATFORM" >&2; exit 1; }
+got=$(docker image inspect --platform "$WANT_PLATFORM" "$img" --format "{{.Descriptor.Digest}}")
+[ "$got" = "$BK_MANIFEST" ] || { echo "$img $WANT_PLATFORM manifest is $got, pinned $BK_MANIFEST" >&2; exit 1; }
+echo "store: $img and $pinned are $BK_INDEX; $WANT_PLATFORM manifest $BK_MANIFEST"
+
+case $MODE in
+offline)
+	# buildx always asks dockerd to pull the builder image first and falls
+	# back to a local one when that fails. With no route out, a builder that
+	# comes up ran the preloaded image.
+	if timeout 20 docker pull -q "$img" >/dev/null 2>&1; then echo "docker pull succeeded: not offline" >&2; exit 1; fi
+	pin=
+	;;
+online)
+	# The same pull buildx makes on create, run first so that the store
+	# holds only what the entrypoint loaded: it resolves the tag at Docker
+	# Hub and must find every blob it names already there.
+	docker pull "$pinned" >/tmp/pull.log 2>&1 || { cat /tmp/pull.log; exit 1; }
+	if ! grep -q "Image is up to date" /tmp/pull.log || grep -Eq "Downloading|Download complete|Pull complete" /tmp/pull.log; then
+		cat /tmp/pull.log
+		echo "docker pull $pinned fetched content" >&2
+		exit 1
+	fi
+	echo "online: docker pull $pinned is up to date, nothing downloaded"
+	pin=$pinned
+	;;
+esac
+start=$(date +%s)
+docker buildx create --name smoke --driver docker-container --driver-opt network=host \
+	${pin:+--driver-opt "image=$pin"} --bootstrap >/tmp/create.log 2>&1 || { cat /tmp/create.log; exit 1; }
+got=$(docker container inspect buildx_buildkit_smoke0 --format "{{.Image}}")
+[ "$got" = "$BK_INDEX" ] || { echo "builder container runs $got, want $BK_INDEX" >&2; exit 1; }
+echo "$MODE: docker-container builder (network=host, image ${pin:-$img by default}) bootstrapped from the preloaded image in $(($(date +%s) - start))s"
+[ "$MODE" = online ] || exit 0
+mkdir -p /tmp/b
+printf "FROM busybox:1.37\nARG MARKER\nRUN printf %%s \"\$MARKER\" > /marker\nCMD [\"cat\", \"/marker\"]\n" >/tmp/b/Dockerfile
+docker buildx build --builder smoke --load --build-arg MARKER="$MARKER" -t smoke-marker /tmp/b >/tmp/build.log 2>&1 ||
+	{ cat /tmp/build.log; exit 1; }
+got=$(docker run --rm smoke-marker)
+[ "$got" = "$MARKER" ] || { echo "built image printed \"$got\", want \"$MARKER\"" >&2; exit 1; }
+echo "docker-container builder: built, loaded and ran smoke-marker; marker matches"
+EOF
+	}
+
+	echo "== APPROXIMATION (--privileged, not the Lux nested contract): entrypoint starts rootless dockerd and preloads BuildKit; docker-container builder with no network"
+	out=$(privileged_entrypoint offline --network none 2>&1) || { echo "$out"; fail "offline BuildKit checks"; }
+	echo "$out"
+	echo "$out" | grep -q "^lux-gha-runner: preloaded moby/buildkit:buildx-stable-1 moby/buildkit:$bk_version in [0-9]*s$" ||
+		fail "entrypoint did not preload moby/buildkit:buildx-stable-1 and :$bk_version"
+	echo "== APPROXIMATION (--privileged): preloaded BuildKit, docker-container builder and a build"
+	privileged_entrypoint online || fail "online BuildKit checks"
 fi
 echo "smoke: OK"

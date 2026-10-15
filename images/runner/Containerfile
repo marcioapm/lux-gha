@@ -1,9 +1,77 @@
 # lux-gha runner: GitHub's official runner, run once with the JIT config Lux
 # places as a file secret, plus rootless Docker for Lux nested Runs
-# (sandbox.nestedContainers). Built and tested for linux/arm64 and linux/amd64.
+# (sandbox.nestedContainers). Built for linux/arm64 and linux/amd64; the
+# rootless dockerd and BuildKit preload checks (smoke.sh --privileged) have
+# run natively on arm64, and on amd64 only in CI's native image job.
 
 # ubuntu:24.04, multi-arch index digest (resolved 2026-10-10).
-FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+# moby/buildkit for setup-buildx-action's docker-container builder, shipped
+# as an OCI archive that the entrypoint loads into the per-Run Docker store.
+# BUILDKIT_DIGEST is the multi-arch index that buildx-stable-1 and
+# BUILDKIT_VERSION pointed to (resolved 2026-10-15); the per-arch digests are
+# its linux/arm64 and linux/amd64 manifests.
+ARG BUILDKIT_VERSION=v0.33.1
+ARG BUILDKIT_DIGEST=sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+ARG BUILDKIT_DIGEST_ARM64=sha256:3ad6bb9bc8c78c0069d03247adb9a59b3b43d68e55353e876e558b888c6c1768
+ARG BUILDKIT_DIGEST_AMD64=sha256:98cc6a3fc46220d00f8224ae483f3274fc874e9be8d7dd1e2e2c5481209228b5
+
+# regctl v0.11.3, alpine variant (has a shell), multi-arch index digest. Runs
+# on the build platform: it only moves bytes.
+FROM --platform=$BUILDPLATFORM ghcr.io/regclient/regctl:v0.11.3-alpine@sha256:246f275efc7d627bb3b6561317ff2742f5fcc574d86bbe276ddd417f19f98744 AS buildkit-fetch
+ARG TARGETARCH
+ARG BUILDKIT_VERSION
+ARG BUILDKIT_DIGEST
+ARG BUILDKIT_DIGEST_ARM64
+ARG BUILDKIT_DIGEST_AMD64
+USER root
+SHELL ["/bin/sh", "-eux", "-c"]
+# An OCI layout holding the pinned index plus the TARGETARCH manifest and its
+# blobs only. Keeping the index makes the loaded image's ID the index digest,
+# as a pull from Docker Hub would, so a later pull of either tag resolves to
+# content already in the store. The fetch is anonymous from Docker Hub and
+# counts against its pull limit for the build host's IP. The index's
+# version annotation must equal BUILDKIT_VERSION, so that the digest and the
+# tag it is filed under cannot drift apart.
+RUN case "$TARGETARCH" in \
+      arm64) want=$BUILDKIT_DIGEST_ARM64 ;; \
+      amd64) want=$BUILDKIT_DIGEST_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    ref="docker.io/moby/buildkit:${BUILDKIT_VERSION}@${BUILDKIT_DIGEST}"; \
+    version=$(regctl manifest get --format '{{index .GetAnnotations "org.opencontainers.image.version"}}' "$ref"); \
+    [ "$version" = "$BUILDKIT_VERSION" ] || { echo "index $BUILDKIT_DIGEST is version '$version', pinned $BUILDKIT_VERSION" >&2; exit 1; }; \
+    got=$(regctl manifest get --platform "linux/$TARGETARCH" --format '{{.GetDescriptor.Digest}}' "$ref"); \
+    [ "$got" = "$want" ] || { echo "index $BUILDKIT_DIGEST lists $got for linux/$TARGETARCH, pinned $want" >&2; exit 1; }; \
+    regctl image copy "docker.io/moby/buildkit@$want" ocidir:///oci:fetched; \
+    regctl manifest get --format raw-body "$ref" >"/oci/blobs/sha256/${BUILDKIT_DIGEST#sha256:}"; \
+    size=$(wc -c <"/oci/blobs/sha256/${BUILDKIT_DIGEST#sha256:}"); \
+    entry() { printf '{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","size":%s,"annotations":{"io.containerd.image.name":"docker.io/moby/buildkit:%s","org.opencontainers.image.ref.name":"%s"}}' \
+      "$BUILDKIT_DIGEST" "$size" "$1" "$1"; }; \
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[%s,%s]}\n' \
+      "$(entry buildx-stable-1)" "$(entry "$BUILDKIT_VERSION")" >/oci/index.json
+
+# Every blob is checked against its file name, the digest that the index, the
+# manifest and the pins above refer to. GNU tar for a byte-stable archive.
+# The archive and its parent directories get fixed modes and mtime 0, so that
+# the COPY --link below yields the same layer digest on every build: a
+# parent directory that COPY creates itself gets the build's wall-clock mtime.
+FROM --platform=$BUILDPLATFORM $UBUNTU_IMAGE AS buildkit-archive
+ARG BUILDKIT_DIGEST
+SHELL ["/bin/sh", "-eux", "-c"]
+COPY --from=buildkit-fetch /oci /oci
+RUN cd /oci/blobs/sha256; \
+    [ -f "${BUILDKIT_DIGEST#sha256:}" ]; \
+    for f in *; do echo "$f  $f"; done | sha256sum -c --quiet -; \
+    d=/out/usr/share/lux-gha; \
+    install -d -m 0755 /out /out/usr /out/usr/share "$d"; \
+    tar -C /oci -cf "$d/buildkit.tar" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=u=rw,go=r,a+X \
+      oci-layout index.json blobs; \
+    chmod 0644 "$d/buildkit.tar"; \
+    touch -d @0 "$d/buildkit.tar" "$d" /out/usr/share /out/usr /out
+
+FROM $UBUNTU_IMAGE
 
 ARG TARGETARCH
 ARG RUNNER_VERSION=2.338.0
@@ -52,7 +120,8 @@ RUN apt-get update; \
 RUN userdel -r ubuntu; \
     useradd -m -u 1000 -U -s /bin/bash runner; \
     printf 'runner:1:999\nrunner:1001:64535\n' > /etc/subuid; \
-    cp /etc/subuid /etc/subgid
+    cp /etc/subuid /etc/subgid; \
+    install -d -o runner -g runner -m 0755 /opt/hostedtoolcache
 
 WORKDIR /home/runner/actions-runner
 RUN case "$TARGETARCH" in \
@@ -84,11 +153,25 @@ RUN install -d -m 0755 /usr/share/lux-gha
 COPY --chmod=644 LICENSE /usr/share/lux-gha/LICENSE
 COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
 
+# Declared here, not at the top of the stage, so that a BuildKit bump
+# rebuilds only the layers from here on.
+ARG BUILDKIT_VERSION
+ARG BUILDKIT_DIGEST
+LABEL io.github.marcioapm.lux-gha.buildkit="moby/buildkit:${BUILDKIT_VERSION}@${BUILDKIT_DIGEST}"
+COPY --link --from=buildkit-archive /out/ /
+
+# The runner installs setup-* tools under RUNNER_TOOL_CACHE, else <work>/_tool.
+# actions/setup-python's CPython is built --enable-shared with its RUNPATH
+# fixed at /opt/hostedtoolcache/Python/<v>/<arch>/lib, so elsewhere it loads
+# libpython only while LD_LIBRARY_PATH is set. AGENT_TOOLSDIRECTORY is the
+# older name, read by some setup-* installer scripts.
 ENV RUNNER_DIR=/home/runner/actions-runner \
     RUNNER_USER=runner \
     HOME=/home/runner \
     XDG_RUNTIME_DIR=/tmp/xdg \
-    DOCKER_HOST=unix:///tmp/xdg/docker.sock
+    DOCKER_HOST=unix:///tmp/xdg/docker.sock \
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 
 USER runner
 WORKDIR /home/runner
