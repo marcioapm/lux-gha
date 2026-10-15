@@ -740,7 +740,9 @@ Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`:
 
 The GitHub release is published before the image jobs start. If an image job fails, re-run the failed
 jobs; the digest artifacts are kept for 7 days. Re-running after a successful push moves `:vX.Y.Z` to a
-new index digest; routes pinned by digest keep working.
+new index digest; routes pinned by digest keep working. If the index job fails at the read-back after
+`imagetools create -t`, the tag has already moved: re-run the release, because routes pin the digest the
+job summary prints.
 
 Tags move; digests do not. The index job's summary prints the pushed reference,
 `ghcr.io/<owner>/lux-gha-runner@sha256:...`, the digest of the index. Put that digest in each route's

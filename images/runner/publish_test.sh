@@ -35,8 +35,11 @@ digest=$(cat "$tmp/digest/$arch")
 
 echo "== image-index.sh, one platform"
 IMAGE=$REPO:publish-test DIGESTS=$tmp/digest PLATFORMS=$PLATFORM OUT=$tmp/ref "$dir/image-index.sh"
-[ "$(cat "$tmp/ref")" = "$REPO@$(docker buildx imagetools inspect "$REPO:publish-test" --format '{{.Manifest.Digest}}')" ] ||
+ref=$(cat "$tmp/ref")
+[ "$ref" = "$REPO@$(docker buildx imagetools inspect "$REPO:publish-test" --format '{{.Manifest.Digest}}')" ] ||
 	fail "OUT does not hold the index reference"
+[ "$(docker buildx imagetools inspect "$ref" --raw | jq -r '[.manifests[].digest]|join(" ")')" = "$digest" ] ||
+	fail "the index $ref does not name exactly the pushed $digest"
 
 echo "== image-index.sh, $PLATFORM digest filed as linux/$other (must fail before tagging)"
 mkdir "$tmp/swapped"
@@ -45,7 +48,7 @@ if out=$(IMAGE=$REPO:publish-test-swapped DIGESTS=$tmp/swapped PLATFORMS=linux/$
 	fail "image-index.sh accepted a $PLATFORM digest as linux/$other"
 fi
 echo "$out"
-echo "$out" | grep -q "index would hold .* not pushed" || fail "image-index.sh failed, but not at the --dry-run check"
+echo "$out" | grep -qF "index would hold $PLATFORM=$digest, want linux/$other=$digest; $REPO:publish-test-swapped not pushed" || fail "image-index.sh failed, but not at the --dry-run check"
 if docker buildx imagetools inspect "$REPO:publish-test-swapped" >/dev/null 2>&1; then
 	fail "$REPO:publish-test-swapped was pushed"
 fi

@@ -98,6 +98,9 @@ jobs:
   # platform as input, and this job builds once more as the release job does.
   publish:
     runs-on: ubuntu-24.04-arm
+    env:
+      PLATFORM: linux/arm64
+      TAG: lux-gha-runner:tested
     services:
       registry:
         image: registry:2
@@ -114,14 +117,9 @@ jobs:
           driver-opts: network=host
 
       - name: smoke.sh --keep
-        env:
-          PLATFORM: linux/arm64
-          TAG: lux-gha-runner:tested
         run: images/runner/smoke.sh --keep
 
       - name: publish_test.sh
         env:
           REPO: localhost:5000/lux-gha-runner
-          PLATFORM: linux/arm64
-          TAG: lux-gha-runner:tested
         run: images/runner/publish_test.sh
