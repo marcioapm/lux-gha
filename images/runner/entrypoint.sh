@@ -7,11 +7,18 @@
 # rootless Docker engine is started first for the job's steps, listening on
 # DOCKER_HOST. It must answer `docker info` within LUXGHA_DOCKER_WAIT seconds
 # (default 60) and is required unless LUXGHA_DOCKER=optional.
+#
+# Once the engine answers, the BuildKit image archive the image ships (if
+# any) is loaded into its store, so that setup-buildx-action's
+# docker-container builder does not pull moby/buildkit. A failed load only
+# warns: the builder then pulls as it would without the archive.
+# LUXGHA_BUILDKIT_ARCHIVE=none skips it; unset or empty means the default.
 set -eu
 
 RUNNER_DIR=${RUNNER_DIR:-/home/runner/actions-runner}
 RUNNER_USER=${RUNNER_USER:-runner}
 config_file=${LUXGHA_JITCONFIG_FILE:?LUXGHA_JITCONFIG_FILE is not set}
+docker_up=false
 
 [ -r "$config_file" ] || { echo "lux-gha-runner: JIT config file is not readable" >&2; exit 1; }
 jitconfig=$(cat "$config_file")
@@ -42,7 +49,7 @@ start_docker() {
 		# A daemon that accepts the connection but never answers must not
 		# outlast the deadline: each probe gets at most 5 s.
 		[ "$left" -le 5 ] || left=5
-		timeout -k 1 "$left" docker info >/dev/null 2>&1 && return 0
+		timeout -k 1 "$left" docker info >/dev/null 2>&1 && { docker_up=true; return 0; }
 		sleep 1
 	done
 	echo "lux-gha-runner: rootless dockerd did not come up within ${wait_s}s; last lines of $log:" >&2
@@ -56,6 +63,27 @@ start_docker() {
 
 start_docker
 
+# The store is the per-Run volume Lux mounts over ~/.local/share/docker, so
+# the image cannot carry the BuildKit image in it; it carries an archive.
+load_buildkit() {
+	archive=${LUXGHA_BUILDKIT_ARCHIVE:-/usr/share/lux-gha/buildkit.tar}
+	[ "$archive" != none ] || return 0
+	[ -f "$archive" ] || return 0
+	limit=${LUXGHA_BUILDKIT_LOAD_TIMEOUT:-30}
+	log=/tmp/buildkit-load.log
+	case $limit in '' | *[!0-9]* | 0*)
+		echo "lux-gha-runner: warning: LUXGHA_BUILDKIT_LOAD_TIMEOUT must be a positive integer without a leading zero; BuildKit not preloaded" >&2
+		return 0 ;;
+	esac
+	start=$(date +%s)
+	if timeout -k 2 "$limit" docker load -i "$archive" >"$log" 2>&1; then
+		echo "lux-gha-runner: preloaded $(sed -n 's/^Loaded image: //p' "$log" | paste -sd ' ' -) in $(($(date +%s) - start))s"
+	else
+		echo "lux-gha-runner: warning: docker load -i $archive failed or exceeded ${limit}s (see $log); setup-buildx will pull moby/buildkit" >&2
+	fi
+}
+
+if $docker_up; then load_buildkit; fi
 cd "$RUNNER_DIR"
 # run.sh forwards SIGTERM to the listener as SIGINT only with this set; the
 # listener then cancels the running job and uploads its logs before exiting.

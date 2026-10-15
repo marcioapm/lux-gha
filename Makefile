@@ -1,7 +1,7 @@
 .PHONY: check lint fmt vet license test entrypoint-test image dist
 
 # The runner image's pinned base, read from its Containerfile.
-RUNNER_BASE := $(shell sed -n 's/^FROM //p' images/runner/Containerfile)
+RUNNER_BASE := $(shell sed -n 's/^ARG UBUNTU_IMAGE=//p' images/runner/Containerfile)
 IMAGE_TAG ?= lux-gha-runner:dev
 
 check: lint test

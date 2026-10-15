@@ -70,7 +70,8 @@ jobs:
         run: make entrypoint-test
 
   # Builds the runner image for each architecture on a runner of that
-  # architecture and runs the unprivileged smoke test against it. Always run:
+  # architecture and runs smoke.sh --privileged against it: the unprivileged
+  # checks plus rootless dockerd, the BuildKit preload and builds. Always run:
   # the image pins apt package versions that Docker's repository can drop, and
   # this catches that before a tag does.
   image:
@@ -87,10 +88,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: smoke.sh (builds the image, then tests it)
+      # rootless dockerd in smoke.sh --privileged creates a user namespace as
+      # uid 1000 in an unconfined (privileged) container. Ubuntu 24.04's
+      # AppArmor denies that to unconfined processes while this sysctl is 1.
+      # Kernels without the key have no such restriction.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: smoke.sh --privileged (builds the image, then tests it)
         env:
           PLATFORM: ${{ matrix.platform }}
-        run: images/runner/smoke.sh
+        run: images/runner/smoke.sh --privileged
 
   # The release's publish scripts, push-by-digest.sh and image-index.sh,
   # against a registry on localhost:5000 (publish_test.sh), so a broken
