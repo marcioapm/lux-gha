@@ -91,3 +91,37 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
         run: images/runner/smoke.sh
+
+  # The release's publish scripts, push-by-digest.sh and image-index.sh,
+  # against a registry on localhost:5000 (publish_test.sh), so a broken
+  # script fails here and not on a tag. arm64 only: the scripts take the
+  # platform as input, and this job builds once more as the release job does.
+  publish:
+    runs-on: ubuntu-24.04-arm
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker-container, as in release.yml: push-by-digest needs it. The
+      # BuildKit container shares the host's network so that localhost:5000
+      # is the registry service; BuildKit speaks plain HTTP to localhost.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: smoke.sh --keep
+        env:
+          PLATFORM: linux/arm64
+          TAG: lux-gha-runner:tested
+        run: images/runner/smoke.sh --keep
+
+      - name: publish_test.sh
+        env:
+          REPO: localhost:5000/lux-gha-runner
+          PLATFORM: linux/arm64
+          TAG: lux-gha-runner:tested
+        run: images/runner/publish_test.sh

@@ -733,13 +733,14 @@ Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`:
 2. The runner image for **linux/arm64 and linux/amd64**. One job per architecture, on a hosted runner of
    that architecture, builds the image and smoke-tests it (`smoke.sh`). It then pushes it to
    `ghcr.io/<owner>/lux-gha-runner` by digest, with no tag. The push rebuilds from the same builder's cache,
-   and the job fails unless the pushed image's layers and config equal the tested image's. A final job
-   publishes `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z` as an image index over the two digests. It runs only
-   if both architectures passed.
+   and the job fails unless the pushed image's platform, layers and runtime config fields equal the tested
+   image's (`images/runner/push-by-digest.sh`; [the fields compared](images/runner/README.md#build-and-smoke-test)).
+   A final job publishes `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z` as an image index over the two digests, after
+   checking the index it would push (`images/runner/image-index.sh`). It runs only if both architectures passed.
 
 The GitHub release is published before the image jobs start. If an image job fails, re-run the failed
-jobs. Re-running after a successful push moves `:vX.Y.Z` to a new index digest; routes pinned by digest
-keep working.
+jobs; the digest artifacts are kept for 7 days. Re-running after a successful push moves `:vX.Y.Z` to a
+new index digest; routes pinned by digest keep working.
 
 Tags move; digests do not. The index job's summary prints the pushed reference,
 `ghcr.io/<owner>/lux-gha-runner@sha256:...`, the digest of the index. Put that digest in each route's

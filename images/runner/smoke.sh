@@ -20,8 +20,8 @@ set -eu
 TAG=${TAG:-lux-gha-runner:smoke}
 PLATFORM=${PLATFORM:-linux/arm64}
 case $PLATFORM in
-linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 ;;
-linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 ;;
+linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 ;;
+linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e ;;
 *) echo "PLATFORM must be linux/arm64 or linux/amd64, not $PLATFORM" >&2; exit 2 ;;
 esac
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -68,8 +68,13 @@ echo "image $got"
 
 echo "== tools"
 # shellcheck disable=SC2016 # the script expands inside the container
-run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" --entrypoint sh "$TAG" -euc '
+run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_machine" --entrypoint sh "$TAG" -euc '
 	[ "$(dpkg --print-architecture)" = "$WANT_ARCH" ] || { echo "dpkg architecture $(dpkg --print-architecture), want $WANT_ARCH" >&2; exit 1; }
+	# e_machine (low byte, offset 18): b7 aarch64, 3e x86_64. Under binfmt
+	# emulation a runner tarball of the wrong architecture would still run.
+	m=$(od -An -tx1 -j18 -N1 "$RUNNER_DIR/bin/Runner.Listener" | tr -d " ")
+	[ "$m" = "$WANT_ELF" ] || { echo "Runner.Listener ELF machine $m, want $WANT_ELF" >&2; exit 1; }
+	echo "Runner.Listener ELF machine $m"
 	v=$(cd "$RUNNER_DIR" && ./config.sh --version)
 	echo "runner $v"
 	[ "$v" = "$WANT_RUNNER" ] || { echo "runner version $v, pinned $WANT_RUNNER" >&2; exit 1; }

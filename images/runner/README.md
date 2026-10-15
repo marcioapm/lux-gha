@@ -34,16 +34,16 @@ lines and exits 1. Set `LUXGHA_DOCKER=optional` in the Run's env to continue wit
 ## Build and smoke test
 
 ```sh
-docker buildx build --platform linux/arm64 --load -t lux-gha-runner:dev -f images/runner/Containerfile images/runner
+make image PLATFORM=linux/arm64            # or linux/amd64; loads lux-gha-runner:dev
 images/runner/smoke.sh                     # tools, caps, runner version, entrypoint lifecycle and failure modes
 images/runner/smoke.sh --privileged        # also rootless dockerd + a docker-container buildx build
 images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail the build; rebuilds the runner layer
 PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default linux/arm64)
 ```
 
-`smoke.sh` builds for `PLATFORM` (`linux/arm64` by default, or `linux/amd64`) and checks that the image
-and its `dpkg` architecture match it. Run it on a host of that architecture; under emulation it may pass
-or fail for reasons that do not hold on real hardware.
+`smoke.sh` builds for `PLATFORM` (`linux/arm64` by default, or `linux/amd64`) and checks that the image,
+its `dpkg` architecture and the ELF machine of the runner's `bin/Runner.Listener` match it. Run it on a host
+of that architecture; under emulation it may pass or fail for reasons that do not hold on real hardware.
 
 `entrypoint_test.sh` runs inside the image as part of `smoke.sh`, or on its own on Linux as a non-root
 user with `sh images/runner/entrypoint_test.sh`, or anywhere with Docker as `make entrypoint-test` (uid 1000
@@ -63,9 +63,20 @@ uid 1000; this path leaves Docker startup to the job.
 
 CI runs the default `smoke.sh` for every pull request twice, natively: `linux/arm64` on `ubuntu-24.04-arm`
 and `linux/amd64` on `ubuntu-24.04`. A `v*` tag builds and smoke-tests each architecture the same way, pushes
-each by digest only, then publishes `ghcr.io/<owner>/lux-gha-runner:<tag>` as an image index over the two
-(see [Releases](../../README.md#releases)). A route pins the index digest; each Lux host pulls the image for
-its own architecture.
+each by digest only (`push-by-digest.sh`), then publishes `ghcr.io/<owner>/lux-gha-runner:<tag>` as an image
+index over the two (`image-index.sh`; see [Releases](../../README.md#releases)). A route pins the index digest;
+each Lux host pulls the image for its own architecture.
+
+`push-by-digest.sh` rebuilds with the builder that built the tested image and fails unless the pushed image
+has the tested image's platform, layer diff IDs and image config fields `User`, `ExposedPorts`, `Env`,
+`Entrypoint`, `Cmd`, `Volumes`, `WorkingDir`, `Labels`, `StopSignal` and `ArgsEscaped`. It does not compare
+`Created`, the container-only fields `docker image inspect` adds (`Hostname`, `Domainname`, `Image`, `Attach*`,
+`Tty`, `OpenStdin`, `StdinOnce`), or `Shell`, `Healthcheck` and `OnBuild`, which `buildx imagetools inspect`
+does not return. `image-index.sh` computes the index with `--dry-run`, checks that it holds exactly the
+expected `platform=digest` pairs, pushes the tag, then reads the index back by digest and checks again.
+CI's `publish` job runs both against a `registry:2` service (`publish_test.sh`): a one-platform arm64
+index, an index that files the arm64 digest as amd64 (must fail before tagging), and a tested image that
+differs from the push by one label (must fail).
 
 ## Route
 
