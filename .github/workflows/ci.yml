@@ -69,13 +69,57 @@ jobs:
       - name: make entrypoint-test
         run: make entrypoint-test
 
-  # Builds the runner image for linux/arm64 and runs the unprivileged smoke
-  # test against it. Always run: the image pins apt package versions that
-  # Docker's repository can drop, and this catches that before a tag does.
+  # Builds the runner image for each architecture on a runner of that
+  # architecture and runs the unprivileged smoke test against it. Always run:
+  # the image pins apt package versions that Docker's repository can drop, and
+  # this catches that before a tag does.
   image:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+    name: image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: smoke.sh (builds the image, then tests it)
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: images/runner/smoke.sh
+
+  # The release's publish scripts, push-by-digest.sh and image-index.sh,
+  # against a registry on localhost:5000 (publish_test.sh), so a broken
+  # script fails here and not on a tag. arm64 only: the scripts take the
+  # platform as input, and this job builds once more as the release job does.
+  publish:
+    runs-on: ubuntu-24.04-arm
+    env:
+      PLATFORM: linux/arm64
+      TAG: lux-gha-runner:tested
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker-container, as in release.yml: push-by-digest needs it. The
+      # BuildKit container shares the host's network so that localhost:5000
+      # is the registry service; BuildKit speaks plain HTTP to localhost.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: smoke.sh --keep
+        run: images/runner/smoke.sh --keep
+
+      - name: publish_test.sh
+        env:
+          REPO: localhost:5000/lux-gha-runner
+        run: images/runner/publish_test.sh

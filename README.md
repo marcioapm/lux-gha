@@ -708,15 +708,16 @@ make lint              # gofmt check, go vet ./..., scripts/check-license.sh
 make test              # go test -race -count=1 ./...
 make check             # lint, then test
 make entrypoint-test   # images/runner/entrypoint_test.sh as uid 1000 in the runner's pinned ubuntu base (Docker)
-make image             # the runner image for the host's architecture, as lux-gha-runner:dev (IMAGE_TAG=...)
+make image             # the runner image for the host's architecture, as lux-gha-runner:dev (IMAGE_TAG=..., PLATFORM=linux/amd64)
 make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
 
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, one
 `go test -race -v` run that fails if any test skipped, and `make dist VERSION=v0.0.0`; `shellcheck`, `sh -n`
-and `make entrypoint-test`; and a linux/arm64 build of the runner image with `images/runner/smoke.sh`
-(unprivileged). The arm64 jobs run on `ubuntu-24.04-arm`, a hosted runner GitHub provides only to public
-repositories: while the repository is private they get no runner.
+and `make entrypoint-test`; and the runner image built and smoke-tested with `images/runner/smoke.sh`
+(unprivileged) natively for linux/arm64 on `ubuntu-24.04-arm` and for linux/amd64 on `ubuntu-24.04`.
+`ubuntu-24.04-arm` is a hosted runner GitHub provides only to public repositories: while the repository
+is private the arm64 jobs get no runner.
 
 ## Releases
 
@@ -729,16 +730,24 @@ Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`:
 
    `make dist` fails unless each binary carries the tag as its version. The tarballs are reproducible:
    rebuilding the same tag with the same Go toolchain and GNU gzip gives byte-identical files.
-2. The runner image, built for **linux/arm64 only** and smoke-tested before it is pushed as
-   `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z`. The Containerfile can select the amd64 runner, but no amd64
-   image is built or tested.
+2. The runner image for **linux/arm64 and linux/amd64**. One job per architecture, on a hosted runner of
+   that architecture, builds the image and smoke-tests it (`smoke.sh`). It then pushes it to
+   `ghcr.io/<owner>/lux-gha-runner` by digest, with no tag. The push rebuilds from the same builder's cache,
+   and the job fails unless the pushed image's platform, layers and runtime config fields equal the tested
+   image's (`images/runner/push-by-digest.sh`; [the fields compared](images/runner/README.md#build-and-smoke-test)).
+   A final job publishes `ghcr.io/<owner>/lux-gha-runner:vX.Y.Z` as an image index over the two digests, after
+   checking the index it would push (`images/runner/image-index.sh`). It runs only if both architectures passed.
 
-The GitHub release is published before the image job starts. If the image job fails, re-run only that
-job. Re-running it after a successful push moves `:vX.Y.Z` to a new digest; routes pinned by digest keep
-working.
+The GitHub release is published before the image jobs start. If an image job fails, re-run the failed
+jobs; the digest artifacts are kept for 7 days. Re-running after a successful push moves `:vX.Y.Z` to a
+new index digest; routes pinned by digest keep working. If the index job fails at the read-back after
+`imagetools create -t`, the tag has already moved: re-run the release, because routes pin the digest the
+job summary prints.
 
-Tags move; digests do not. The release job's summary prints the pushed reference,
-`ghcr.io/<owner>/lux-gha-runner@sha256:...`. Put that digest in each route's `image`. To read it later:
+Tags move; digests do not. The index job's summary prints the pushed reference,
+`ghcr.io/<owner>/lux-gha-runner@sha256:...`, the digest of the index. Put that digest in each route's
+`image`: a Lux host pulls the manifest for its own architecture from it, so one digest serves arm64 and
+amd64 pools. To read it later:
 
 ```sh
 docker buildx imagetools inspect ghcr.io/<owner>/lux-gha-runner:vX.Y.Z --format '{{.Manifest.Digest}}'

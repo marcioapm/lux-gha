@@ -1,6 +1,6 @@
 # lux-gha runner: GitHub's official runner, run once with the JIT config Lux
 # places as a file secret, plus rootless Docker for Lux nested Runs
-# (sandbox.nestedContainers). Built and tested for linux/arm64.
+# (sandbox.nestedContainers). Built and tested for linux/arm64 and linux/amd64.
 
 # ubuntu:24.04, multi-arch index digest (resolved 2026-10-10).
 FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
