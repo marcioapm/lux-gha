@@ -14,6 +14,8 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   `containerd.io`, buildx 0.38.0, compose 5.6.0. Also `uidmap` (`newuidmap`/`newgidmap` with file
   capabilities only), `fuse-overlayfs`, `slirp4netns`, `iptables` and `iproute2`.
 - `git`, `curl`, `ca-certificates`, `jq`, `unzip`, `xz-utils`, `python3`. uv is not baked in: `astral-sh/setup-uv` installs it.
+- `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
+  `node` exits 127 without it.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.

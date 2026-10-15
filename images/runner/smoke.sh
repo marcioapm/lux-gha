@@ -63,6 +63,8 @@ run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
 	docker buildx version
 	docker compose version
 	python3 --version
+	# The official Node.js linux-arm64 builds (actions/setup-node) link libatomic.
+	ldconfig -p | grep -q "libatomic.so.1 " || { echo "libatomic.so.1 is missing" >&2; exit 1; }
 	id
 	[ "$(id -u)" = 1000 ] && [ "$(id -un)" = runner ]
 	grep -x "runner:1:999" /etc/subuid && grep -x "runner:1001:64535" /etc/subgid
