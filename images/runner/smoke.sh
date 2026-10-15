@@ -1,20 +1,29 @@
 #!/bin/sh
-# Local smoke test for the runner image: builds it for linux/arm64 into the
-# local Docker and checks its tools, user, file capabilities, the entrypoint
-# lifecycle (entrypoint_test.sh, run inside the image) and its failure modes
-# against the real runner.
+# Local smoke test for the runner image: builds it for $PLATFORM
+# (linux/arm64, the default, or linux/amd64) into the local Docker and checks
+# its architecture, tools, user, file capabilities, the entrypoint lifecycle
+# (entrypoint_test.sh, run inside the image) and its failure modes against the
+# real runner. Run it on a host of that architecture: under emulation the
+# results say little about the image on real hardware.
 #
 # --privileged also starts rootless dockerd and builds with a docker-container
 # buildx builder. That is an approximation only: Lux nested Runs are never
 # privileged, so it does not prove the Lux nested-container contract.
 #
-# --checksum-negative only rebuilds the runner layer with a wrong
-# RUNNER_SHA256_ARM64 and requires that build to fail at the checksum check.
+# --checksum-negative only rebuilds the runner layer with a wrong runner
+# SHA-256 for $PLATFORM (RUNNER_SHA256_ARM64 or RUNNER_SHA256_AMD64) and
+# requires that build to fail at the checksum check.
 #
-# Usage: images/runner/smoke.sh [--privileged] [--keep] | --checksum-negative
+# Usage: [PLATFORM=linux/arm64|linux/amd64] [TAG=...] images/runner/smoke.sh [--privileged] [--keep] | --checksum-negative
 set -eu
 
 TAG=${TAG:-lux-gha-runner:smoke}
+PLATFORM=${PLATFORM:-linux/arm64}
+case $PLATFORM in
+linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 ;;
+linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 ;;
+*) echo "PLATFORM must be linux/arm64 or linux/amd64, not $PLATFORM" >&2; exit 2 ;;
+esac
 dir=$(cd "$(dirname "$0")" && pwd)
 privileged=false keep=false checksum_negative=false
 for arg in "$@"; do
@@ -27,17 +36,17 @@ for arg in "$@"; do
 done
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-run() { docker run --rm --platform linux/arm64 "$@"; }
+run() { docker run --rm --platform "$PLATFORM" "$@"; }
 
 sh "$dir/../../scripts/check-license.sh" || fail "images/runner/LICENSE does not match the root LICENSE"
 
 if $checksum_negative; then
 	log=$(mktemp)
 	trap 'rm -f "$log"' EXIT
-	echo "== build with RUNNER_SHA256_ARM64 set to 64 zeros"
+	echo "== $PLATFORM build with $sha_arg set to 64 zeros"
 	# No --load and no tag: a failed build must leave nothing behind.
-	if docker buildx build --platform linux/arm64 --progress=plain \
-		--build-arg RUNNER_SHA256_ARM64=0000000000000000000000000000000000000000000000000000000000000000 \
+	if docker buildx build --platform "$PLATFORM" --progress=plain \
+		--build-arg "$sha_arg=0000000000000000000000000000000000000000000000000000000000000000" \
 		-f "$dir/Containerfile" "$dir" >"$log" 2>&1; then
 		fail "build succeeded with a wrong runner checksum"
 	fi
@@ -48,13 +57,19 @@ if $checksum_negative; then
 	exit 0
 fi
 
-docker buildx build --platform linux/arm64 --load -t "$TAG" -f "$dir/Containerfile" "$dir"
+docker buildx build --platform "$PLATFORM" --load -t "$TAG" -f "$dir/Containerfile" "$dir"
 $keep || trap 'docker image rm "$TAG" >/dev/null 2>&1 || true' EXIT
 runner_version=$(docker image inspect "$TAG" --format '{{index .Config.Labels "io.github.actions.runner.version"}}')
 
+echo "== architecture"
+got=$(docker image inspect "$TAG" --format '{{.Os}}/{{.Architecture}}')
+echo "image $got"
+[ "$got" = "$PLATFORM" ] || fail "image is $got, want $PLATFORM"
+
 echo "== tools"
 # shellcheck disable=SC2016 # the script expands inside the container
-run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
+run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" --entrypoint sh "$TAG" -euc '
+	[ "$(dpkg --print-architecture)" = "$WANT_ARCH" ] || { echo "dpkg architecture $(dpkg --print-architecture), want $WANT_ARCH" >&2; exit 1; }
 	v=$(cd "$RUNNER_DIR" && ./config.sh --version)
 	echo "runner $v"
 	[ "$v" = "$WANT_RUNNER" ] || { echo "runner version $v, pinned $WANT_RUNNER" >&2; exit 1; }
@@ -63,7 +78,8 @@ run -e WANT_RUNNER="$runner_version" --entrypoint sh "$TAG" -euc '
 	docker buildx version
 	docker compose version
 	python3 --version
-	# The official Node.js linux-arm64 builds (actions/setup-node) link libatomic.
+	# The official Node.js linux-arm64 builds (actions/setup-node) link
+	# libatomic; the image installs it on every architecture.
 	ldconfig -p | grep -q "libatomic.so.1 " || { echo "libatomic.so.1 is missing" >&2; exit 1; }
 	id
 	[ "$(id -u)" = 1000 ] && [ "$(id -un)" = runner ]

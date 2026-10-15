@@ -69,13 +69,25 @@ jobs:
       - name: make entrypoint-test
         run: make entrypoint-test
 
-  # Builds the runner image for linux/arm64 and runs the unprivileged smoke
-  # test against it. Always run: the image pins apt package versions that
-  # Docker's repository can drop, and this catches that before a tag does.
+  # Builds the runner image for each architecture on a runner of that
+  # architecture and runs the unprivileged smoke test against it. Always run:
+  # the image pins apt package versions that Docker's repository can drop, and
+  # this catches that before a tag does.
   image:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+    name: image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: smoke.sh (builds the image, then tests it)
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: images/runner/smoke.sh

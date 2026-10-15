@@ -6,8 +6,8 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 
 ## Contents
 
-- `ubuntu:24.04`, pinned by its multi-arch index digest. Built and tested for `linux/arm64`; the
-  Containerfile also selects the `linux/amd64` runner tarball and hash, but that build is untested.
+- `ubuntu:24.04`, pinned by its multi-arch index digest. Built and smoke-tested for `linux/arm64` and
+  `linux/amd64`; the Containerfile selects the runner tarball and its hash by `TARGETARCH`.
 - [actions/runner](https://github.com/actions/runner) 2.338.0 in `/home/runner/actions-runner`. The
   tarball is checked against its published SHA-256, and `bin/installdependencies.sh` runs at build time.
 - Docker Engine 29.9.0 from Docker's apt repository: `docker-ce`, `docker-ce-cli`, `docker-ce-rootless-extras`,
@@ -15,7 +15,7 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   capabilities only), `fuse-overlayfs`, `slirp4netns`, `iptables` and `iproute2`.
 - `git`, `curl`, `ca-certificates`, `jq`, `unzip`, `xz-utils`, `python3`. uv is not baked in: `astral-sh/setup-uv` installs it.
 - `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
-  `node` exits 127 without it.
+  `node` exits 127 without it. The amd64 image has it too.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.
@@ -38,7 +38,12 @@ docker buildx build --platform linux/arm64 --load -t lux-gha-runner:dev -f image
 images/runner/smoke.sh                     # tools, caps, runner version, entrypoint lifecycle and failure modes
 images/runner/smoke.sh --privileged        # also rootless dockerd + a docker-container buildx build
 images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail the build; rebuilds the runner layer
+PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default linux/arm64)
 ```
+
+`smoke.sh` builds for `PLATFORM` (`linux/arm64` by default, or `linux/amd64`) and checks that the image
+and its `dpkg` architecture match it. Run it on a host of that architecture; under emulation it may pass
+or fail for reasons that do not hold on real hardware.
 
 `entrypoint_test.sh` runs inside the image as part of `smoke.sh`, or on its own on Linux as a non-root
 user with `sh images/runner/entrypoint_test.sh`, or anywhere with Docker as `make entrypoint-test` (uid 1000
@@ -56,8 +61,11 @@ only verified live, against a real GitHub job; the signal harness uses a fake li
 `make entrypoint-test` also checks uid 0 through real `setpriv`, dropping to
 uid 1000; this path leaves Docker startup to the job.
 
-CI runs the default `smoke.sh` on a linux/arm64 runner for every pull request. A `v*` tag builds, smoke-tests
-and pushes the arm64 image to `ghcr.io/<owner>/lux-gha-runner` (see [Releases](../../README.md#releases)).
+CI runs the default `smoke.sh` for every pull request twice, natively: `linux/arm64` on `ubuntu-24.04-arm`
+and `linux/amd64` on `ubuntu-24.04`. A `v*` tag builds and smoke-tests each architecture the same way, pushes
+each by digest only, then publishes `ghcr.io/<owner>/lux-gha-runner:<tag>` as an image index over the two
+(see [Releases](../../README.md#releases)). A route pins the index digest; each Lux host pulls the image for
+its own architecture.
 
 ## Route
 
@@ -68,7 +76,7 @@ and pushes the arm64 image to `ghcr.io/<owner>/lux-gha-runner` (see [Releases](.
  "nestedContainers": true, "egressHosts": ["..."]}
 ```
 
-- `image`: the pushed image, referenced by digest.
+- `image`: the pushed image index, referenced by digest. The same digest serves arm64 and amd64 pools.
 - `nestedContainers: true`, with `pool` set to a pool whose hosts run `lux-runner --nested`. Otherwise the
   entrypoint exits 1 because dockerd cannot start.
 - Docker's store sits on the ephemeral volume Lux mounts at `~/.local/share/docker`, so `diskGiB` (or, on a
@@ -117,7 +125,7 @@ current.
 The table covers the runner and the tools named above. The first pilot workflow's own image build needed more:
 
 - Docker Hub, for its base `ubuntu:26.04`;
-- the Ubuntu arm64 apt mirror, `ports.ubuntu.com`;
+- the Ubuntu arm64 apt mirror, `ports.ubuntu.com` (on amd64: `archive.ubuntu.com` and `security.ubuntu.com`);
 - `registry.npmjs.org`;
 - `services.gradle.org`;
 - `builds.dotnet.microsoft.com`;

@@ -28,9 +28,10 @@ entrypoint-test:
 	docker run --rm -i --workdir /home/ubuntu --user 0:0 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
 		$(RUNNER_BASE) -s /src/entrypoint.sh sigterm-root <images/runner/entrypoint_test.sh
 
-# The runner image for the host's architecture, loaded into the local Docker.
+# The runner image, loaded into the local Docker: the host's architecture, or
+# PLATFORM=linux/arm64|linux/amd64.
 image:
-	docker buildx build --load -t $(IMAGE_TAG) -f images/runner/Containerfile images/runner
+	docker buildx build $(if $(PLATFORM),--platform $(PLATFORM)) --load -t $(IMAGE_TAG) -f images/runner/Containerfile images/runner
 
 # Release tarballs and SHA256SUMS in dist/ (README "Releases"). VERSION reaches
 # dist.sh through the environment Make exports, never through the recipe line:
