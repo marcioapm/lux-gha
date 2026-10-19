@@ -95,7 +95,7 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	docker buildx version
 	docker compose version
 	python3 --version
-	socat -V | head -n 2
+	socat -V
 	session-manager-plugin --version
 	aws --version
 	# The official Node.js linux-arm64 builds (actions/setup-node) link
