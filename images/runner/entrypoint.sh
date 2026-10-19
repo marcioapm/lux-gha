@@ -6,7 +6,9 @@
 # When dockerd-rootless is installed and DOCKER_HOST is a unix socket, a
 # rootless Docker engine is started first for the job's steps, listening on
 # DOCKER_HOST. It must answer `docker info` within LUXGHA_DOCKER_WAIT seconds
-# (default 60) and is required unless LUXGHA_DOCKER=optional.
+# (default 60) and is required unless LUXGHA_DOCKER=optional. Its containers
+# reach the runner's own loopback through host-gateway (host.docker.internal),
+# as they do with rootful Docker: see start_docker.
 #
 # Once the engine answers, the BuildKit image archive the image ships (if
 # any) is loaded into its store, so that setup-buildx-action's
@@ -40,7 +42,14 @@ start_docker() {
 	chmod 700 "$XDG_RUNTIME_DIR"
 	# Own session, so a signal to the runner's process group does not reach it.
 	# --host makes dockerd listen where the CLI and the job's steps look.
-	setsid "$dockerd" --host "$DOCKER_HOST" </dev/null >"$log" 2>&1 &
+	# Rootless defaults block a container from the runner's 127.0.0.1, and its
+	# host-gateway is an address the runner does not have. slirp4netns maps
+	# 10.0.2.2 to the runner's loopback once host loopback is allowed, so
+	# host.docker.internal:host-gateway reaches a server the job bound to
+	# 127.0.0.1. That loopback is the Run's own network namespace, not the host's.
+	DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns \
+		DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=false \
+		setsid "$dockerd" --host "$DOCKER_HOST" --host-gateway-ip=10.0.2.2 </dev/null >"$log" 2>&1 &
 	pid=$!
 	deadline=$(($(date +%s) + wait_s))
 	while kill -0 "$pid" 2>/dev/null; do

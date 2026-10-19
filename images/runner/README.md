@@ -14,6 +14,11 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   `containerd.io`, buildx 0.38.0, compose 5.6.0. Also `uidmap` (`newuidmap`/`newgidmap` with file
   capabilities only), `fuse-overlayfs`, `slirp4netns`, `iptables` and `iproute2`.
 - `git`, `curl`, `ca-certificates`, `jq`, `unzip`, `xz-utils`, `python3`. uv is not baked in: `astral-sh/setup-uv` installs it.
+- `socat` and the AWS Session Manager plugin 1.2.896.0 (`session-manager-plugin`, checked against a pinned
+  SHA-256 per architecture), for `aws ssm start-session` port forwarding, which jobs otherwise install with
+  `sudo`.
+- AWS CLI v2 2.38.1 (`aws`), installed from versioned, SHA-256-pinned archives for each architecture.
+  Jobs can use it directly without downloading tools or elevating privileges at runtime.
 - `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
   `node` exits 127 without it. The amd64 image has it too.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
@@ -31,7 +36,10 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is
 `unix:///tmp/xdg/docker.sock`), the entrypoint starts the engine listening on `DOCKER_HOST` (`--host`) and
-logs to `/tmp/dockerd.log`. It waits up to 60 s in total for `docker info`, each probe bounded to 5 s, and
+logs to `/tmp/dockerd.log`. It runs rootlesskit with `slirp4netns` and host loopback allowed, and sets
+`--host-gateway-ip=10.0.2.2`, slirp4netns's address for the runner's loopback: a container started with
+`--add-host host.docker.internal:host-gateway` reaches a server the job bound to `127.0.0.1`, as with rootful
+Docker. That loopback belongs to the Run's own network namespace, not the Lux host's. It waits up to 60 s in total for `docker info`, each probe bounded to 5 s, and
 stops early if the daemon exits. If the engine does not come up, the entrypoint prints the log's last 20
 lines and exits 1. Set `LUXGHA_DOCKER=optional` in the Run's env to continue without Docker instead.
 `LUXGHA_DOCKER_WAIT` (whole seconds, no leading zero, default 60) changes the deadline. It exists for

@@ -87,6 +87,16 @@ ARG BUILDX_VERSION=0.38.0-1~ubuntu.24.04~noble
 ARG COMPOSE_VERSION=5.6.0-1~ubuntu.24.04~noble
 # Docker Release (CE deb) <docker@docker.com>
 ARG DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# AWS Session Manager plugin, for `aws ssm start-session` port forwarding. AWS
+# publishes no checksum file; these are the SHA-256 of the versioned debs
+# (resolved 2026-10-19), so a changed upload fails the build.
+ARG SSM_PLUGIN_VERSION=1.2.896.0
+ARG SSM_PLUGIN_SHA256_AMD64=53f51fcc67314a4bf85888a38a3967cd41f8d0f28a60a9469a63acf935ba713e
+ARG SSM_PLUGIN_SHA256_ARM64=914eeca87b18b55356c58be197080f73742b3ca60d3823f0a45670dc9056aa9c
+# Versioned AWS CLI v2 archives (resolved 2026-10-19).
+ARG AWS_CLI_VERSION=2.38.1
+ARG AWS_CLI_SHA256_AMD64=b11ed416d91f4251da363a17706938eeaf0e520745754c104c0c1890dd8363c7
+ARG AWS_CLI_SHA256_ARM64=91360c0adb2ae508334ff657dce4787b598b443a11cf3dc58e08b74f12e16009
 
 LABEL org.opencontainers.image.source="https://github.com/marcioapm/lux-gha" \
       org.opencontainers.image.description="lux-gha one-shot GitHub Actions runner with rootless Docker" \
@@ -112,9 +122,32 @@ RUN apt-get update; \
       "docker-ce-rootless-extras=${DOCKER_VERSION}" "containerd.io=${CONTAINERD_VERSION}" \
       "docker-buildx-plugin=${BUILDX_VERSION}" "docker-compose-plugin=${COMPOSE_VERSION}" \
       uidmap libcap2-bin fuse-overlayfs slirp4netns iptables iproute2 \
-      git jq unzip xz-utils python3 libatomic1; \
+      git jq unzip xz-utils python3 libatomic1 socat; \
     apt-get purge -y --auto-remove gnupg; \
     rm -rf /var/lib/apt/lists/*
+
+RUN case "$TARGETARCH" in \
+      arm64) dir=ubuntu_arm64 sha=$SSM_PLUGIN_SHA256_ARM64 ;; \
+      amd64) dir=ubuntu_64bit sha=$SSM_PLUGIN_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 --retry-all-errors -o /tmp/ssm.deb \
+      "https://s3.amazonaws.com/session-manager-downloads/plugin/${SSM_PLUGIN_VERSION}/${dir}/session-manager-plugin.deb"; \
+    echo "${sha}  /tmp/ssm.deb" | sha256sum -c -; \
+    dpkg -i /tmp/ssm.deb; \
+    rm /tmp/ssm.deb
+
+RUN case "$TARGETARCH" in \
+      arm64) arch=aarch64 sha=$AWS_CLI_SHA256_ARM64 ;; \
+      amd64) arch=x86_64 sha=$AWS_CLI_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 --retry-all-errors -o /tmp/awscliv2.zip \
+      "https://awscli.amazonaws.com/awscli-exe-linux-${arch}-${AWS_CLI_VERSION}.zip"; \
+    echo "${sha}  /tmp/awscliv2.zip" | sha256sum -c -; \
+    unzip -q /tmp/awscliv2.zip -d /tmp/awscli; \
+    /tmp/awscli/aws/install; \
+    rm -rf /tmp/awscliv2.zip /tmp/awscli
 
 # The base image's "ubuntu" user holds uid 1000.
 RUN userdel -r ubuntu; \

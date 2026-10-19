@@ -95,6 +95,9 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	docker buildx version
 	docker compose version
 	python3 --version
+	socat -V
+	session-manager-plugin --version
+	aws --version
 	# The official Node.js linux-arm64 builds (actions/setup-node) link
 	# libatomic; the image installs it on every architecture.
 	ldconfig -p | grep -q "libatomic.so.1 " || { echo "libatomic.so.1 is missing" >&2; exit 1; }
@@ -268,6 +271,17 @@ docker buildx build --builder smoke --load --build-arg MARKER="$MARKER" -t smoke
 got=$(docker run --rm smoke-marker)
 [ "$got" = "$MARKER" ] || { echo "built image printed \"$got\", want \"$MARKER\"" >&2; exit 1; }
 echo "docker-container builder: built, loaded and ran smoke-marker; marker matches"
+# A server bound only to the runner's loopback, reached from a container via
+# host-gateway, as an SSM port-forward relay is.
+mkdir -p /tmp/lo && printf %s "$MARKER" >/tmp/lo/marker
+python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp/lo >/tmp/lo.log 2>&1 &
+i=0; until python3 -c "import urllib.request as u; u.urlopen(\"http://127.0.0.1:18080/marker\")" 2>/dev/null; do
+	i=$((i + 1)); [ "$i" -lt 20 ] || { cat /tmp/lo.log; exit 1; }; sleep 0.5
+done
+got=$(docker run --rm --add-host host.docker.internal:host-gateway busybox:1.37 wget -T 5 -qO- http://host.docker.internal:18080/marker) ||
+	{ echo "a container could not reach the runner's 127.0.0.1:18080 via host-gateway" >&2; exit 1; }
+[ "$got" = "$MARKER" ] || { echo "host-gateway returned \"$got\", want \"$MARKER\"" >&2; exit 1; }
+echo "host-gateway: a container reached a server bound to the runner's 127.0.0.1"
 EOF
 	}
 

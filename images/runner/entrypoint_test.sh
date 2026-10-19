@@ -67,6 +67,7 @@ EOF
 cat >"$root/bin/dockerd-rootless" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$@" >"$FAKE_CASE_DIR/dockerd.args"
+env | grep '^DOCKERD_ROOTLESS_' | sort >"$FAKE_CASE_DIR/dockerd.env" || :
 sock=$XDG_RUNTIME_DIR/docker.sock
 [ "${1:-}" != --host ] || sock=${2#unix://}
 [ "$FAKE_DOCKERD" != exit ] || exit 1
@@ -202,7 +203,8 @@ run_case exec FAKE_RUN=signal-parent
 check "exits 0" '[ "$rc" = 0 ]'
 check "run.sh replaces the entrypoint: its parent is the supervisor" '[ -f "$d/signal" ]'
 check "runner gets exactly --jitconfig <config>" '[ "$(cat "$d/runner.args")" = "$(printf "%s\n%s" --jitconfig "$sentinel")" ]'
-check "dockerd listens on DOCKER_HOST" '[ "$(cat "$d/dockerd.args")" = "$(printf "%s\n%s" --host "unix://$d/custom.sock")" ]'
+check "dockerd listens on DOCKER_HOST, host-gateway is slirp4netns's 10.0.2.2" '[ "$(cat "$d/dockerd.args")" = "$(printf "%s\n%s\n%s" --host "unix://$d/custom.sock" --host-gateway-ip=10.0.2.2)" ]'
+check "rootlesskit uses slirp4netns with host loopback allowed" '[ "$(cat "$d/dockerd.env")" = "$(printf "%s\n%s" DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=false DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns)" ]'
 check_no_leak
 
 # Lux stops a Run with SIGTERM to its workload's process group, then SIGKILL
