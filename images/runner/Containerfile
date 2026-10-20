@@ -235,6 +235,26 @@ RUN case "$TARGETARCH" in \
     if [ -n "$alias" ]; then ln -s "$tc" "$d/$alias"; chown -h runner:runner "$d/$alias"; fi; \
     for a in "$tc" $alias; do setpriv --reuid=runner --regid=runner --init-groups touch "$d/$a.complete"; done
 
+# Node.js from nodejs.org, laid out as setup-node's cache step leaves it (the
+# tarball with its top directory stripped). SHA-256 are from the release's
+# SHASUMS256.txt.
+ARG NODE_VERSION=26.10.0
+ARG NODE_SHA256_ARM64=7a6353f63eb3d04765004b4adf172616243e4522434635cb1d26288658b04ab5
+ARG NODE_SHA256_AMD64=ca70e9e349de048b9522abb3adc05b3bd6f43c5ffd3ec57916c7da292f59f022
+RUN case "$TARGETARCH" in \
+      arm64) arch=arm64 sha=$NODE_SHA256_ARM64 ;; \
+      amd64) arch=x64 sha=$NODE_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    f=node-v${NODE_VERSION}-linux-${arch}.tar.xz; \
+    curl -fsSL --retry 3 --retry-all-errors -o "/tmp/$f" "https://nodejs.org/dist/v${NODE_VERSION}/$f"; \
+    echo "${sha}  /tmp/$f" | sha256sum -c -; \
+    d=/opt/hostedtoolcache/node/${NODE_VERSION}; \
+    install -d -o runner -g runner "${d%/*}" "$d" "$d/$arch"; \
+    setpriv --reuid=runner --regid=runner --init-groups tar -xJf "/tmp/$f" -C "$d/$arch" --strip-components=1; \
+    rm "/tmp/$f"; \
+    setpriv --reuid=runner --regid=runner --init-groups touch "$d/$arch.complete"
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.

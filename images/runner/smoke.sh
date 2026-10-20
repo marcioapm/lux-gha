@@ -127,6 +127,7 @@ echo "== preinstalled tool cache"
 # shellcheck disable=SC2016 # the script expands inside the container
 run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	-e JV="$(containerfile_arg JAVA_TOOLCACHE_VERSION)" -e JR="$(containerfile_arg JAVA_RELEASE)" \
+	-e NV="$(containerfile_arg NODE_VERSION)" \
 	--entrypoint sh "$TAG" -euc '
 	t=/opt/hostedtoolcache
 	entry() {
@@ -152,6 +153,12 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	"$j/bin/java" -version
 	clean "$j/bin/java" -version 2>/dev/null || { echo "java fails with an empty environment" >&2; exit 1; }
 	echo "java runs with env -i"
+	entry node "$NV" "$A"
+	n=$t/node/$NV/$A/bin/node
+	[ "$("$n" -v)" = "v$NV" ] || { echo "$n is not v$NV" >&2; exit 1; }
+	[ "$(clean "$n" -v)" = "v$NV" ] || { echo "node fails with an empty environment" >&2; exit 1; }
+	clean PATH="${n%/*}" "${n%/*}/npm" -v >/dev/null || { echo "npm fails" >&2; exit 1; }
+	echo "node v$NV and npm run with env -i"
 	bad=$(find "$t" \( ! -user runner -o ! -group runner \) -print -quit)
 	[ -z "$bad" ] || { echo "$bad is not owned by runner:runner" >&2; exit 1; }
 	echo "everything under $t is owned by runner:runner; running as $(id -un)"
