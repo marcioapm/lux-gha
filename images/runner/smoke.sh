@@ -126,6 +126,7 @@ echo "== preinstalled tool cache"
 # catches a binary that only loads its libraries through LD_LIBRARY_PATH.
 # shellcheck disable=SC2016 # the script expands inside the container
 run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
+	-e JV="$(containerfile_arg JAVA_TOOLCACHE_VERSION)" -e JR="$(containerfile_arg JAVA_RELEASE)" \
 	--entrypoint sh "$TAG" -euc '
 	t=/opt/hostedtoolcache
 	entry() {
@@ -141,6 +142,16 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	clean "$p" -c "import ssl, sqlite3" || { echo "$p fails with an empty environment" >&2; exit 1; }
 	clean "$t/Python/$PY/$A/python" -m pip --version
 	echo "python $PY runs with env -i"
+	entry Java_Temurin-Hotspot_jdk "$JV" "$A"
+	j=$t/Java_Temurin-Hotspot_jdk/$JV/$A
+	if [ "$A" = arm64 ]; then
+		entry Java_Temurin-Hotspot_jdk "$JV" aarch64
+		[ "$(readlink "$t/Java_Temurin-Hotspot_jdk/$JV/aarch64")" = arm64 ] || { echo "aarch64 is not a symlink to arm64" >&2; exit 1; }
+	fi
+	grep -x "JAVA_RUNTIME_VERSION=\"${JR#jdk-}-LTS\"" "$j/release" || { echo "$j/release does not name $JR" >&2; exit 1; }
+	"$j/bin/java" -version
+	clean "$j/bin/java" -version 2>/dev/null || { echo "java fails with an empty environment" >&2; exit 1; }
+	echo "java runs with env -i"
 	bad=$(find "$t" \( ! -user runner -o ! -group runner \) -print -quit)
 	[ -z "$bad" ] || { echo "$bad is not owned by runner:runner" >&2; exit 1; }
 	echo "everything under $t is owned by runner:runner; running as $(id -un)"

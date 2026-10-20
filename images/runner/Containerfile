@@ -204,6 +204,37 @@ RUN case "$TARGETARCH" in \
     rm -rf "/tmp/$f" /tmp/python /home/runner/.cache; \
     [ -f "/opt/hostedtoolcache/Python/${PYTHON_VERSION}/${arch}.complete" ]
 
+# Temurin JDK from Adoptium. setup-java names the directory after the Adoptium
+# API's version_data.semver with its first "+" replaced by "-"
+# (getToolcacheVersionName), so JAVA_TOOLCACHE_VERSION is that string for
+# JAVA_RELEASE, not a value derivable from the tarball. setup-java v4/v5 look
+# under os.arch() (arm64), v6 under its normalised name (aarch64); on arm64
+# aarch64 is a symlink to arm64 with its own marker, so both find it.
+# SHA-256 are the package checksums the Adoptium API publishes.
+ARG JAVA_RELEASE=jdk-25.0.4.1+1
+ARG JAVA_TOOLCACHE_VERSION=25.0.4-101.0.LTS
+ARG JAVA_SHA256_ARM64=69df11a02cfa3ef7d7ca645e03edce6778ec090e100f6ae2b42097865730ac52
+ARG JAVA_SHA256_AMD64=dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e
+RUN case "$TARGETARCH" in \
+      arm64) arch=aarch64 tc=arm64 alias=aarch64 sha=$JAVA_SHA256_ARM64 ;; \
+      amd64) arch=x64 tc=x64 alias= sha=$JAVA_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    v=${JAVA_RELEASE#jdk-}; \
+    major=${v%%[.+]*}; \
+    f=OpenJDK${major}U-jdk_${arch}_linux_hotspot_$(echo "$v" | tr + _).tar.gz; \
+    curl -fsSL --retry 3 --retry-all-errors -o "/tmp/$f" \
+      "https://github.com/adoptium/temurin${major}-binaries/releases/download/$(echo "$JAVA_RELEASE" | sed 's/+/%2B/')/$f"; \
+    echo "${sha}  /tmp/$f" | sha256sum -c -; \
+    d=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/${JAVA_TOOLCACHE_VERSION}; \
+    install -d -o runner -g runner "${d%/*}" "$d" "$d/$tc"; \
+    setpriv --reuid=runner --regid=runner --init-groups tar -xzf "/tmp/$f" -C "$d/$tc" --strip-components=1; \
+    rm "/tmp/$f"; \
+    grep -qx "JAVA_RUNTIME_VERSION=\"$v-LTS\"\|JAVA_RUNTIME_VERSION=\"$v\"" "$d/$tc/release" || \
+      { echo "$d/$tc/release does not name $v" >&2; exit 1; }; \
+    if [ -n "$alias" ]; then ln -s "$tc" "$d/$alias"; chown -h runner:runner "$d/$alias"; fi; \
+    for a in "$tc" $alias; do setpriv --reuid=runner --regid=runner --init-groups touch "$d/$a.complete"; done
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.
