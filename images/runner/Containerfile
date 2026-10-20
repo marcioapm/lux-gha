@@ -173,6 +173,37 @@ RUN case "$TARGETARCH" in \
     mkdir -p /home/runner/.local/share/docker; \
     chown -R runner:runner /home/runner
 
+# Preinstalled tool cache: each tool sits at <tool>/<version>/<arch> with an
+# <arch>.complete marker, the layout @actions/tool-cache's find() requires, so
+# a setup-* action whose version spec matches uses it without a download.
+
+# CPython from actions/python-versions, installed by its bundled setup.sh as
+# setup-python does, so that its RUNPATH /opt/hostedtoolcache/Python/<v>/<arch>/lib
+# resolves. setup.sh force-reinstalls pip; PIP_NO_INDEX with the bundled wheel
+# keeps that offline and the result reproducible (pip from ensurepip).
+# SHA-256 are the release asset digests the GitHub releases API reports.
+ARG PYTHON_VERSION=3.11.17
+ARG PYTHON_RELEASE=3.11.17-36876195594
+ARG PYTHON_SHA256_ARM64=a7a7bb9e6b50483f393d1c44c87aa87677a0464a9e3b07f33ee5b31ce155c6ef
+ARG PYTHON_SHA256_AMD64=ae713815fe406a06f1691856f697a0b1e58b3e986f44e62f0cd0bca2424f1aac
+RUN case "$TARGETARCH" in \
+      arm64) arch=arm64 sha=$PYTHON_SHA256_ARM64 ;; \
+      amd64) arch=x64 sha=$PYTHON_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    f=python-${PYTHON_VERSION}-linux-24.04-${arch}.tar.gz; \
+    curl -fsSL --retry 3 --retry-all-errors -o "/tmp/$f" \
+      "https://github.com/actions/python-versions/releases/download/${PYTHON_RELEASE}/$f"; \
+    echo "${sha}  /tmp/$f" | sha256sum -c -; \
+    install -d -o runner -g runner /tmp/python; \
+    setpriv --reuid=runner --regid=runner --init-groups tar -xzf "/tmp/$f" -C /tmp/python; \
+    (cd /tmp/python && setpriv --reuid=runner --regid=runner --init-groups env \
+      HOME=/home/runner RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
+      LD_LIBRARY_PATH=/tmp/python/lib PIP_NO_INDEX=1 PIP_FIND_LINKS="/tmp/python/lib/python${PYTHON_VERSION%.*}/ensurepip/_bundled" \
+      bash ./setup.sh); \
+    rm -rf "/tmp/$f" /tmp/python /home/runner/.cache; \
+    [ -f "/opt/hostedtoolcache/Python/${PYTHON_VERSION}/${arch}.complete" ]
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.

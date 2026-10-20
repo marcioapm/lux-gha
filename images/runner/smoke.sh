@@ -24,8 +24,8 @@ set -eu
 TAG=${TAG:-lux-gha-runner:smoke}
 PLATFORM=${PLATFORM:-linux/arm64}
 case $PLATFORM in
-linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 bk_arg=BUILDKIT_DIGEST_ARM64 ;;
-linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e bk_arg=BUILDKIT_DIGEST_AMD64 ;;
+linux/arm64) arch=arm64 tc_arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 bk_arg=BUILDKIT_DIGEST_ARM64 ;;
+linux/amd64) arch=amd64 tc_arch=x64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e bk_arg=BUILDKIT_DIGEST_AMD64 ;;
 *) echo "PLATFORM must be linux/arm64 or linux/amd64, not $PLATFORM" >&2; exit 2 ;;
 esac
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -117,6 +117,33 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	mkdir "$t/smoke"
 	rmdir "$t/smoke"
 	echo "tool cache $t: runner:runner 755, writable as $(id -un)"
+'
+
+echo "== preinstalled tool cache"
+# Versions from the Containerfile. Each entry must sit where
+# @actions/tool-cache's find() looks (<tool>/<version>/<arch> plus
+# <arch>.complete), run as runner, and run with an empty environment, which
+# catches a binary that only loads its libraries through LD_LIBRARY_PATH.
+# shellcheck disable=SC2016 # the script expands inside the container
+run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
+	--entrypoint sh "$TAG" -euc '
+	t=/opt/hostedtoolcache
+	entry() {
+		[ -d "$t/$1/$2/$3" ] || { echo "$t/$1/$2/$3 missing" >&2; exit 1; }
+		[ -f "$t/$1/$2/$3.complete" ] || { echo "$t/$1/$2/$3.complete missing" >&2; exit 1; }
+		echo "$1/$2/$3 and $3.complete present"
+	}
+	clean() { env -i "$@"; }
+	entry Python "$PY" "$A"
+	p=$t/Python/$PY/$A/bin/python${PY%.*}
+	"$p" -c "import ssl, sqlite3, sys; print(sys.version.split()[0], ssl.OPENSSL_VERSION, sqlite3.sqlite_version)"
+	[ "$("$p" -c "import platform; print(platform.python_version())")" = "$PY" ] || { echo "$p is not $PY" >&2; exit 1; }
+	clean "$p" -c "import ssl, sqlite3" || { echo "$p fails with an empty environment" >&2; exit 1; }
+	clean "$t/Python/$PY/$A/python" -m pip --version
+	echo "python $PY runs with env -i"
+	bad=$(find "$t" \( ! -user runner -o ! -group runner \) -print -quit)
+	[ -z "$bad" ] || { echo "$bad is not owned by runner:runner" >&2; exit 1; }
+	echo "everything under $t is owned by runner:runner; running as $(id -un)"
 '
 
 echo "== licence"
