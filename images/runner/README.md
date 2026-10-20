@@ -72,7 +72,9 @@ Image size (`docker image inspect -f '{{.Size}}'`, local build): arm64 545 433 4
 ### Bumping a tool
 
 Each tool is one `RUN` in the Containerfile with its `ARG`s declared just above it, so a bump rebuilds that
-layer and those after it. `smoke.sh` reads the same `ARG`s.
+layer and those after it. `smoke.sh` reads the same `ARG`s. With every bump, also update the version and path in
+the [table above](#preinstalled-tool-cache) and the image and per-tool size figures below it, measured on the new
+build.
 
 - Python: take the newest stable `3.11.x` entry from `actions/python-versions`' `versions-manifest.json`.
   Set `PYTHON_VERSION`, set `PYTHON_RELEASE` to the release tag in its `download_url` (`<version>-<run id>`), and
