@@ -61,10 +61,13 @@ setup-java v5.7.0 and v6.1.0, and setup-node v7.1.0. The cache is skipped when t
 - Gradle is not baked. `gradle/actions/setup-gradle` (v6.4.0, `sources/src/execution/provision.ts`) never reads
   the tool cache. It looks for a `gradle` on `PATH` whose `gradle -v` matches, then under `RUNNER_TEMP`, then in its
   GitHub cache entry, and only then downloads. Wrapper distributions under `~/.gradle/wrapper/dists` are per-Run.
+- Stripped at build time: the JDK's `lib/src.zip`, CPython's `lib/python3.11/test/` and its static
+  `lib/python3.11/config-3.11-*/libpython3.11.a` (about 220 MB, none read by a setup action); a job that needs
+  CPython's test suite or a static libpython must install its own Python.
 
-Image size (`docker image inspect -f '{{.Size}}'`, local build): arm64 545 433 437 → 836 499 240 bytes, amd64
-656 969 687 → 950 214 749 bytes, about 290 MB more each. On disk the three take about 316 MB (Python),
-303 MB (JDK) and 229 MB (Node) per architecture.
+Image size (`docker image inspect -f '{{.Size}}'`, local build): arm64 545 433 437 bytes without the tool cache,
+745 618 450 with it (about 200 MB more). On disk the three take about 138 MB (Python), 264 MB (JDK) and 224 MB
+(Node) on arm64. amd64 was 656 969 687 → 950 214 749 bytes before the strip and has not been re-measured since.
 
 ### Bumping a tool
 
@@ -123,7 +126,8 @@ and config, every blob's digest, no other platform's blobs), and that `/opt/host
 writable as `runner` and named by `RUNNER_TOOL_CACHE`. For each preinstalled tool it checks the directory and
 `.complete` marker, ownership, and that the binary runs as `runner` and again under `env -i`
 (`python3.11 -c 'import ssl, sqlite3'`, `java -version`, `node -v`), which catches a library found only through
-`LD_LIBRARY_PATH`. Under `--privileged` the entrypoint must log its
+`LD_LIBRARY_PATH`. It checks that the stripped files are absent, and that, offline, `import ssl, sqlite3, venv,
+ensurepip` works and `python3.11 -m venv` creates a venv with pip. Under `--privileged` the entrypoint must log its
 `preloaded` line, and the store must hold the pinned index and `PLATFORM` manifest under both tags. With
 `--network none`, a `docker-container` builder must bootstrap from the preloaded image. With network,
 `docker pull` of the pinned version tag must download nothing, and a builder pinned to it builds and runs an image.

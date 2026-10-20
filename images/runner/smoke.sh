@@ -148,6 +148,16 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	clean "$p" -c "import ssl, sqlite3" || { echo "$p fails with an empty environment" >&2; exit 1; }
 	clean "$t/Python/$PY/$A/python" -m pip --version
 	echo "python $PY runs with env -i"
+	# Stripped at build time; the stdlib a job uses must still work offline.
+	l=$t/Python/$PY/$A/lib/python${PY%.*}
+	for x in "$l/test" "$l"/config-*/libpython*.a "$t/Java_Temurin-Hotspot_jdk"/*/"$A"/lib/src.zip; do
+		[ ! -e "$x" ] || { echo "$x is present" >&2; exit 1; }
+	done
+	clean "$p" -c "import ssl, sqlite3, venv, ensurepip" || { echo "$p: stdlib import failed" >&2; exit 1; }
+	venv=$(mktemp -d)/venv
+	"$p" -m venv "$venv" || { echo "$p -m venv failed" >&2; exit 1; }
+	"$venv/bin/python" -m pip --version
+	echo "python test suite, static libpython and JDK src.zip absent; python -m venv works offline"
 	# The only JDK directory must be the name the Containerfile derives from
 	# JAVA_RELEASE (JTC), plus .0.LTS when the release file says -LTS.
 	jdir=$(ls "$t/Java_Temurin-Hotspot_jdk")

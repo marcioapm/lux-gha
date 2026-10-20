@@ -176,6 +176,9 @@ RUN case "$TARGETARCH" in \
 # Preinstalled tool cache: each tool sits at <tool>/<version>/<arch> with an
 # <arch>.complete marker, the layout @actions/tool-cache's find() requires, so
 # a setup-* action whose version spec matches uses it without a download.
+# find() checks only the directory and marker, so content no setup-* action
+# or normal job reads is deleted in the same RUN: the JDK's lib/src.zip,
+# CPython's test suite and its static libpython (about 220 MB together).
 
 # CPython from actions/python-versions, installed by its bundled setup.sh as
 # setup-python does, so that its RUNPATH /opt/hostedtoolcache/Python/<v>/<arch>/lib
@@ -202,7 +205,9 @@ RUN case "$TARGETARCH" in \
       LD_LIBRARY_PATH=/tmp/python/lib PIP_NO_INDEX=1 PIP_FIND_LINKS="/tmp/python/lib/python${PYTHON_VERSION%.*}/ensurepip/_bundled" \
       bash ./setup.sh); \
     rm -rf "/tmp/$f" /tmp/python /home/runner/.cache; \
-    [ -f "/opt/hostedtoolcache/Python/${PYTHON_VERSION}/${arch}.complete" ]
+    [ -f "/opt/hostedtoolcache/Python/${PYTHON_VERSION}/${arch}.complete" ]; \
+    l=/opt/hostedtoolcache/Python/${PYTHON_VERSION}/${arch}/lib; \
+    rm -r "$l/python${PYTHON_VERSION%.*}/test" "$l/python${PYTHON_VERSION%.*}"/config-*/libpython*.a
 
 # Temurin JDK from Adoptium. setup-java names the directory after the Adoptium
 # API's version_data.semver with its first "+" replaced by "-"
@@ -239,7 +244,7 @@ RUN case "$TARGETARCH" in \
     d=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/${JAVA_TOOLCACHE_VERSION}; \
     install -d -o runner -g runner "${d%/*}" "$d" "$d/$tc"; \
     setpriv --reuid=runner --regid=runner --init-groups tar -xzf "/tmp/$f" -C "$d/$tc" --strip-components=1; \
-    rm "/tmp/$f"; \
+    rm "/tmp/$f" "$d/$tc/lib/src.zip"; \
     grep -qx "JAVA_RUNTIME_VERSION=\"$rv\"" "$d/$tc/release" || \
       { echo "$d/$tc/release does not name $rv, which JAVA_TOOLCACHE_VERSION $JAVA_TOOLCACHE_VERSION implies" >&2; exit 1; }; \
     if [ -n "$alias" ]; then ln -s "$tc" "$d/$alias"; chown -h runner:runner "$d/$alias"; fi; \
