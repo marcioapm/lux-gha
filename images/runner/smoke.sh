@@ -149,11 +149,12 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	clean "$t/Python/$PY/$A/python" -m pip --version
 	echo "python $PY runs with env -i"
 	# The only JDK directory must be the name the Containerfile derives from
-	# JAVA_RELEASE (JTC) for an LTS build.
+	# JAVA_RELEASE (JTC), plus .0.LTS when the release file says -LTS.
 	jdir=$(ls "$t/Java_Temurin-Hotspot_jdk")
 	j=$t/Java_Temurin-Hotspot_jdk/$jdir/$A
-	jtc=$JTC.0.LTS
-	grep -x "JAVA_RUNTIME_VERSION=\"${JR#jdk-}-LTS\"" "$j/release" || { echo "$j/release does not name $JR" >&2; exit 1; }
+	jtc=$JTC
+	if grep -qx "JAVA_RUNTIME_VERSION=\"${JR#jdk-}-LTS\"" "$j/release"; then jtc=$jtc.0.LTS
+	else grep -qx "JAVA_RUNTIME_VERSION=\"${JR#jdk-}\"" "$j/release" || { echo "$j/release does not name $JR" >&2; exit 1; }; fi
 	[ "$jdir" = "$jtc" ] || { echo "JDK directory [$jdir], want $jtc for $JR" >&2; exit 1; }
 	[ "$JV" = "$jtc" ] || { echo "JAVA_TOOLCACHE_VERSION $JV, want $jtc for $JR" >&2; exit 1; }
 	entry Java_Temurin-Hotspot_jdk "$jtc" "$A"
@@ -161,7 +162,7 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 		entry Java_Temurin-Hotspot_jdk "$jtc" aarch64
 		[ "$(readlink "$t/Java_Temurin-Hotspot_jdk/$jtc/aarch64")" = arm64 ] || { echo "aarch64 is not a symlink to arm64" >&2; exit 1; }
 	fi
-	echo "$JR: JDK directory $jtc"
+	echo "$JR: JDK directory $jtc, $(grep JAVA_RUNTIME_VERSION= "$j/release")"
 	"$j/bin/java" -version
 	clean "$j/bin/java" -version 2>/dev/null || { echo "java fails with an empty environment" >&2; exit 1; }
 	echo "java runs with env -i"
