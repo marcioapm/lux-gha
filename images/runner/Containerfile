@@ -206,8 +206,12 @@ RUN case "$TARGETARCH" in \
 
 # Temurin JDK from Adoptium. setup-java names the directory after the Adoptium
 # API's version_data.semver with its first "+" replaced by "-"
-# (getToolcacheVersionName), so JAVA_TOOLCACHE_VERSION is that string for
-# JAVA_RELEASE, not a value derivable from the tarball. setup-java v4/v5 look
+# (getToolcacheVersionName); any other name is a silent cache miss. Adoptium
+# maps jdk-A.B.C[.P]+N to A.B.C+(P*100+N), with ".0.LTS" appended when the
+# build's release file says "-LTS" and nothing otherwise (API, 2026-10-20:
+# 25.0.4+101.0.LTS, 26.0.2+101, 17.0.20+101). The build fails unless
+# JAVA_TOOLCACHE_VERSION is one of the two forms and the release file agrees;
+# smoke.sh repeats the derivation. setup-java v4/v5 look
 # under os.arch() (arm64), v6 under its normalised name (aarch64); on arm64
 # aarch64 is a symlink to arm64 with its own marker, so both find it.
 # SHA-256 are the package checksums the Adoptium API publishes.
@@ -221,6 +225,12 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     v=${JAVA_RELEASE#jdk-}; \
+    jtc=$(echo "$v" | awk -F+ '{split($1, a, "."); printf "%d.%d.%d-%d", a[1], a[2], a[3], a[4] * 100 + $2}'); \
+    case "$JAVA_TOOLCACHE_VERSION" in \
+      "$jtc.0.LTS") rv="$v-LTS" ;; \
+      "$jtc") rv=$v ;; \
+      *) echo "JAVA_TOOLCACHE_VERSION $JAVA_TOOLCACHE_VERSION does not match $JAVA_RELEASE: want $jtc.0.LTS (LTS) or $jtc (non-LTS)" >&2; exit 1 ;; \
+    esac; \
     major=${v%%[.+]*}; \
     f=OpenJDK${major}U-jdk_${arch}_linux_hotspot_$(echo "$v" | tr + _).tar.gz; \
     curl -fsSL --retry 3 --retry-all-errors -o "/tmp/$f" \
@@ -230,8 +240,8 @@ RUN case "$TARGETARCH" in \
     install -d -o runner -g runner "${d%/*}" "$d" "$d/$tc"; \
     setpriv --reuid=runner --regid=runner --init-groups tar -xzf "/tmp/$f" -C "$d/$tc" --strip-components=1; \
     rm "/tmp/$f"; \
-    grep -qx "JAVA_RUNTIME_VERSION=\"$v-LTS\"\|JAVA_RUNTIME_VERSION=\"$v\"" "$d/$tc/release" || \
-      { echo "$d/$tc/release does not name $v" >&2; exit 1; }; \
+    grep -qx "JAVA_RUNTIME_VERSION=\"$rv\"" "$d/$tc/release" || \
+      { echo "$d/$tc/release does not name $rv, which JAVA_TOOLCACHE_VERSION $JAVA_TOOLCACHE_VERSION implies" >&2; exit 1; }; \
     if [ -n "$alias" ]; then ln -s "$tc" "$d/$alias"; chown -h runner:runner "$d/$alias"; fi; \
     for a in "$tc" $alias; do setpriv --reuid=runner --regid=runner --init-groups touch "$d/$a.complete"; done
 

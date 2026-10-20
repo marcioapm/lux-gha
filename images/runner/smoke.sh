@@ -124,9 +124,14 @@ echo "== preinstalled tool cache"
 # @actions/tool-cache's find() looks (<tool>/<version>/<arch> plus
 # <arch>.complete), run as runner, and run with an empty environment, which
 # catches a binary that only loads its libraries through LD_LIBRARY_PATH.
+# The JDK directory name, derived as in the Containerfile: Adoptium's semver
+# for jdk-A.B.C[.P]+N is A.B.C+(P*100+N), "+" becoming "-" in the tool cache.
+java_release=$(containerfile_arg JAVA_RELEASE)
+v=${java_release#jdk-}
+jtc=$(echo "$v" | awk -F+ '{split($1, a, "."); printf "%d.%d.%d-%d", a[1], a[2], a[3], a[4] * 100 + $2}')
 # shellcheck disable=SC2016 # the script expands inside the container
 run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
-	-e JV="$(containerfile_arg JAVA_TOOLCACHE_VERSION)" -e JR="$(containerfile_arg JAVA_RELEASE)" \
+	-e JV="$(containerfile_arg JAVA_TOOLCACHE_VERSION)" -e JR="$java_release" -e JTC="$jtc" \
 	-e NV="$(containerfile_arg NODE_VERSION)" \
 	--entrypoint sh "$TAG" -euc '
 	t=/opt/hostedtoolcache
@@ -143,13 +148,20 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	clean "$p" -c "import ssl, sqlite3" || { echo "$p fails with an empty environment" >&2; exit 1; }
 	clean "$t/Python/$PY/$A/python" -m pip --version
 	echo "python $PY runs with env -i"
-	entry Java_Temurin-Hotspot_jdk "$JV" "$A"
-	j=$t/Java_Temurin-Hotspot_jdk/$JV/$A
-	if [ "$A" = arm64 ]; then
-		entry Java_Temurin-Hotspot_jdk "$JV" aarch64
-		[ "$(readlink "$t/Java_Temurin-Hotspot_jdk/$JV/aarch64")" = arm64 ] || { echo "aarch64 is not a symlink to arm64" >&2; exit 1; }
-	fi
+	# The only JDK directory must be the name the Containerfile derives from
+	# JAVA_RELEASE (JTC) for an LTS build.
+	jdir=$(ls "$t/Java_Temurin-Hotspot_jdk")
+	j=$t/Java_Temurin-Hotspot_jdk/$jdir/$A
+	jtc=$JTC.0.LTS
 	grep -x "JAVA_RUNTIME_VERSION=\"${JR#jdk-}-LTS\"" "$j/release" || { echo "$j/release does not name $JR" >&2; exit 1; }
+	[ "$jdir" = "$jtc" ] || { echo "JDK directory [$jdir], want $jtc for $JR" >&2; exit 1; }
+	[ "$JV" = "$jtc" ] || { echo "JAVA_TOOLCACHE_VERSION $JV, want $jtc for $JR" >&2; exit 1; }
+	entry Java_Temurin-Hotspot_jdk "$jtc" "$A"
+	if [ "$A" = arm64 ]; then
+		entry Java_Temurin-Hotspot_jdk "$jtc" aarch64
+		[ "$(readlink "$t/Java_Temurin-Hotspot_jdk/$jtc/aarch64")" = arm64 ] || { echo "aarch64 is not a symlink to arm64" >&2; exit 1; }
+	fi
+	echo "$JR: JDK directory $jtc"
 	"$j/bin/java" -version
 	clean "$j/bin/java" -version 2>/dev/null || { echo "java fails with an empty environment" >&2; exit 1; }
 	echo "java runs with env -i"

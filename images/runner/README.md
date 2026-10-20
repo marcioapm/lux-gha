@@ -54,7 +54,10 @@ setup-java v5.7.0 and v6.1.0, and setup-node v7.1.0. The cache is skipped when t
   setup-python does, so its RUNPATH `/opt/hostedtoolcache/Python/3.11.17/<arch>/lib` holds.
 - The JDK directory name is not the JDK's version. setup-java takes the Adoptium API's `version_data.semver`
   (`25.0.4+101.0.LTS` for the release `jdk-25.0.4.1+1`) and replaces its first `+` with `-`. Any other name is a
-  silent cache miss.
+  silent cache miss. Adoptium derives the semver from the release: `jdk-A.B.C[.P]+N` becomes `A.B.C+(P*100+N)`
+  (P is 0 when absent), followed by `.0.LTS` for an LTS build and nothing otherwise (`26.0.2+101` for
+  `jdk-26.0.2.1+1`). The build and `smoke.sh` derive the name the same way and fail if `JAVA_TOOLCACHE_VERSION`
+  differs.
 - Gradle is not baked. `gradle/actions/setup-gradle` (v6.4.0, `sources/src/execution/provision.ts`) never reads
   the tool cache. It looks for a `gradle` on `PATH` whose `gradle -v` matches, then under `RUNNER_TEMP`, then in its
   GitHub cache entry, and only then downloads. Wrapper distributions under `~/.gradle/wrapper/dists` are per-Run.
@@ -74,8 +77,9 @@ layer and those after it. `smoke.sh` reads the same `ARG`s.
   `api.github.com/repos/actions/python-versions/releases/tags/<tag>`.
 - JDK: query `api.adoptium.net/v3/assets/feature_releases/25/ga?os=linux&image_type=jdk&jvm_impl=hotspot&architecture=<aarch64|x64>`.
   Set `JAVA_RELEASE` to `release_name`, `JAVA_TOOLCACHE_VERSION` to `version_data.semver` with its first `+`
-  replaced by `-`, and `JAVA_SHA256_ARM64`/`_AMD64` to `binaries[0].package.checksum`. The build fails if the
-  tarball's `release` file does not name `JAVA_RELEASE`.
+  replaced by `-`, and `JAVA_SHA256_ARM64`/`_AMD64` to `binaries[0].package.checksum`. The build fails if
+  `JAVA_TOOLCACHE_VERSION` is not the name derived from `JAVA_RELEASE`, or if the tarball's `release` file does not
+  name `JAVA_RELEASE` (with `-LTS` exactly when the name ends in `.LTS`).
 - Node: set `NODE_VERSION` and `NODE_SHA256_ARM64`/`_AMD64` from `nodejs.org/dist/v<version>/SHASUMS256.txt`
   (`node-v<version>-linux-<arm64|x64>.tar.xz`).
 
