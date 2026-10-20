@@ -31,7 +31,64 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   Run's Docker store, so that `setup-buildx-action`'s builder does not pull it. See [BuildKit driver](#buildkit-driver).
 - `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY` set to `/opt/hostedtoolcache` (owned by `runner`, mode 0755), where
   hosted runners keep it: `actions/setup-python`'s CPython has its library RUNPATH there and fails to load
-  `libpython` elsewhere once `LD_LIBRARY_PATH` is dropped. It is not on the Lux volume, so tools are still per-Run.
+  `libpython` elsewhere once `LD_LIBRARY_PATH` is dropped. It is not on the Lux volume, so tools a job installs are
+  still per-Run. The tool cache comes preinstalled; see [Preinstalled tool cache](#preinstalled-tool-cache).
+
+## Preinstalled tool cache
+
+| Tool | Version | Path under `/opt/hostedtoolcache` | Found by |
+|---|---|---|---|
+| CPython | 3.11.17 | `Python/3.11.17/<x64\|arm64>` | `actions/setup-python` with `python-version: 3.11` (or `3.11.17`) |
+| Temurin JDK | 25.0.4.1+1 (Adoptium semver `25.0.4+101.0.LTS`) | `Java_Temurin-Hotspot_jdk/25.0.4-101.0.LTS/<x64\|arm64>`, plus `aarch64` → `arm64` | `actions/setup-java` with `distribution: temurin`, `java-version: 25` |
+| Node.js | 26.10.0 | `node/26.10.0/<x64\|arm64>` | `actions/setup-node` with `node-version: 26` (or `26.10.0`) |
+
+Each sits at `<tool>/<version>/<arch>` with an `<arch>.complete` marker beside it, owned by `runner`. That is the
+layout `@actions/tool-cache`'s `find()` requires. A setup action whose version spec matches therefore uses the
+baked copy, adds it to `PATH` and downloads nothing. Measured offline in the image with setup-python v6.3.0,
+setup-java v5.7.0 and v6.1.0, and setup-node v7.1.0. The cache is skipped when the spec names a different version, with
+`check-latest: true`, with setup-java's `java-version: latest`, or with setup-node aliases (`lts/*`, `latest`,
+`current`), which resolve the version remotely first. setup-java v6 names arm64 `aarch64` and v4/v5 name it
+`arm64`, hence the symlink, which has its own `.complete` marker.
+
+- Python is the `linux-24.04` build from `actions/python-versions`, installed by its own `setup.sh` as
+  setup-python does, so its RUNPATH `/opt/hostedtoolcache/Python/3.11.17/<arch>/lib` holds.
+- The JDK directory name is not the JDK's version. setup-java takes the Adoptium API's `version_data.semver`
+  (`25.0.4+101.0.LTS` for the release `jdk-25.0.4.1+1`) and replaces its first `+` with `-`. Any other name is a
+  silent cache miss. Adoptium derives the semver from the release: `jdk-A.B.C[.P]+N` becomes `A.B.C+(P*100+N)`
+  (P is 0 when absent), followed by `.0.LTS` for an LTS build and nothing otherwise (`26.0.2+101` for
+  `jdk-26.0.2.1+1`). The build and `smoke.sh` derive the name the same way and fail if `JAVA_TOOLCACHE_VERSION`
+  differs.
+- Gradle is not baked. `gradle/actions/setup-gradle` (v6.4.0, `sources/src/execution/provision.ts`) never reads
+  the tool cache. It looks for a `gradle` on `PATH` whose `gradle -v` matches, then under `RUNNER_TEMP`, then in its
+  GitHub cache entry, and only then downloads. Wrapper distributions under `~/.gradle/wrapper/dists` are per-Run.
+- Stripped at build time: the JDK's `lib/src.zip`, CPython's `lib/python3.11/test/` and its static
+  `lib/python3.11/config-3.11-*/libpython3.11.a` (about 220 MB, none read by a setup action); a job that needs
+  CPython's test suite or a static libpython must install its own Python.
+
+Image size (`docker image inspect -f '{{.Size}}'`, local build): arm64 545 433 437 bytes without the tool cache,
+745 618 450 with it (about 200 MB more). On disk the three take about 138 MB (Python), 264 MB (JDK) and 224 MB
+(Node) on arm64. amd64 was 656 969 687 → 950 214 749 bytes before the strip and has not been re-measured since.
+
+### Bumping a tool
+
+Each tool is one `RUN` in the Containerfile with its `ARG`s declared just above it, so a bump rebuilds that
+layer and those after it. `smoke.sh` reads the same `ARG`s. With every bump, also update the version and path in
+the [table above](#preinstalled-tool-cache) and the image and per-tool size figures below it, measured on the new
+build.
+
+- Python: take the newest stable `3.11.x` entry from `actions/python-versions`' `versions-manifest.json`.
+  Set `PYTHON_VERSION`, set `PYTHON_RELEASE` to the release tag in its `download_url` (`<version>-<run id>`), and
+  set `PYTHON_SHA256_ARM64`/`_AMD64` to the `digest` of the `python-<v>-linux-24.04-<arm64|x64>.tar.gz` assets in
+  `api.github.com/repos/actions/python-versions/releases/tags/<tag>`.
+- JDK: query `api.adoptium.net/v3/assets/feature_releases/25/ga?os=linux&image_type=jdk&jvm_impl=hotspot&architecture=<aarch64|x64>`.
+  Set `JAVA_RELEASE` to `release_name`, `JAVA_TOOLCACHE_VERSION` to `version_data.semver` with its first `+`
+  replaced by `-`, and `JAVA_SHA256_ARM64`/`_AMD64` to `binaries[0].package.checksum`. The build fails if
+  `JAVA_TOOLCACHE_VERSION` is not the name derived from `JAVA_RELEASE`, or if the tarball's `release` file does not
+  name `JAVA_RELEASE` (with `-LTS` exactly when the name ends in `.LTS`).
+- Node: set `NODE_VERSION` and `NODE_SHA256_ARM64`/`_AMD64` from `nodejs.org/dist/v<version>/SHASUMS256.txt`
+  (`node-v<version>-linux-<arm64|x64>.tar.xz`).
+
+A workflow that pins a different version still works: its setup action downloads that version as before.
 
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is
@@ -68,7 +125,11 @@ its `dpkg` architecture and the ELF machine of the runner's `bin/Runner.Listener
 of that architecture; under emulation it may pass or fail for reasons that do not hold on real hardware.
 It also checks the BuildKit archive offline against the Containerfile's pins (tags, index, `PLATFORM` manifest
 and config, every blob's digest, no other platform's blobs), and that `/opt/hostedtoolcache` is owned by and
-writable as `runner` and named by `RUNNER_TOOL_CACHE`. Under `--privileged` the entrypoint must log its
+writable as `runner` and named by `RUNNER_TOOL_CACHE`. For each preinstalled tool it checks the directory and
+`.complete` marker, ownership, and that the binary runs as `runner` and again under `env -i`
+(`python3.11 -c 'import ssl, sqlite3'`, `java -version`, `node -v`), which catches a library found only through
+`LD_LIBRARY_PATH`. It checks that the stripped files are absent, and that, offline, `import ssl, sqlite3, venv,
+ensurepip` works and `python3.11 -m venv` creates a venv with pip. Under `--privileged` the entrypoint must log its
 `preloaded` line, and the store must hold the pinned index and `PLATFORM` manifest under both tags. With
 `--network none`, a `docker-container` builder must bootstrap from the preloaded image. With network,
 `docker pull` of the pinned version tag must download nothing, and a builder pinned to it builds and runs an image.

@@ -24,8 +24,8 @@ set -eu
 TAG=${TAG:-lux-gha-runner:smoke}
 PLATFORM=${PLATFORM:-linux/arm64}
 case $PLATFORM in
-linux/arm64) arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 bk_arg=BUILDKIT_DIGEST_ARM64 ;;
-linux/amd64) arch=amd64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e bk_arg=BUILDKIT_DIGEST_AMD64 ;;
+linux/arm64) arch=arm64 tc_arch=arm64 sha_arg=RUNNER_SHA256_ARM64 elf_machine=b7 bk_arg=BUILDKIT_DIGEST_ARM64 ;;
+linux/amd64) arch=amd64 tc_arch=x64 sha_arg=RUNNER_SHA256_AMD64 elf_machine=3e bk_arg=BUILDKIT_DIGEST_AMD64 ;;
 *) echo "PLATFORM must be linux/arm64 or linux/amd64, not $PLATFORM" >&2; exit 2 ;;
 esac
 dir=$(cd "$(dirname "$0")" && pwd)
@@ -117,6 +117,74 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	mkdir "$t/smoke"
 	rmdir "$t/smoke"
 	echo "tool cache $t: runner:runner 755, writable as $(id -un)"
+'
+
+echo "== preinstalled tool cache"
+# Versions from the Containerfile. Each entry must sit where
+# @actions/tool-cache's find() looks (<tool>/<version>/<arch> plus
+# <arch>.complete), run as runner, and run with an empty environment, which
+# catches a binary that only loads its libraries through LD_LIBRARY_PATH.
+# The JDK directory name, derived as in the Containerfile: Adoptium's semver
+# for jdk-A.B.C[.P]+N is A.B.C+(P*100+N), "+" becoming "-" in the tool cache.
+java_release=$(containerfile_arg JAVA_RELEASE)
+v=${java_release#jdk-}
+jtc=$(echo "$v" | awk -F+ '{split($1, a, "."); printf "%d.%d.%d-%d", a[1], a[2], a[3], a[4] * 100 + $2}')
+# shellcheck disable=SC2016 # the script expands inside the container
+run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
+	-e JV="$(containerfile_arg JAVA_TOOLCACHE_VERSION)" -e JR="$java_release" -e JTC="$jtc" \
+	-e NV="$(containerfile_arg NODE_VERSION)" \
+	--entrypoint sh "$TAG" -euc '
+	t=/opt/hostedtoolcache
+	entry() {
+		[ -d "$t/$1/$2/$3" ] || { echo "$t/$1/$2/$3 missing" >&2; exit 1; }
+		[ -f "$t/$1/$2/$3.complete" ] || { echo "$t/$1/$2/$3.complete missing" >&2; exit 1; }
+		echo "$1/$2/$3 and $3.complete present"
+	}
+	clean() { env -i "$@"; }
+	entry Python "$PY" "$A"
+	p=$t/Python/$PY/$A/bin/python${PY%.*}
+	"$p" -c "import ssl, sqlite3, sys; print(sys.version.split()[0], ssl.OPENSSL_VERSION, sqlite3.sqlite_version)"
+	[ "$("$p" -c "import platform; print(platform.python_version())")" = "$PY" ] || { echo "$p is not $PY" >&2; exit 1; }
+	clean "$p" -c "import ssl, sqlite3" || { echo "$p fails with an empty environment" >&2; exit 1; }
+	clean "$t/Python/$PY/$A/python" -m pip --version
+	echo "python $PY runs with env -i"
+	# Stripped at build time; the stdlib a job uses must still work offline.
+	l=$t/Python/$PY/$A/lib/python${PY%.*}
+	for x in "$l/test" "$l"/config-*/libpython*.a "$t/Java_Temurin-Hotspot_jdk"/*/"$A"/lib/src.zip; do
+		[ ! -e "$x" ] || { echo "$x is present" >&2; exit 1; }
+	done
+	clean "$p" -c "import ssl, sqlite3, venv, ensurepip" || { echo "$p: stdlib import failed" >&2; exit 1; }
+	venv=$(mktemp -d)/venv
+	"$p" -m venv "$venv" || { echo "$p -m venv failed" >&2; exit 1; }
+	"$venv/bin/python" -m pip --version
+	echo "python test suite, static libpython and JDK src.zip absent; python -m venv works offline"
+	# The only JDK directory must be the name the Containerfile derives from
+	# JAVA_RELEASE (JTC), plus .0.LTS when the release file says -LTS.
+	jdir=$(ls "$t/Java_Temurin-Hotspot_jdk")
+	j=$t/Java_Temurin-Hotspot_jdk/$jdir/$A
+	jtc=$JTC
+	if grep -qx "JAVA_RUNTIME_VERSION=\"${JR#jdk-}-LTS\"" "$j/release"; then jtc=$jtc.0.LTS
+	else grep -qx "JAVA_RUNTIME_VERSION=\"${JR#jdk-}\"" "$j/release" || { echo "$j/release does not name $JR" >&2; exit 1; }; fi
+	[ "$jdir" = "$jtc" ] || { echo "JDK directory [$jdir], want $jtc for $JR" >&2; exit 1; }
+	[ "$JV" = "$jtc" ] || { echo "JAVA_TOOLCACHE_VERSION $JV, want $jtc for $JR" >&2; exit 1; }
+	entry Java_Temurin-Hotspot_jdk "$jtc" "$A"
+	if [ "$A" = arm64 ]; then
+		entry Java_Temurin-Hotspot_jdk "$jtc" aarch64
+		[ "$(readlink "$t/Java_Temurin-Hotspot_jdk/$jtc/aarch64")" = arm64 ] || { echo "aarch64 is not a symlink to arm64" >&2; exit 1; }
+	fi
+	echo "$JR: JDK directory $jtc, $(grep JAVA_RUNTIME_VERSION= "$j/release")"
+	"$j/bin/java" -version
+	clean "$j/bin/java" -version 2>/dev/null || { echo "java fails with an empty environment" >&2; exit 1; }
+	echo "java runs with env -i"
+	entry node "$NV" "$A"
+	n=$t/node/$NV/$A/bin/node
+	[ "$("$n" -v)" = "v$NV" ] || { echo "$n is not v$NV" >&2; exit 1; }
+	[ "$(clean "$n" -v)" = "v$NV" ] || { echo "node fails with an empty environment" >&2; exit 1; }
+	clean PATH="${n%/*}" "${n%/*}/npm" -v >/dev/null || { echo "npm fails" >&2; exit 1; }
+	echo "node v$NV and npm run with env -i"
+	bad=$(find "$t" \( ! -user runner -o ! -group runner \) -print -quit)
+	[ -z "$bad" ] || { echo "$bad is not owned by runner:runner" >&2; exit 1; }
+	echo "everything under $t is owned by runner:runner; running as $(id -un)"
 '
 
 echo "== licence"
