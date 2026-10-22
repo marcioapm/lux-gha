@@ -130,16 +130,28 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 		return err
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	var errs []error
 	for _, s := range servers {
-		if err := s.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errs = append(errs, err)
+		err := s.Shutdown(shutdownCtx)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			continue
 		}
+		if s != srv && errors.Is(err, context.DeadlineExceeded) {
+			// Uploads and proxied transfers have no overall timeout, so a
+			// long one can outlast the drain; a stop still exits cleanly.
+			log.Warn("cache listener: transfers still running at shutdown were dropped", "after", shutdownTimeout)
+			s.Close()
+			continue
+		}
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
+
+// shutdownTimeout bounds the drain of in-flight requests on stop.
+var shutdownTimeout = 10 * time.Second
 
 // startCache serves the cache on its own listener and starts its reaper;
 // stop ends the reaper and waits for it. Serve errors are sent on errc.
