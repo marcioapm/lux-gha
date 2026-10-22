@@ -38,8 +38,15 @@ func TestUploadTokenMintAndOpen(t *testing.T) {
 	p, m, _ := strings.Cut(tok, ".")
 	payload, _ := base64.RawURLEncoding.DecodeString(p)
 	payload[len(payload)-1] ^= 1
+	// The 43rd MAC character carries 4 data bits and 2 padding bits; the
+	// spelling with a padding bit set decodes to the same MAC unless strict.
+	last := strings.IndexByte(b64URLAlphabet, m[42])
+	nonCanonical := p + "." + m[:42] + string(b64URLAlphabet[last^1])
+	if last&3 != 0 {
+		t.Fatalf("minted MAC %q has padding bits set", m)
+	}
 	for _, bad := range []string{
-		"", "x", tok + "x", p + "." + m[:42] + "A",
+		"", "x", tok + "x", nonCanonical,
 		base64.RawURLEncoding.EncodeToString(payload) + "." + m,
 		strings.Repeat("A", 3000) + "." + m,
 	} {
@@ -48,6 +55,8 @@ func TestUploadTokenMintAndOpen(t *testing.T) {
 		}
 	}
 }
+
+const b64URLAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 func (h *harness) reserve(token, key, version string) string {
 	h.t.Helper()
@@ -214,9 +223,12 @@ func TestUploadURLForgedOrExpiredIs403(t *testing.T) {
 	h := newHarness(t)
 	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
 	u, _ := url.Parse(up)
-	sig := u.Query().Get("sig")
+	p, m, _ := strings.Cut(u.Query().Get("sig"), ".")
+	// Flip a data bit of the MAC, not a padding bit.
+	mac, _ := base64.RawURLEncoding.DecodeString(m)
+	mac[0] ^= 1
 	forged := *u
-	forged.RawQuery = url.Values{"sig": {sig[:len(sig)-1] + map[bool]string{true: "B", false: "A"}[sig[len(sig)-1] == 'A']}}.Encode()
+	forged.RawQuery = url.Values{"sig": {p + "." + base64.RawURLEncoding.EncodeToString(mac)}}.Encode()
 	none := *u
 	none.RawQuery = ""
 	for _, bad := range []string{forged.String(), none.String() + "?x=1"} {

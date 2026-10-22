@@ -57,7 +57,8 @@ func (s signer) open(token string, now time.Time) (string, error) {
 		return "", errBadToken
 	}
 	p, m, _ := strings.Cut(token, ".")
-	enc := base64.RawURLEncoding
+	// Strict: non-zero padding bits are rejected, so a token has one spelling.
+	enc := base64.RawURLEncoding.Strict()
 	payload, err1 := enc.DecodeString(p)
 	sig, err2 := enc.DecodeString(m)
 	if err1 != nil || err2 != nil || len(payload) < 10 || payload[0] != uploadTokenVersion {
