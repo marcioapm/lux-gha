@@ -1,3 +1,5 @@
+//go:build s3integration
+
 package cache
 
 import (
@@ -20,16 +22,14 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// The S3 integration tests run only with LUXGHA_CACHE_S3_TEST=1, against
-// LUXGHA_CACHE_S3_ENDPOINT (an S3-compatible server) and
-// LUXGHA_CACHE_S3_BUCKET (created if missing), with credentials from the
-// AWS default chain, e.g. AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Each
-// run works under its own random prefix.
+// The S3 integration tests build only with -tags s3integration (CI fails
+// on any skipped test, so they are left out rather than skipped) and run
+// against LUXGHA_CACHE_S3_ENDPOINT, an S3-compatible server, and
+// LUXGHA_CACHE_S3_BUCKET, created if missing, with credentials from the
+// AWS default chain, e.g. AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+// Each test works under its own random prefix.
 func s3TestStore(t *testing.T) (*s3Store, string) {
 	t.Helper()
-	if os.Getenv("LUXGHA_CACHE_S3_TEST") != "1" {
-		t.Skip("set LUXGHA_CACHE_S3_TEST=1 to run against a real S3-compatible server")
-	}
 	endpoint, bucket := os.Getenv("LUXGHA_CACHE_S3_ENDPOINT"), os.Getenv("LUXGHA_CACHE_S3_BUCKET")
 	if endpoint == "" || bucket == "" {
 		t.Fatal("LUXGHA_CACHE_S3_ENDPOINT and LUXGHA_CACHE_S3_BUCKET are required")

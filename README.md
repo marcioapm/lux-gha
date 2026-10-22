@@ -641,8 +641,10 @@ cache. `ac` is a JSON string holding `[{"Scope": "<ref>", "Permission": n}]`,
 read 1 and write 2: a job saves only to its one writable scope (its own ref)
 and restores from its readable scopes, its own first and then the others in
 token order (for a pull request, the base branch). A missing or malformed
-claim is `401`; a save with no writable scope is `403`
-(`cache write denied: ...`), which the client reports as a warning.
+claim is `401`. A save with no writable scope gets `ok: false` with a
+message starting `cache write denied:`, and a restore with no readable scope
+a `403` starting `cache read denied:`; the client reports either as a
+warning and carries on.
 
 **Matching.** Within each scope in that order: the exact key, then the
 newest entry whose key starts with the key, then the same for each restore

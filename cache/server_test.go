@@ -460,11 +460,14 @@ func TestIssuerUnavailableIs503(t *testing.T) {
 func TestReadOnlyTokenCannotSave(t *testing.T) {
 	h := newHarness(t)
 	ro := h.is.token(t, "100", readMain())
-	for _, r := range []twirpResult{h.create(ro, "k", v1), h.finalize(ro, "k", v1, 1)} {
-		// The client classifies this prefix as a policy denial.
-		if r.status != http.StatusForbidden || r.code != twirpPermissionDenied || !strings.HasPrefix(r.msg, "cache write denied:") {
-			t.Fatalf("%+v", r)
-		}
+	// Create answers ok:false with the prefix the client classifies as a
+	// policy denial; Finalize, which a client never reaches without a
+	// successful Create, is a permission_denied error.
+	if r := h.create(ro, "k", v1); r.status != http.StatusOK || r.ok() || !strings.HasPrefix(str(r.body["message"]), "cache write denied:") {
+		t.Fatalf("create: %+v", r)
+	}
+	if r := h.finalize(ro, "k", v1, 1); r.status != http.StatusForbidden || r.code != twirpPermissionDenied || !strings.HasPrefix(r.msg, "cache write denied:") {
+		t.Fatalf("finalize: %+v", r)
 	}
 	// It may still restore.
 	h.save(h.is.token(t, "100", writeMain()), "k", v1, []byte("x"))

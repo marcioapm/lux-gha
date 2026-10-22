@@ -199,10 +199,11 @@ func validateEntry(key, version string) error {
 	return nil
 }
 
+const writeDeniedMessage = "cache write denied: the runtime token has no writable cache scope"
+
 func writeDenied(id *identity) error {
 	if id.WriteScope == "" {
-		// The client recognises this prefix as a policy denial.
-		return twerr(twirpPermissionDenied, "cache write denied: the runtime token has no writable cache scope")
+		return twerr(twirpPermissionDenied, writeDeniedMessage)
 	}
 	return nil
 }
@@ -215,8 +216,11 @@ func (s *Server) create(ctx context.Context, id *identity, r *http.Request, c co
 	if err := validateEntry(req.Key, req.Version); err != nil {
 		return nil, err
 	}
-	if err := writeDenied(id); err != nil {
-		return nil, err
+	if id.WriteScope == "" {
+		// The client turns ok:false with this prefix into a write-denied
+		// warning (@actions/cache saveCacheV2); a Twirp error would be
+		// reported as contention instead.
+		return createResponse{Message: writeDeniedMessage}, nil
 	}
 	_, err := s.st.head(ctx, s.lay.entryKey(id.RepoID, id.WriteScope, req.Version, req.Key))
 	switch {
