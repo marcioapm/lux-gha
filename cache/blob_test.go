@@ -316,9 +316,8 @@ func TestUploadURLForgedOrExpiredIs403(t *testing.T) {
 		}
 	}
 	h.clk.add(uploadURLTTL)
-	if resp, _ := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, []byte("x")); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expired URL: %d", resp.StatusCode)
-	}
+	resp, body := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, []byte("x"))
+	azureErr(t, "expired URL", resp, body, http.StatusForbidden, "AuthenticationFailed", "expired")
 	if len(h.st.keys("")) != 0 {
 		t.Fatalf("rejected uploads stored %q", h.st.keys(""))
 	}
@@ -329,18 +328,15 @@ func TestUploadSizeBounds(t *testing.T) {
 	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
 	// A single shot over the entry bound is refused before its body is read.
 	resp, body := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, make([]byte, 2*minPartBytes+11))
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("single shot: %d %s", resp.StatusCode, body)
-	}
+	azureErr(t, "single shot", resp, body, http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "exceeds")
 	// Blocks: the third pushes the staged total over the bound.
 	for i, n := range []int{minPartBytes, minPartBytes} {
 		if resp, body := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(i)), nil, make([]byte, n)); resp.StatusCode != http.StatusCreated {
 			t.Fatalf("block %d: %d %s", i, resp.StatusCode, body)
 		}
 	}
-	if resp, _ := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(2)), nil, make([]byte, 11)); resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("overflowing block: %d", resp.StatusCode)
-	}
+	resp, body = h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(2)), nil, make([]byte, 11))
+	azureErr(t, "overflowing block", resp, body, http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "staged blocks exceed")
 	// Re-staging an existing block replaces it rather than adding to it.
 	if resp, _ := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(1)), nil, make([]byte, minPartBytes+10)); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("restaged block: %d", resp.StatusCode)

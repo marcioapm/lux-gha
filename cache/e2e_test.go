@@ -148,8 +148,13 @@ func TestE2ESaveRestoreWithActionsCache(t *testing.T) {
 	if res := e.node(tok, map[string]any{"op": "save", "paths": paths, "key": "deps-linux-old"}); !saved(res) || res["warnings"] != nil {
 		t.Fatalf("save old: %v", res)
 	}
-	// LastModified has one-second resolution on many S3 servers.
-	time.Sleep(1100 * time.Millisecond)
+	// LastModified has one-second resolution on many S3 servers: wait until
+	// a new save is stamped later than this one.
+	var first object
+	e.srv.st.list(t.Context(), e.srv.lay.entriesRoot(), func(o object) bool { first = o; return false })
+	for !time.Now().Truncate(time.Second).After(first.LastModified) {
+		time.Sleep(50 * time.Millisecond)
+	}
 	e.write("deps/a.txt", []byte("second"))
 	if res := e.node(tok, map[string]any{"op": "save", "paths": paths, "key": "deps-linux-new"}); !saved(res) {
 		t.Fatalf("save new: %v", res)
