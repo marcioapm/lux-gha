@@ -152,6 +152,7 @@ func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc ch
 		cache.S3Options{Bucket: cc.S3.Bucket, Region: cc.S3.Region, Endpoint: cc.S3.Endpoint},
 		cache.Options{
 			PublicURL: cc.PublicURL, Issuer: cc.Issuer, Upstream: cc.UpstreamResultsURL, SigningKeys: keys,
+			RepositoryOwnerIDs: cc.RepositoryOwnerIDs, RepositoryIDs: cc.RepositoryIDs,
 			Prefix: cc.S3.Prefix, DownloadURLTTL: cc.DownloadURLTTL.Duration, TTL: cc.TTL.Duration,
 			MaxBytes: cc.MaxBytes, MaxEntryBytes: cc.MaxEntryBytes, ReapInterval: cc.ReapInterval.Duration, Log: log,
 		})

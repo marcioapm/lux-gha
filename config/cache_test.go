@@ -9,7 +9,7 @@ import (
 )
 
 const cacheConfig = `"cache": {"listen": "127.0.0.1:8090", "publicURL": "https://cache.example.test",
-  "s3": {"bucket": "cache-bucket", "region": "eu-west-1"}, "signingKeyFile": "/s"},
+  "s3": {"bucket": "cache-bucket", "region": "eu-west-1"}, "repositoryIDs": [100], "signingKeyFile": "/s"},
   "listen"`
 
 func withCache(old, new string) []byte {
@@ -63,14 +63,31 @@ func TestCacheRejectsInvalid(t *testing.T) {
 		"negative maxBytes":  {`"signingKeyFile": "/s"`, `"signingKeyFile": "/s", "maxBytes": -1`},
 		"entry over total":   {`"signingKeyFile": "/s"`, `"signingKeyFile": "/s", "maxBytes": 10, "maxEntryBytes": 11`},
 		"short reapInterval": {`"signingKeyFile": "/s"`, `"signingKeyFile": "/s", "reapInterval": "1s"`},
+		"no allowlist":       {`"repositoryIDs": [100], `, ``},
+		"empty allowlists":   {`"repositoryIDs": [100]`, `"repositoryIDs": [], "repositoryOwnerIDs": []`},
+		"zero repository ID": {`"repositoryIDs": [100]`, `"repositoryIDs": [0]`},
+		"negative owner ID":  {`"repositoryIDs": [100]`, `"repositoryIDs": [100], "repositoryOwnerIDs": [-1]`},
+		"string owner ID":    {`"repositoryIDs": [100]`, `"repositoryOwnerIDs": ["7"]`},
+		"fractional ID":      {`"repositoryIDs": [100]`, `"repositoryIDs": [1.5]`},
 	} {
-		if _, err := Parse(withCache(edit[0], edit[1])); err == nil ||
-			!(strings.Contains(err.Error(), "cache") || strings.Contains(err.Error(), "unknown field")) {
+		_, err := Parse(withCache(edit[0], edit[1]))
+		if err == nil || !(strings.Contains(err.Error(), "cache") || strings.Contains(err.Error(), "unknown field")) {
 			t.Errorf("%s: err=%v", name, err)
 		}
 	}
 	if _, err := Parse(withCache(`"region": "eu-west-1"`, `"region": "eu-west-1", "prefix": "ci/gha-cache", "endpoint": "http://127.0.0.1:59240"`)); err != nil {
 		t.Errorf("prefix and loopback endpoint: %v", err)
+	}
+}
+
+func TestCacheAllowlist(t *testing.T) {
+	c, err := Parse(withCache(`"repositoryIDs": [100]`, `"repositoryOwnerIDs": [7, 8]`))
+	if err != nil || len(c.Cache.RepositoryIDs) != 0 || len(c.Cache.RepositoryOwnerIDs) != 2 || c.Cache.RepositoryOwnerIDs[1] != 8 {
+		t.Fatalf("owners only: %+v err=%v", c, err)
+	}
+	c, err = Parse(withCache(`"repositoryIDs": [100]`, `"repositoryIDs": [100, 200], "repositoryOwnerIDs": [7]`))
+	if err != nil || len(c.Cache.RepositoryIDs) != 2 || len(c.Cache.RepositoryOwnerIDs) != 1 {
+		t.Fatalf("both: %+v err=%v", c, err)
 	}
 }
 

@@ -87,6 +87,12 @@ func (l *logRecorder) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
+func (l *logRecorder) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
+}
+
 func TestReaperPass(t *testing.T) {
 	logs := &logRecorder{}
 	// MaxBytes 15: after the expired entry, 30 bytes remain; the oldest go
@@ -219,16 +225,18 @@ func TestUpstreamDownIs502(t *testing.T) {
 
 func TestNewServerValidatesOptions(t *testing.T) {
 	st := newMemStore(time.Now)
-	good := Options{PublicURL: "https://cache.example.test", Upstream: DefaultUpstreamResultsURL, SigningKeys: [][]byte{make([]byte, 32)}}
+	good := Options{PublicURL: "https://cache.example.test", Upstream: DefaultUpstreamResultsURL, SigningKeys: [][]byte{make([]byte, 32)}, RepositoryIDs: []int64{1}}
 	if _, err := newServer(st, good); err != nil {
 		t.Fatal(err)
 	}
 	for name, edit := range map[string]func(*Options){
-		"no key":        func(o *Options) { o.SigningKeys = nil },
-		"short key":     func(o *Options) { o.SigningKeys = [][]byte{make([]byte, 31)} },
-		"public path":   func(o *Options) { o.PublicURL = "https://cache.example.test/x" },
-		"public scheme": func(o *Options) { o.PublicURL = "ftp://cache.example.test" },
-		"upstream":      func(o *Options) { o.Upstream = "not a url" },
+		"no key":          func(o *Options) { o.SigningKeys = nil },
+		"short key":       func(o *Options) { o.SigningKeys = [][]byte{make([]byte, 31)} },
+		"public path":     func(o *Options) { o.PublicURL = "https://cache.example.test/x" },
+		"public scheme":   func(o *Options) { o.PublicURL = "ftp://cache.example.test" },
+		"upstream":        func(o *Options) { o.Upstream = "not a url" },
+		"no allowlist":    func(o *Options) { o.RepositoryIDs = nil },
+		"entry over 90 %": func(o *Options) { o.MaxBytes = 100; o.MaxEntryBytes = 91 },
 	} {
 		o := good
 		edit(&o)

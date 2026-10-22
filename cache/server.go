@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// Defaults of Options' zero fields.
+// Defaults of Options' zero fields; config applies the same values.
 const (
 	DefaultUpstreamResultsURL = "https://results-receiver.actions.githubusercontent.com"
 	DefaultDownloadURLTTL     = 10 * time.Minute
@@ -36,8 +36,24 @@ const (
 	maxKeys  = 10
 )
 
-// Options configures a Server. PublicURL, Upstream and SigningKeys are
-// required.
+// MaxEntryBytesFor returns the largest entry a cap of maxBytes admits: 90 %
+// of it, the size the reaper trims to, so a just-saved entry survives a
+// capped pass. With no cap (0) it is DefaultMaxEntryBytes.
+func MaxEntryBytesFor(maxBytes int64) int64 {
+	if maxBytes <= 0 {
+		return DefaultMaxEntryBytes
+	}
+	return maxBytes - maxBytes/10
+}
+
+// DefaultMaxEntryBytesFor is the maxEntryBytes default for a cap of
+// maxBytes: DefaultMaxEntryBytes, lowered to MaxEntryBytesFor(maxBytes).
+func DefaultMaxEntryBytesFor(maxBytes int64) int64 {
+	return min(DefaultMaxEntryBytes, MaxEntryBytesFor(maxBytes))
+}
+
+// Options configures a Server. PublicURL, Upstream, SigningKeys and at least
+// one of RepositoryOwnerIDs and RepositoryIDs are required.
 type Options struct {
 	// PublicURL is the scheme and host runners reach this server at
 	// (ACTIONS_RESULTS_URL); signed upload URLs are built from it.
@@ -49,10 +65,14 @@ type Options struct {
 	// Upstream receives every request that is not a cache request.
 	Upstream string
 	// SigningKeys sign upload URLs: the first mints, all verify.
-	SigningKeys    [][]byte
-	Prefix         string
-	DownloadURLTTL time.Duration
-	TTL            time.Duration
+	SigningKeys [][]byte
+	// RepositoryOwnerIDs and RepositoryIDs name the repositories served;
+	// every other token is denied.
+	RepositoryOwnerIDs []int64
+	RepositoryIDs      []int64
+	Prefix             string
+	DownloadURLTTL     time.Duration
+	TTL                time.Duration
 	// MaxBytes caps the total size of final entries; 0 is no cap.
 	MaxBytes      int64
 	MaxEntryBytes int64
@@ -63,15 +83,22 @@ type Options struct {
 
 // Server serves the cache service and passes other Results traffic upstream.
 type Server struct {
-	st     store
-	o      Options
-	lay    layout
-	auth   *verifier
-	sign   signer
-	public *url.URL
-	proxy  *httputil.ReverseProxy
-	log    *slog.Logger
-	reaper reaper
+	st      store
+	o       Options
+	lay     layout
+	auth    *verifier
+	allow   allowlist
+	sign    signer
+	public  *url.URL
+	proxy   *httputil.ReverseProxy
+	proxies chan struct{}
+	log     *slog.Logger
+	logOnce *logLimiter
+	reaper  reaper
+	// twirpReadTimeout bounds reading a Twirp request; idleTimeout bounds
+	// the time without progress on an upload or proxied body.
+	twirpReadTimeout time.Duration
+	idleTimeout      time.Duration
 }
 
 func newServer(st store, o Options) (*Server, error) {
@@ -85,7 +112,7 @@ func newServer(st store, o Options) (*Server, error) {
 		o.TTL = DefaultTTL
 	}
 	if o.MaxEntryBytes == 0 {
-		o.MaxEntryBytes = DefaultMaxEntryBytes
+		o.MaxEntryBytes = DefaultMaxEntryBytesFor(o.MaxBytes)
 	}
 	if o.ReapInterval == 0 {
 		o.ReapInterval = DefaultReapInterval
@@ -104,6 +131,13 @@ func newServer(st store, o Options) (*Server, error) {
 			return nil, errors.New("cache: a signing key is shorter than 32 bytes")
 		}
 	}
+	allow := newAllowlist(o.RepositoryOwnerIDs, o.RepositoryIDs)
+	if allow.empty() {
+		return nil, errors.New("cache: no repository IDs or repository owner IDs to serve")
+	}
+	if o.MaxBytes > 0 && o.MaxEntryBytes > MaxEntryBytesFor(o.MaxBytes) {
+		return nil, fmt.Errorf("cache: max entry bytes %d exceed 90 %% of max bytes %d", o.MaxEntryBytes, o.MaxBytes)
+	}
 	pub, err := url.Parse(strings.TrimSuffix(o.PublicURL, "/"))
 	if err != nil || pub.Host == "" || (pub.Scheme != "http" && pub.Scheme != "https") || pub.Path != "" {
 		return nil, fmt.Errorf("cache: public URL %q must be http(s)://host[:port] without a path", o.PublicURL)
@@ -113,13 +147,15 @@ func newServer(st store, o Options) (*Server, error) {
 		return nil, fmt.Errorf("cache: upstream URL %q must be an absolute http(s) URL", o.Upstream)
 	}
 	s := &Server{
-		st:     st,
-		o:      o,
-		lay:    newLayout(o.Prefix),
-		auth:   newVerifier(o.Issuer, o.IssuerClient, o.Now),
-		sign:   signer{keys: o.SigningKeys},
-		public: pub,
-		log:    o.Log,
+		st:      st,
+		o:       o,
+		lay:     newLayout(o.Prefix),
+		auth:    newVerifier(o.Issuer, o.IssuerClient, o.Now),
+		allow:   allow,
+		sign:    signer{keys: o.SigningKeys},
+		public:  pub,
+		log:     o.Log,
+		logOnce: newLogLimiter(time.Minute, o.Now),
 	}
 	s.proxy = newProxy(up, s.log)
 	s.reaper = reaper{st: st, lay: s.lay, ttl: o.TTL, maxBytes: o.MaxBytes, now: o.Now, log: s.log}
@@ -175,6 +211,14 @@ func (s *Server) serveTwirp(w http.ResponseWriter, r *http.Request, method strin
 		}
 		s.log.Info("cache: rejected token", "method", method, "error", err)
 		writeTwirpError(w, twerr(twirpUnauthenticated, "invalid runtime token"))
+		return
+	}
+	if !s.allow.permits(id) {
+		if s.logOnce.allow("deny:" + id.RepoID) {
+			s.log.Warn("cache: repository not served; denying its requests (logged once a minute per repository)",
+				"repository_id", id.RepoID, "repository_owner_id", id.OwnerID, "method", method)
+		}
+		writeTwirpError(w, twerr(twirpPermissionDenied, "cache denied: this repository is not served by this cache"))
 		return
 	}
 	resp, err := call(r.Context(), id, r, c)

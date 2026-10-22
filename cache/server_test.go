@@ -55,8 +55,10 @@ func newHarness(t *testing.T, edit ...func(*Options)) *harness {
 		Issuer:      h.is.URL,
 		Upstream:    "http://upstream.invalid",
 		SigningKeys: [][]byte{bytes.Repeat([]byte("k"), 32)},
-		Prefix:      "gha-cache",
-		Now:         h.clk.now,
+		// The repositories the tests use; TestAllowlist covers owners.
+		RepositoryIDs: []int64{100, 200},
+		Prefix:        "gha-cache",
+		Now:           h.clk.now,
 	}
 	for _, e := range edit {
 		e(&o)

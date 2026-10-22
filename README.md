@@ -593,6 +593,7 @@ image's BuildKit archive into it (a failed load only warns).
   "publicURL": "https://gha-cache.example.com",
   "s3": {"bucket": "cache-bucket", "region": "eu-west-1", "prefix": "gha-cache"},
   "signingKeyFile": "/etc/lux-gha/cache-signing-keys",
+  "repositoryIDs": [123456789], "repositoryOwnerIDs": [],
   "issuer": "https://token.actions.githubusercontent.com",
   "upstreamResultsURL": "https://results-receiver.actions.githubusercontent.com",
   "downloadURLTTL": "10m", "ttl": "168h", "maxBytes": 0, "maxEntryBytes": 10737418240,
@@ -609,6 +610,18 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
   **`signingKeyFile`** are required. `publicURL` is a scheme and host with no
   path, HTTPS except on loopback; signed upload URLs are built from it.
   `listen` must differ from the top-level `listen`.
+- **`repositoryIDs`**, **`repositoryOwnerIDs`**: numeric GitHub IDs (JSON
+  numbers) of the repositories served, or of their owners; at least one list
+  must be non-empty. The issuer signs runtime tokens for every repository on
+  GitHub, so without this any workflow anywhere could use the cache. A token
+  is served when its `repository_id` is in `repositoryIDs`, or its
+  `repository_owner_id` claim is present and in `repositoryOwnerIDs`; a token
+  without that claim matches only by `repositoryIDs`. Every other token gets
+  `403` (`permission_denied`), logged at most once a minute per repository.
+  `repository_owner_id` is a claim of GitHub's OIDC tokens; it has not yet
+  been confirmed in a runtime token (`ACTIONS_RUNTIME_TOKEN`). Decode one
+  real runtime token and check the claim before relying on
+  `repositoryOwnerIDs`; `repositoryIDs` does not depend on it.
 - **`s3`**: credentials come only from the AWS default chain (an instance
   role, the environment, shared config); there is no key field. `prefix`
   (optional) holds every object. `endpoint` (optional) names an

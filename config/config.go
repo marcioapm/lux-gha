@@ -51,6 +51,11 @@ type Cache struct {
 	MaxBytes      int64    `json:"maxBytes"`
 	MaxEntryBytes int64    `json:"maxEntryBytes"`
 	ReapInterval  Duration `json:"reapInterval"`
+	// A runtime token is served only when its repository_id is in
+	// RepositoryIDs or its repository owner ID is in RepositoryOwnerIDs;
+	// at least one list is required.
+	RepositoryOwnerIDs []int64 `json:"repositoryOwnerIDs"`
+	RepositoryIDs      []int64 `json:"repositoryIDs"`
 }
 
 type CacheS3 struct {
@@ -486,6 +491,19 @@ func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
 	}
 	if cc.ReapInterval.Duration < time.Minute {
 		add("cache.reapInterval %s must be at least 1m", cc.ReapInterval.Duration)
+	}
+	if len(cc.RepositoryOwnerIDs) == 0 && len(cc.RepositoryIDs) == 0 {
+		add("cache: list the served repositories in cache.repositoryIDs or their owners in cache.repositoryOwnerIDs (numeric GitHub IDs)")
+	}
+	for _, id := range cc.RepositoryOwnerIDs {
+		if id <= 0 {
+			add("cache.repositoryOwnerIDs: %d is not a positive GitHub ID", id)
+		}
+	}
+	for _, id := range cc.RepositoryIDs {
+		if id <= 0 {
+			add("cache.repositoryIDs: %d is not a positive GitHub ID", id)
+		}
 	}
 }
 

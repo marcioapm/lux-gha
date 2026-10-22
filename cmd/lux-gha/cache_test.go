@@ -53,6 +53,7 @@ func TestRunServesCacheOnSecondListener(t *testing.T) {
 			"listen": "127.0.0.1:0", "publicURL": "http://127.0.0.1:1",
 			"s3":             map[string]any{"bucket": "cache-bucket", "region": "us-east-1", "endpoint": "http://127.0.0.1:1"},
 			"signingKeyFile": keyFile, "issuer": "http://127.0.0.1:1", "upstreamResultsURL": upstream.URL,
+			"repositoryIDs": []int64{100},
 		}
 	})
 	addrs := make(chan [2]string, 2)
@@ -132,6 +133,7 @@ func TestRunRefusesCacheWithBadSigningKey(t *testing.T) {
 		c["cache"] = map[string]any{
 			"listen": "127.0.0.1:0", "publicURL": "http://127.0.0.1:1",
 			"s3": map[string]any{"bucket": "cache-bucket", "region": "us-east-1"}, "signingKeyFile": keyFile,
+			"repositoryOwnerIDs": []int64{7},
 		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -41,7 +41,7 @@ func newE2E(t *testing.T) *e2e {
 	h := newHarness(t)
 	srv, err := newServer(st, Options{
 		PublicURL: h.http.URL, Issuer: h.is.URL, Upstream: "http://upstream.invalid",
-		SigningKeys: [][]byte{bytes.Repeat([]byte("k"), 32)}, Prefix: prefix,
+		SigningKeys: [][]byte{bytes.Repeat([]byte("k"), 32)}, Prefix: prefix, RepositoryIDs: []int64{100, 200},
 	})
 	if err != nil {
 		t.Fatal(err)

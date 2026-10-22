@@ -96,6 +96,13 @@ func (is *testIssuer) token(t testing.TB, repoID string, scopes ...scopeGrant) s
 	return signJWT(t, is.key, is.kid, is.claims(t, repoID, scopes...))
 }
 
+// ownedToken is token with the repository owner ID claim.
+func (is *testIssuer) ownedToken(t testing.TB, repoID string, owner any, scopes ...scopeGrant) string {
+	c := is.claims(t, repoID, scopes...)
+	c[ownerIDClaim] = owner
+	return signJWT(t, is.key, is.kid, c)
+}
+
 func (is *testIssuer) sign(t testing.TB, claims map[string]any) string {
 	return signJWT(t, is.key, is.kid, claims)
 }

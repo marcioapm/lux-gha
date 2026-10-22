@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ const (
 // identity is what a verified runtime token grants.
 type identity struct {
 	RepoID string
+	// OwnerID is the repository owner's numeric ID; empty when the token
+	// has no such claim.
+	OwnerID string
 	// WriteScope is the one scope the job may save to; empty when none.
 	WriteScope string
 	// ReadScopes are searched on restore in this order: the write scope
@@ -36,6 +40,11 @@ type identity struct {
 	// TokenHash binds an upload reservation to the token that made it.
 	TokenHash string
 }
+
+// ownerIDClaim names the repository owner's numeric ID in a runtime token.
+// It is taken from GitHub's OIDC token claims and has not been confirmed in
+// a runtime token; repositoryIDs does not depend on it.
+const ownerIDClaim = "repository_owner_id"
 
 var (
 	errUnauthenticated = errors.New("unauthenticated")
@@ -133,6 +142,10 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	if err := tok.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("%w: claims: %v", errUnauthenticated, err)
 	}
+	var all map[string]json.RawMessage
+	if err := tok.Claims(&all); err != nil {
+		return nil, fmt.Errorf("%w: claims: %v", errUnauthenticated, err)
+	}
 	if claims.RepoID == nil || !repoIDPattern.MatchString(*claims.RepoID) {
 		return nil, fmt.Errorf("%w: repository_id claim missing or not numeric", errUnauthenticated)
 	}
@@ -143,7 +156,7 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	if err := json.Unmarshal([]byte(*claims.AC), &acl); err != nil {
 		return nil, fmt.Errorf("%w: ac claim is not a JSON array of scopes", errUnauthenticated)
 	}
-	id := &identity{RepoID: *claims.RepoID}
+	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(all[ownerIDClaim])}
 	sum := sha256.Sum256([]byte(raw))
 	id.TokenHash = hex.EncodeToString(sum[:])
 	for _, e := range acl {
@@ -168,4 +181,41 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 		}
 	}
 	return id, nil
+}
+
+// numericClaim returns a claim holding a decimal ID, as a string or a JSON
+// integer, and "" for anything else.
+func numericClaim(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		s = string(raw)
+	}
+	if !repoIDPattern.MatchString(s) {
+		return ""
+	}
+	return s
+}
+
+// allowlist names the repositories, by ID or by owner ID, this server
+// serves. Every other token is denied.
+type allowlist struct {
+	owners map[string]bool
+	repos  map[string]bool
+}
+
+func newAllowlist(owners, repos []int64) allowlist {
+	a := allowlist{owners: map[string]bool{}, repos: map[string]bool{}}
+	for _, o := range owners {
+		a.owners[strconv.FormatInt(o, 10)] = true
+	}
+	for _, r := range repos {
+		a.repos[strconv.FormatInt(r, 10)] = true
+	}
+	return a
+}
+
+func (a allowlist) empty() bool { return len(a.owners) == 0 && len(a.repos) == 0 }
+
+func (a allowlist) permits(id *identity) bool {
+	return a.repos[id.RepoID] || (id.OwnerID != "" && a.owners[id.OwnerID])
 }
