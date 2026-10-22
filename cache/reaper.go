@@ -56,7 +56,7 @@ func selectEntries(entries []object, now time.Time, ttl time.Duration, maxBytes 
 	if maxBytes <= 0 || kept <= maxBytes {
 		return del
 	}
-	target := maxBytes / 10 * 9
+	target := maxBytes - maxBytes/10
 	for ; i < len(sorted) && kept > target; i++ {
 		del = append(del, sorted[i])
 		kept -= sorted[i].Size
