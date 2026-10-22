@@ -820,6 +820,23 @@ make image             # the runner image for the host's architecture, as lux-gh
 make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
 
+The cache's S3 and end-to-end tests are left out of `make test`. They build
+with `-tags s3integration` and need an S3-compatible server, and for the
+end-to-end tests `node`, `zstd` and GNU tar plus a directory holding
+`@actions/cache` 6 (`npm --prefix <dir> install @actions/cache@6`):
+
+```sh
+docker run -d --name cache-s3 -p 127.0.0.1:59240:7070 -e ROOT_ACCESS_KEY=testuser -e ROOT_SECRET_KEY=testsecret \
+  versity/versitygw:v1.7.0 --port :7070 --iam-dir /tmp posix /tmp
+LUXGHA_CACHE_S3_ENDPOINT=http://127.0.0.1:59240 LUXGHA_CACHE_S3_BUCKET=cache-bucket \
+  AWS_ACCESS_KEY_ID=testuser AWS_SECRET_ACCESS_KEY=testsecret AWS_REGION=us-east-1 \
+  LUXGHA_CACHE_NODE_DIR=<dir> LUXGHA_CACHE_S3_CONDITIONAL=1 \
+  go test -tags s3integration -count=1 ./cache/
+```
+
+`LUXGHA_CACHE_S3_CONDITIONAL=1` fails the run unless the server enforces
+`If-None-Match` on `CompleteMultipartUpload`, as AWS S3 and versitygw do.
+
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, one
 `go test -race -v` run that fails if any test skipped, and `make dist VERSION=v0.0.0`; `shellcheck`, `sh -n`
 and `make entrypoint-test`; and the runner image built and smoke-tested with `images/runner/smoke.sh`

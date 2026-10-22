@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -146,10 +147,16 @@ func (s *s3Store) deleteKeys(ctx context.Context, keys []string) ([]string, erro
 	return failed, nil
 }
 
+// copyConcurrency bounds the UploadPartCopy calls of one finalize.
+const copyConcurrency = 8
+
 // assemble copies the parts server-side into a multipart upload of dst and
 // completes it with If-None-Match: *, so the first finalize wins and dst
 // appears whole or not at all. A server that ignores the condition makes
-// the last complete win, still atomically.
+// the last complete win, still atomically. Blocks are staged as separate
+// objects and copied here because the Azure client stages them in
+// parallel under opaque IDs, so their part numbers are known only once
+// the block list arrives.
 func (s *s3Store) assemble(ctx context.Context, dst string, parts []string) (err error) {
 	if _, err := s.head(ctx, dst); err == nil {
 		return errExists
@@ -172,19 +179,35 @@ func (s *s3Store) assemble(ctx context.Context, dst string, parts []string) (err
 		}
 	}()
 	done := make([]types.CompletedPart, len(parts))
+	errs := make([]error, len(parts))
+	sem := make(chan struct{}, copyConcurrency)
+	var wg sync.WaitGroup
 	for i, p := range parts {
 		n := int32(i + 1)
-		out, err := s.c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
-			Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId, PartNumber: aws.Int32(n),
-			CopySource: aws.String(s.bucket + "/" + copySourceEscape(p)),
-		})
-		if err != nil {
-			if isNotFound(err) {
-				return errNotFound
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			out, err := s.c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+				Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId, PartNumber: aws.Int32(n),
+				CopySource: aws.String(s.bucket + "/" + copySourceEscape(p)),
+			})
+			if err != nil {
+				errs[i] = err
+				return
 			}
-			return fmt.Errorf("copy part %d: %w", n, err)
+			done[i] = types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag}
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err == nil {
+			continue
 		}
-		done[i] = types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag}
+		if isNotFound(err) {
+			return errNotFound
+		}
+		return fmt.Errorf("copy part %d: %w", i+1, err)
 	}
 	_, err = s.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId,
