@@ -540,3 +540,18 @@ func TestReadScopeOrder(t *testing.T) {
 		t.Fatalf("%+v", id)
 	}
 }
+
+// A 512-byte non-ASCII key escapes past S3's 1024-byte object name limit.
+func TestKeysTooLongOnceEscaped(t *testing.T) {
+	h := newHarness(t)
+	tok := h.is.token(t, "100", writeMain())
+	long := strings.Repeat("é", 256)
+	if r := h.create(tok, long, v1); r.status != http.StatusOK || r.ok() || !strings.Contains(str(r.body["message"]), "too long") {
+		t.Fatalf("create: %+v", r)
+	}
+	// Restore skips the over-long probes and still matches a short restore key.
+	h.save(tok, "short-1", v1, []byte("x"))
+	if r := h.restore(tok, long, v1, "short-"); r.body["matched_key"] != "short-1" {
+		t.Fatalf("restore: %+v", r)
+	}
+}

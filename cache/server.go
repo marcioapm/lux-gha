@@ -222,7 +222,12 @@ func (s *Server) create(ctx context.Context, id *identity, r *http.Request, c co
 		// reported as contention instead.
 		return createResponse{Message: writeDeniedMessage}, nil
 	}
-	_, err := s.st.head(ctx, s.lay.entryKey(id.RepoID, id.WriteScope, req.Version, req.Key))
+	final := s.lay.entryKey(id.RepoID, id.WriteScope, req.Version, req.Key)
+	if len(final) > maxObjectKeyBytes {
+		// Escaping can triple a key's length past S3's key limit.
+		return createResponse{Message: "the key is too long to store once escaped; use a shorter or ASCII key"}, nil
+	}
+	_, err := s.st.head(ctx, final)
 	switch {
 	case err == nil:
 		return createResponse{Message: "a cache entry for this key and version already exists"}, nil
@@ -360,15 +365,21 @@ func (s *Server) lookup(ctx context.Context, id *identity, req downloadRequest) 
 	prefixes := append([]string{req.Key}, req.RestoreKeys...)
 	for _, scope := range id.ReadScopes {
 		exact := s.lay.entryKey(id.RepoID, scope, req.Version, req.Key)
-		o, err := s.st.head(ctx, exact)
-		if err == nil {
-			return o, req.Key, nil
-		}
-		if !errors.Is(err, errNotFound) {
-			return object{}, "", fmt.Errorf("head entry: %w", err)
-		}
 		dir := s.lay.versionDir(id.RepoID, scope, req.Version)
+		// A name longer than S3 allows was never stored, nor any it prefixes.
+		if len(exact) <= maxObjectKeyBytes {
+			o, err := s.st.head(ctx, exact)
+			if err == nil {
+				return o, req.Key, nil
+			}
+			if !errors.Is(err, errNotFound) {
+				return object{}, "", fmt.Errorf("head entry: %w", err)
+			}
+		}
 		for _, p := range prefixes {
+			if len(dir)+len(encodeKey(p)) > maxObjectKeyBytes {
+				continue
+			}
 			o, k, err := s.newest(ctx, dir, p)
 			if err == nil {
 				return o, k, nil

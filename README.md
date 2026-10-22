@@ -22,7 +22,7 @@ process.
 - `webhook`: signed `workflow_job` ingress that calls an injected function, and optionally `installation` and `installation_repositories` ingress.
 - `reconcile`: the single reconciler that provisions and removes runners.
 - `cache`: an optional GitHub Actions cache server (cache service v2) backed by S3, on its own listener ([Actions cache](#actions-cache)).
-- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
+- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`, and, with a `cache` section, the Actions cache on a second listener. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
 The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)). Besides the runner and rootless Docker, it ships `moby/buildkit` for its own architecture, pinned by digest. The entrypoint loads it into each Run's Docker store, so that `docker/setup-buildx-action`'s default `docker-container` builder does not pull BuildKit from Docker Hub on every job. Workflows should pin `driver-opts: image=moby/buildkit:<version>` to the version the image carries (its `io.github.marcioapm.lux-gha.buildkit` label). With `buildx-stable-1`, buildx downloads a newer BuildKit once that tag moves ([BuildKit driver](images/runner/README.md#buildkit-driver)).
 
