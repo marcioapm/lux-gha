@@ -188,7 +188,8 @@ func (s *Server) putBlock(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if r.ContentLength == 0 {
 		return azerr(http.StatusBadRequest, "InvalidInput", "an empty block is not stored")
 	}
-	if _, err := bodyLength(r, min(s.entryLimit(), maxBlockBytes)); err != nil {
+	limit := min(s.entryLimit(), maxBlockBytes)
+	if _, err := bodyLength(r, limit); err != nil {
 		return err
 	}
 	// The reservation's staged blocks plus this one must fit in an entry.
@@ -207,7 +208,7 @@ func (s *Server) putBlock(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if staged > s.o.MaxEntryBytes {
 		return azerr(http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "the staged blocks exceed %d bytes", s.o.MaxEntryBytes)
 	}
-	if _, err := s.stageObject(ctx, r, key, min(s.entryLimit(), maxBlockBytes)); err != nil {
+	if _, err := s.stageObject(ctx, r, key, limit); err != nil {
 		return err
 	}
 	s.created(w, r)

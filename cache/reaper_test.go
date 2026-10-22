@@ -53,6 +53,12 @@ func TestSelectEntries(t *testing.T) {
 	if got := selectEntries(nil, now, day, 1); len(got) != 0 {
 		t.Fatalf("empty: %v", got)
 	}
+	// An entry of MaxEntryBytesFor(cap), the largest config admits, survives
+	// the pass right after it is saved.
+	big := MaxEntryBytesFor(100)
+	if got := keysOf(selectEntries([]object{obj("a", 11, time.Hour, now), obj("just-saved", big, 0, now)}, now, 7*day, 100)); got != "a" {
+		t.Fatalf("largest entry: %q", got)
+	}
 }
 
 func TestSelectStagingKeepsLiveReservationsWhole(t *testing.T) {

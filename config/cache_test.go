@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/marcioapm/lux-gha/cache"
 )
 
 const cacheConfig = `"cache": {"listen": "127.0.0.1:8090", "publicURL": "https://cache.example.test",
@@ -29,9 +31,9 @@ func TestCacheDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	cc := c.Cache
-	if cc.Issuer != DefaultCacheIssuer || cc.UpstreamResultsURL != DefaultUpstreamResultsURL ||
-		cc.DownloadURLTTL.Duration != DefaultCacheDownloadURLTTL || cc.TTL.Duration != DefaultCacheTTL ||
-		cc.MaxBytes != 0 || cc.MaxEntryBytes != DefaultCacheMaxEntryBytes || cc.ReapInterval.Duration != DefaultCacheReapInterval {
+	if cc.Issuer != cache.DefaultIssuer || cc.UpstreamResultsURL != cache.DefaultUpstreamResultsURL ||
+		cc.DownloadURLTTL.Duration != cache.DefaultDownloadURLTTL || cc.TTL.Duration != cache.DefaultTTL ||
+		cc.MaxBytes != 0 || cc.MaxEntryBytes != cache.DefaultMaxEntryBytes || cc.ReapInterval.Duration != cache.DefaultReapInterval {
 		t.Fatalf("defaults %+v", cc)
 	}
 	tuned, err := Parse(withCache(`"signingKeyFile": "/s"`, `"signingKeyFile": "/s", "ttl": "48h", "maxBytes": 100000000000,
@@ -77,6 +79,39 @@ func TestCacheRejectsInvalid(t *testing.T) {
 	}
 	if _, err := Parse(withCache(`"region": "eu-west-1"`, `"region": "eu-west-1", "prefix": "ci/gha-cache", "endpoint": "http://127.0.0.1:59240"`)); err != nil {
 		t.Errorf("prefix and loopback endpoint: %v", err)
+	}
+}
+
+func TestCacheMaxEntryBytesFollowsMaxBytes(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, c := range []struct {
+		maxBytes, maxEntry string
+		want               int64
+	}{
+		// Only maxBytes, below 10 GiB: 90 % of it.
+		{"5368709120", "", 5*gib - 5*gib/10},
+		// Only maxBytes, large: the 10 GiB default.
+		{"1099511627776", "", 10 * gib},
+		// Exactly 90 %.
+		{"1000", "900", 900},
+	} {
+		edit := `"signingKeyFile": "/s", "maxBytes": ` + c.maxBytes
+		if c.maxEntry != "" {
+			edit += `, "maxEntryBytes": ` + c.maxEntry
+		}
+		cfg, err := Parse(withCache(`"signingKeyFile": "/s"`, edit))
+		if err != nil || cfg.Cache.MaxEntryBytes != c.want {
+			t.Errorf("maxBytes %s maxEntryBytes %q: got %+v err=%v, want %d", c.maxBytes, c.maxEntry, cfg, err, c.want)
+		}
+	}
+	for _, edit := range []string{
+		`"maxBytes": 1000, "maxEntryBytes": 901`,
+		`"maxBytes": 1000, "maxEntryBytes": 1000`,
+	} {
+		_, err := Parse(withCache(`"signingKeyFile": "/s"`, `"signingKeyFile": "/s", `+edit))
+		if err == nil || !strings.Contains(err.Error(), "90 % of cache.maxBytes") || !strings.Contains(err.Error(), "10 GiB") {
+			t.Errorf("%s: err=%v", edit, err)
+		}
 	}
 }
 

@@ -640,7 +640,9 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
 - **`ttl`** (at least 1 h): entries are deleted this long after they were
   saved. **`maxBytes`** (0: no cap): when entries exceed it, the oldest are
   deleted until 90 % remain. **`maxEntryBytes`**: the largest archive
-  accepted (default 10 GiB). **`reapInterval`** (at least 1 m): how often the
+  accepted: default 10 GiB, or 90 % of `maxBytes` if that is smaller, and
+  never more than 90 % of `maxBytes`, so the cap never deletes an entry just
+  saved. **`reapInterval`** (at least 1 m): how often the
   reaper runs.
 
 **Authentication.** Every cache call carries the job's runtime token

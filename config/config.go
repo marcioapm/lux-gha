@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marcioapm/lux-gha/cache"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -66,13 +67,8 @@ type CacheS3 struct {
 	Endpoint string `json:"endpoint"`
 }
 
+// The cache defaults are the cache package's own.
 const (
-	DefaultCacheIssuer         = "https://token.actions.githubusercontent.com"
-	DefaultUpstreamResultsURL  = "https://results-receiver.actions.githubusercontent.com"
-	DefaultCacheDownloadURLTTL = 10 * time.Minute
-	DefaultCacheTTL            = 7 * 24 * time.Hour
-	DefaultCacheMaxEntryBytes  = 10 << 30
-	DefaultCacheReapInterval   = time.Hour
 	// A presigned S3 URL lives at most 7 days.
 	MaxCacheDownloadURLTTL = 7 * 24 * time.Hour
 	// S3's object size limit.
@@ -451,25 +447,25 @@ func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
 		add("cache.signingKeyFile is required")
 	}
 	if cc.Issuer == "" {
-		cc.Issuer = DefaultCacheIssuer
+		cc.Issuer = cache.DefaultIssuer
 	}
 	if err := checkURL(cc.Issuer); err != nil {
 		add("cache.issuer: %v", err)
 	}
 	if cc.UpstreamResultsURL == "" {
-		cc.UpstreamResultsURL = DefaultUpstreamResultsURL
+		cc.UpstreamResultsURL = cache.DefaultUpstreamResultsURL
 	}
 	if err := checkURL(cc.UpstreamResultsURL); err != nil {
 		add("cache.upstreamResultsURL: %v", err)
 	}
 	if cc.DownloadURLTTL.Duration == 0 {
-		cc.DownloadURLTTL.Duration = DefaultCacheDownloadURLTTL
+		cc.DownloadURLTTL.Duration = cache.DefaultDownloadURLTTL
 	}
 	if d := cc.DownloadURLTTL.Duration; d < time.Minute || d > MaxCacheDownloadURLTTL {
 		add("cache.downloadURLTTL %s must be between 1m and %s", d, MaxCacheDownloadURLTTL)
 	}
 	if cc.TTL.Duration == 0 {
-		cc.TTL.Duration = DefaultCacheTTL
+		cc.TTL.Duration = cache.DefaultTTL
 	}
 	if cc.TTL.Duration < time.Hour {
 		add("cache.ttl %s must be at least 1h", cc.TTL.Duration)
@@ -477,17 +473,21 @@ func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
 	if cc.MaxBytes < 0 {
 		add("cache.maxBytes must not be negative")
 	}
-	if cc.MaxEntryBytes == 0 {
-		cc.MaxEntryBytes = DefaultCacheMaxEntryBytes
+	if cc.MaxEntryBytes == 0 && cc.MaxBytes >= 0 {
+		cc.MaxEntryBytes = cache.DefaultMaxEntryBytesFor(cc.MaxBytes)
 	}
-	if cc.MaxEntryBytes < 0 || cc.MaxEntryBytes > MaxCacheEntryBytes {
-		add("cache.maxEntryBytes must be between 1 and %d", int64(MaxCacheEntryBytes))
+	if cc.MaxEntryBytes <= 0 || cc.MaxEntryBytes > MaxCacheEntryBytes {
+		add("cache.maxEntryBytes must be between 1 and %d (default %d, 10 GiB, or 90 %% of cache.maxBytes if smaller)",
+			int64(MaxCacheEntryBytes), int64(cache.DefaultMaxEntryBytes))
 	}
-	if cc.MaxBytes > 0 && cc.MaxEntryBytes > cc.MaxBytes {
-		add("cache.maxEntryBytes must not exceed cache.maxBytes")
+	// The reaper trims to 90 % of maxBytes; a larger entry would be deleted
+	// by the first capped pass after it is saved.
+	if cc.MaxBytes > 0 && cc.MaxEntryBytes > cache.MaxEntryBytesFor(cc.MaxBytes) {
+		add("cache.maxEntryBytes %d must not exceed 90 %% of cache.maxBytes (%d); omit it for the default, 10 GiB or 90 %% of cache.maxBytes if smaller",
+			cc.MaxEntryBytes, cache.MaxEntryBytesFor(cc.MaxBytes))
 	}
 	if cc.ReapInterval.Duration == 0 {
-		cc.ReapInterval.Duration = DefaultCacheReapInterval
+		cc.ReapInterval.Duration = cache.DefaultReapInterval
 	}
 	if cc.ReapInterval.Duration < time.Minute {
 		add("cache.reapInterval %s must be at least 1m", cc.ReapInterval.Duration)
