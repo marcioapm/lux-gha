@@ -103,6 +103,10 @@ func (s *s3Store) put(ctx context.Context, key string, body io.Reader, size int6
 		})
 	}
 	_, err := s.c.PutObject(ctx, in, opts...)
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorCode() == "BadDigest" {
+		return fmt.Errorf("%w: %v", errBadDigest, err)
+	}
 	return err
 }
 

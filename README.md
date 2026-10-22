@@ -673,6 +673,9 @@ token, valid for 6 hours. The client uploads to it with the Azure Blob SDK;
 lux-gha implements the three requests that client sends: one `Put Blob` up
 to 128 MiB, or `Put Block` per 64 MiB block followed by `Put Block List`.
 Every block but the last must be at least 5 MiB, S3's multipart minimum.
+One upload is either a `Put Blob` or blocks, not both (`409
+InvalidBlobOrBlock`), and holds at most 10,000 blocks (`400
+BlockCountExceedsLimit`).
 `@actions/cache` meets that; BuildKit's `type=gha` cache, which uploads 1 MiB
 blocks, is not supported. Blocks are streamed to S3, never held in memory.
 `FinalizeCacheEntryUpload` checks the uploaded size against `size_bytes`
@@ -694,12 +697,18 @@ endpoint as well as to `publicURL`.
 | `staging/<reservation>/…` | uploads not yet finalized; never read by a restore. |
 
 **Expiry.** The reaper runs at start and every `reapInterval`, one pass at a
-time, and logs one `cache reaper pass` line with the entry count and bytes
-and what it deleted. It deletes entries older than `ttl`, then the oldest
-while over `maxBytes`, staging uploads untouched for 24 hours, and multipart
-uploads under `prefix` started more than 24 hours ago (without a `prefix`,
-every multipart upload in the bucket: give the cache its own bucket or a
-prefix). A failed delete is
+time and each bounded by `reapInterval`, and logs one `cache reaper pass`
+line with the entry count and bytes, the staging bytes, and what it deleted.
+It deletes entries older than `ttl`, staging uploads untouched for 24 hours,
+and multipart uploads under `prefix` started more than 24 hours ago (without
+a `prefix`, every multipart upload in the bucket: give the cache its own
+bucket or a prefix). Then, while entries and staging uploads together exceed
+`maxBytes`, it deletes whole staging uploads, oldest first, and then the
+oldest entries, until 90 % remain. A staging upload written to within the
+last 6 hours (the upload URL lifetime) is never deleted for the cap. For the
+cap every entry and every staging upload counts as at least 1 MiB, so
+`maxBytes` also bounds the number of objects (`maxBytes` / 1 MiB) the reaper
+lists and holds. A failed delete is
 retried next pass. As a backstop, give the bucket a lifecycle rule that
 aborts incomplete multipart uploads after a day or more.
 

@@ -158,7 +158,7 @@ func newServer(st store, o Options) (*Server, error) {
 		logOnce: newLogLimiter(time.Minute, o.Now),
 	}
 	s.proxy = newProxy(up, s.log)
-	s.reaper = reaper{st: st, lay: s.lay, ttl: o.TTL, maxBytes: o.MaxBytes, now: o.Now, log: s.log}
+	s.reaper = reaper{st: st, lay: s.lay, ttl: o.TTL, maxBytes: o.MaxBytes, timeout: o.ReapInterval, now: o.Now, log: s.log}
 	return s, nil
 }
 
@@ -356,12 +356,11 @@ func (s *Server) cleanStaging(ctx context.Context, staging string) {
 		keys = append(keys, o.Key)
 		return true
 	})
-	if err == nil && len(keys) > 0 {
-		_, err = s.st.deleteKeys(ctx, keys)
-	}
 	if err != nil {
 		s.log.Warn("cache: staging cleanup failed; the reaper retries", "error", err)
+		return
 	}
+	deleteBatched(ctx, s.st, s.log, keys)
 }
 
 func (s *Server) download(ctx context.Context, id *identity, r *http.Request, c codec) (marshaler, error) {

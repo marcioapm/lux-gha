@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -162,33 +163,110 @@ func TestSmallNonFinalBlockIsRefused(t *testing.T) {
 	}
 }
 
+// azureErr asserts an Azure error response's status, x-ms-error-code and
+// message.
+func azureErr(t *testing.T, name string, resp *http.Response, body string, status int, code, msg string) {
+	t.Helper()
+	if resp.StatusCode != status || resp.Header.Get("x-ms-error-code") != code || !strings.Contains(body, msg) {
+		t.Errorf("%s: %d %s %s, want %d %s %q", name, resp.StatusCode, resp.Header.Get("x-ms-error-code"), body, status, code, msg)
+	}
+}
+
 func TestBlockListErrors(t *testing.T) {
 	h := newHarness(t)
 	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
-	h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, []byte("x"))
-	for name, body := range map[string][]byte{
-		"missing block": blockListXML(blockID(0), blockID(9)),
-		"duplicate":     blockListXML(blockID(0), blockID(0)),
-		"empty":         blockListXML(),
-		"not XML":       []byte("<BlockList"),
-		"bad id":        blockListXML("!!"),
-		"bad element":   []byte("<BlockList><Other>" + blockID(0) + "</Other></BlockList>"),
+	// Block 0 is large enough to sit anywhere in a list, so only the check
+	// under test can reject it.
+	if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, make([]byte, minPartBytes)); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("block 0: %d %s", resp.StatusCode, b)
+	}
+	for _, c := range []struct {
+		name      string
+		body      []byte
+		code, msg string
+	}{
+		{"missing block", blockListXML(blockID(0), blockID(9)), "InvalidBlockList", "block 1 was not uploaded"},
+		{"missing first", blockListXML(blockID(9), blockID(0)), "InvalidBlockList", "block 0 was not uploaded"},
+		{"duplicate", blockListXML(blockID(0), blockID(0)), "InvalidBlockList", "block 1 is listed twice"},
+		{"empty", blockListXML(), "InvalidBlockList", "the block list is empty"},
+		{"not XML", []byte("<BlockList"), "InvalidXmlDocument", "block list"},
+		{"bad id", blockListXML("!!"), "InvalidQueryParameterValue", "blockid must be base64"},
+		{"bad element", []byte("<BlockList><Other>" + blockID(0) + "</Other></BlockList>"), "InvalidXmlNodeValue", "unexpected element &#34;Other&#34;"},
 	} {
-		if resp, b := h.put(up, "comp=blocklist", nil, body); resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
-		}
+		resp, b := h.put(up, "comp=blocklist", nil, c.body)
+		azureErr(t, c.name, resp, b, http.StatusBadRequest, c.code, c.msg)
 	}
-	if resp, _ := h.put(up, "comp=block&blockid=", nil, []byte("x")); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("empty block id: %d", resp.StatusCode)
+	tooMany := make([]string, maxParts+1)
+	for i := range tooMany {
+		tooMany[i] = blockID(0)
 	}
-	if resp, _ := h.put(up, "comp=appendblock", nil, []byte("x")); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("unsupported comp: %d", resp.StatusCode)
+	resp, b := h.put(up, "comp=blocklist", nil, blockListXML(tooMany...))
+	azureErr(t, "too many", resp, b, http.StatusBadRequest, "InvalidBlockList", "exceed the limit of 10000")
+	resp, b = h.put(up, "comp=block&blockid=", nil, []byte("x"))
+	azureErr(t, "empty block id", resp, b, http.StatusBadRequest, "InvalidQueryParameterValue", "blockid")
+	resp, b = h.put(up, "comp=appendblock", nil, []byte("x"))
+	azureErr(t, "unsupported comp", resp, b, http.StatusBadRequest, "UnsupportedQueryParameter", "appendblock")
+	resp, b = h.put(up, "", map[string]string{"x-ms-blob-type": "PageBlob"}, []byte("x"))
+	azureErr(t, "page blob", resp, b, http.StatusBadRequest, "InvalidBlobType", "PageBlob")
+	resp, b = h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(1)), map[string]string{"Content-MD5": "not-md5"}, []byte("x"))
+	azureErr(t, "malformed Content-MD5", resp, b, http.StatusBadRequest, "InvalidHeaderValue", "Content-MD5")
+	resp, b = h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(1)), map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(make([]byte, 16))}, []byte("x"))
+	azureErr(t, "wrong Content-MD5", resp, b, http.StatusBadRequest, "Md5Mismatch", "MD5")
+	if left := h.st.keys(h.srv.lay.stagingRoot()); len(left) != 1 {
+		t.Errorf("rejected blocks were staged: %q", left)
 	}
-	if resp, _ := h.put(up, "", map[string]string{"x-ms-blob-type": "PageBlob"}, []byte("x")); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("page blob: %d", resp.StatusCode)
+	// Non-PUT methods on the upload URL.
+	r, _ := http.NewRequest(http.MethodGet, up, nil)
+	gresp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if resp, _ := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob", "Content-MD5": base64.StdEncoding.EncodeToString(make([]byte, 16))}, []byte("x")); resp.StatusCode < 400 {
-		t.Errorf("wrong Content-MD5 accepted: %d", resp.StatusCode)
+	gb, _ := io.ReadAll(gresp.Body)
+	gresp.Body.Close()
+	azureErr(t, "GET", gresp, string(gb), http.StatusMethodNotAllowed, "UnsupportedHttpVerb", "only PUT")
+}
+
+// The SDK sends Put Blob or blocks, never both: the mix is refused, so a
+// reservation stages at most one entry's bytes.
+func TestPutBlobAndPutBlockDoNotMix(t *testing.T) {
+	h := newHarness(t)
+	tok := h.is.token(t, "100", writeMain())
+	blobFirst := h.reserve(tok, "a", v1)
+	h.putBlobOK(blobFirst, []byte("whole"))
+	resp, b := h.put(blobFirst, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, []byte("x"))
+	azureErr(t, "block after blob", resp, b, http.StatusConflict, "InvalidBlobOrBlock", "Put Block cannot follow Put Blob")
+	// Re-putting the blob still works (the SDK retries).
+	h.putBlobOK(blobFirst, []byte("whole"))
+
+	blocksFirst := h.reserve(tok, "b", v1)
+	if resp, b := h.put(blocksFirst, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, []byte("x")); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("block: %d %s", resp.StatusCode, b)
+	}
+	resp, b = h.put(blocksFirst, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, []byte("whole"))
+	azureErr(t, "blob after block", resp, b, http.StatusConflict, "InvalidBlobOrBlock", "Put Blob cannot follow Put Block")
+	if f := h.finalize(tok, "a", v1, 5); !f.ok() {
+		t.Fatalf("finalize a: %+v", f)
+	}
+}
+
+// Put Block counts the reservation's staged blocks and refuses one past
+// maxParts; re-putting a staged block does not add to the count.
+func TestPutBlockCountsBlocks(t *testing.T) {
+	h := newHarness(t)
+	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
+	u, _ := url.Parse(up)
+	staging, err := h.srv.sign.open(u.Query().Get("sig"), h.clk.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range maxParts {
+		h.st.set(fmt.Sprintf("%s/block/%04x", staging, i), []byte("x"))
+	}
+	resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(1)), nil, []byte("x"))
+	azureErr(t, "block past maxParts", resp, b, http.StatusBadRequest, "BlockCountExceedsLimit", "at most 10000 blocks")
+	existing := base64.StdEncoding.EncodeToString([]byte{0, 5})
+	if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(existing), nil, []byte("y")); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("re-put of a staged block: %d %s", resp.StatusCode, b)
 	}
 }
 
@@ -275,8 +353,63 @@ func TestUploadSizeBounds(t *testing.T) {
 func TestEmptyArchiveRefused(t *testing.T) {
 	h := newHarness(t)
 	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
-	if resp, _ := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, nil); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("empty: %d", resp.StatusCode)
+	resp, b := h.put(up, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, nil)
+	azureErr(t, "empty archive", resp, b, http.StatusBadRequest, "InvalidInput", "empty archive")
+	resp, b = h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, nil)
+	azureErr(t, "empty block", resp, b, http.StatusBadRequest, "InvalidInput", "empty block")
+}
+
+// Concurrent Put Blocks can each pass the per-block sum; Put Block List's
+// total is the bound that holds.
+func TestBlockListTotalIsBounded(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxEntryBytes = 2 * minPartBytes })
+	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
+	u, _ := url.Parse(up)
+	staging, _ := h.srv.sign.open(u.Query().Get("sig"), h.clk.now())
+	for i := range 2 {
+		if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(i)), nil, make([]byte, minPartBytes)); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("block %d: %d %s", i, resp.StatusCode, b)
+		}
+	}
+	// A racing re-put of block 1 that passed its check with the old size.
+	key, _ := blockObject(staging, blockID(1))
+	h.st.set(key, make([]byte, minPartBytes+1))
+	resp, b := h.put(up, "comp=blocklist", nil, blockListXML(blockID(0), blockID(1)))
+	azureErr(t, "list over the bound", resp, b, http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "exceeds 10485760 bytes")
+	if _, ok := h.st.get(staging + "/manifest"); ok {
+		t.Fatal("a manifest was written")
+	}
+}
+
+// A body without a Content-Length (chunked) is refused before any byte is
+// staged.
+func TestChunkedUploadIs411(t *testing.T) {
+	h := newHarness(t)
+	up := h.reserve(h.is.token(t, "100", writeMain()), "k", v1)
+	for _, c := range []struct{ query, blobType string }{
+		{"", "BlockBlob"},
+		{"comp=block&blockid=" + url.QueryEscape(blockID(0)), ""},
+		{"comp=blocklist", ""},
+	} {
+		u := up
+		if c.query != "" {
+			u += "&" + c.query
+		}
+		// An io.Reader of unknown length makes the client send chunked.
+		r, _ := http.NewRequest(http.MethodPut, u, io.MultiReader(strings.NewReader(string(blockListXML(blockID(0))))))
+		if c.blobType != "" {
+			r.Header.Set("x-ms-blob-type", c.blobType)
+		}
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		azureErr(t, "chunked "+c.query, resp, string(b), http.StatusLengthRequired, "MissingContentLengthHeader", "Content-Length is required")
+	}
+	if left := h.st.keys(h.srv.lay.stagingRoot()); len(left) != 0 {
+		t.Fatalf("staged %q", left)
 	}
 }
 

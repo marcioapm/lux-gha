@@ -23,13 +23,21 @@ type memStore struct {
 	now     func() time.Time
 	// failDelete makes deleteKeys report these keys as failed.
 	failDelete map[string]bool
+	// failList makes a listing of exactly this prefix deliver half its
+	// objects and then fail, as a listing that breaks on a later page.
+	failList map[string]error
+	// failHead makes head of these keys fail.
+	failHead map[string]error
 	// lastWriterWins disables the conditional write.
 	lastWriterWins bool
+	deleteCalls    int
 }
 
 type memObj struct {
 	data []byte
 	mod  time.Time
+	// meta is the reservation that assembled the object.
+	meta string
 }
 
 func newMemStore(now func() time.Time) *memStore {
@@ -39,6 +47,9 @@ func newMemStore(now func() time.Time) *memStore {
 func (m *memStore) head(_ context.Context, key string) (object, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.failHead[key]; err != nil {
+		return object{}, err
+	}
 	o, ok := m.objs[key]
 	if !ok {
 		return object{}, errNotFound
@@ -54,14 +65,18 @@ func (m *memStore) list(_ context.Context, prefix string, fn func(object) bool) 
 			out = append(out, object{Key: k, Size: int64(len(o.data)), LastModified: o.mod})
 		}
 	}
+	failErr := m.failList[prefix]
 	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if failErr != nil {
+		out = out[:len(out)/2]
+	}
 	for _, o := range out {
 		if !fn(o) {
-			break
+			return nil
 		}
 	}
-	return nil
+	return failErr
 }
 
 func (m *memStore) put(_ context.Context, key string, body io.Reader, size int64, sum string) error {
@@ -75,7 +90,7 @@ func (m *memStore) put(_ context.Context, key string, body io.Reader, size int64
 	if sum != "" {
 		h := md5.Sum(b)
 		if base64.StdEncoding.EncodeToString(h[:]) != sum {
-			return fmt.Errorf("BadDigest")
+			return errBadDigest
 		}
 	}
 	m.set(key, b)
@@ -121,6 +136,11 @@ func (m *memStore) getSmall(_ context.Context, key string, limit int64) ([]byte,
 func (m *memStore) deleteKeys(_ context.Context, keys []string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.deleteCalls++
+	if len(keys) > deleteBatch {
+		// S3 rejects the whole DeleteObjects request.
+		return nil, fmt.Errorf("MalformedXML: %d keys", len(keys))
+	}
 	var failed []string
 	for _, k := range keys {
 		if m.failDelete[k] {

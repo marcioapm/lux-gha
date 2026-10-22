@@ -16,15 +16,18 @@ type reaper struct {
 	lay      layout
 	ttl      time.Duration
 	maxBytes int64
-	now      func() time.Time
-	log      *slog.Logger
-	running  sync.Mutex
+	// timeout bounds one pass, so a stuck S3 call cannot stop later passes.
+	timeout time.Duration
+	now     func() time.Time
+	log     *slog.Logger
+	running sync.Mutex
 }
 
 // reapResult is one pass's summary.
 type reapResult struct {
 	Entries        int
 	Bytes          int64
+	StagingBytes   int64
 	DeletedEntries int
 	DeletedBytes   int64
 	DeletedStaging int
@@ -32,10 +35,70 @@ type reapResult struct {
 	Errors         int
 }
 
-// selectEntries returns the entries to delete: every one last modified
-// before now-ttl, then, while the rest exceed maxBytes, the oldest of the
-// rest until they fit in 90 % of maxBytes. maxBytes 0 is no cap.
-func selectEntries(entries []object, now time.Time, ttl time.Duration, maxBytes int64) []object {
+// minAccountedBytes is the least size an entry or a staging reservation
+// counts for against maxBytes, so the cap also bounds how many objects the
+// reaper lists and holds in memory (maxBytes / 1 MiB).
+const minAccountedBytes = 1 << 20
+
+func accounted(size int64) int64 { return max(size, minAccountedBytes) }
+
+// reservation is one upload's staging objects.
+type reservation struct {
+	name   string
+	newest time.Time
+	bytes  int64
+	keys   []string
+}
+
+// groupStaging groups staging objects by reservation, oldest newest-object
+// first.
+func groupStaging(objs []object, root string) []reservation {
+	idx := map[string]int{}
+	var res []reservation
+	for _, o := range objs {
+		name := reservationOf(root, o.Key)
+		i, ok := idx[name]
+		if !ok {
+			i = len(res)
+			idx[name] = i
+			res = append(res, reservation{name: name, newest: o.LastModified})
+		}
+		r := &res[i]
+		if o.LastModified.After(r.newest) {
+			r.newest = o.LastModified
+		}
+		r.bytes += o.Size
+		r.keys = append(r.keys, o.Key)
+	}
+	slices.SortFunc(res, func(a, b reservation) int {
+		if c := a.newest.Compare(b.newest); c != 0 {
+			return c
+		}
+		return strings.Compare(a.name, b.name)
+	})
+	return res
+}
+
+// selectReap returns the entries and staging objects to delete:
+//   - every entry last modified before now-ttl;
+//   - every staging reservation whose newest object is older than
+//     stagingMaxAge, whole, so a pass never removes part of a live upload;
+//   - then, while entries and staging together exceed maxBytes (each
+//     counted at least minAccountedBytes), staging reservations oldest
+//     first, never one written to within uploadURLTTL, and then the oldest
+//     entries, until 90 % of maxBytes remain. maxBytes 0 is no cap.
+//
+// entriesOK false means the entry listing failed: no entry is deleted and
+// the cap is not applied, since the total is unknown.
+func selectReap(entries, staged []object, entriesOK bool, root string, now time.Time, ttl time.Duration, maxBytes int64) (delEntries []object, delStaging []string) {
+	groups := groupStaging(staged, root)
+	g := 0
+	for ; g < len(groups) && groups[g].newest.Before(now.Add(-stagingMaxAge)); g++ {
+		delStaging = append(delStaging, groups[g].keys...)
+	}
+	if !entriesOK {
+		return nil, delStaging
+	}
 	sorted := slices.Clone(entries)
 	slices.SortStableFunc(sorted, func(a, b object) int {
 		if c := a.LastModified.Compare(b.LastModified); c != 0 {
@@ -43,46 +106,35 @@ func selectEntries(entries []object, now time.Time, ttl time.Duration, maxBytes 
 		}
 		return strings.Compare(a.Key, b.Key)
 	})
-	cutoff := now.Add(-ttl)
-	var del []object
-	var kept int64
 	i := 0
-	for ; i < len(sorted) && sorted[i].LastModified.Before(cutoff); i++ {
-		del = append(del, sorted[i])
+	for ; i < len(sorted) && sorted[i].LastModified.Before(now.Add(-ttl)); i++ {
+		delEntries = append(delEntries, sorted[i])
 	}
+	if maxBytes <= 0 {
+		return delEntries, delStaging
+	}
+	var total int64
 	for _, o := range sorted[i:] {
-		kept += o.Size
+		total += accounted(o.Size)
 	}
-	if maxBytes <= 0 || kept <= maxBytes {
-		return del
+	for _, r := range groups[g:] {
+		total += accounted(r.bytes)
+	}
+	if total <= maxBytes {
+		return delEntries, delStaging
 	}
 	target := maxBytes - maxBytes/10
-	for ; i < len(sorted) && kept > target; i++ {
-		del = append(del, sorted[i])
-		kept -= sorted[i].Size
+	// Groups are ordered by their newest object, so the first one written
+	// within uploadURLTTL ends the staging candidates.
+	for ; g < len(groups) && total > target && groups[g].newest.Before(now.Add(-uploadURLTTL)); g++ {
+		delStaging = append(delStaging, groups[g].keys...)
+		total -= accounted(groups[g].bytes)
 	}
-	return del
-}
-
-// selectStaging returns the staging objects of reservations whose newest
-// object is older than maxAge. A reservation is deleted whole or not at
-// all, so a pass never removes part of an upload still being written.
-func selectStaging(objs []object, root string, now time.Time, maxAge time.Duration) []string {
-	newest := map[string]time.Time{}
-	for _, o := range objs {
-		res := reservationOf(root, o.Key)
-		if t, ok := newest[res]; !ok || o.LastModified.After(t) {
-			newest[res] = o.LastModified
-		}
+	for ; i < len(sorted) && total > target; i++ {
+		delEntries = append(delEntries, sorted[i])
+		total -= accounted(sorted[i].Size)
 	}
-	cutoff := now.Add(-maxAge)
-	var del []string
-	for _, o := range objs {
-		if newest[reservationOf(root, o.Key)].Before(cutoff) {
-			del = append(del, o.Key)
-		}
-	}
-	return del
+	return delEntries, delStaging
 }
 
 func reservationOf(root, key string) string {
@@ -93,13 +145,14 @@ func reservationOf(root, key string) string {
 
 const deleteBatch = 1000
 
-// deleteAll deletes keys in batches and returns the ones not deleted.
-func (rp *reaper) deleteAll(ctx context.Context, keys []string) (failed []string) {
+// deleteBatched deletes keys in batches of deleteBatch, the S3
+// DeleteObjects limit, and returns the ones not deleted.
+func deleteBatched(ctx context.Context, st store, log *slog.Logger, keys []string) (failed []string) {
 	for len(keys) > 0 {
 		n := min(len(keys), deleteBatch)
-		f, err := rp.st.deleteKeys(ctx, keys[:n])
+		f, err := st.deleteKeys(ctx, keys[:n])
 		if err != nil {
-			rp.log.Warn("cache reaper: delete failed; retried next pass", "error", err)
+			log.Warn("cache: delete failed; the reaper retries", "error", err)
 			f = keys[:n]
 		}
 		failed = append(failed, f...)
@@ -114,6 +167,11 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		return reapResult{}, false
 	}
 	defer rp.running.Unlock()
+	if rp.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, rp.timeout)
+		defer cancel()
+	}
 	var res reapResult
 	now := rp.now()
 
@@ -122,28 +180,16 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		entries = append(entries, o)
 		return true
 	})
-	if err != nil {
-		// A partial listing would undercount the total; delete nothing.
+	entriesOK := err == nil
+	if !entriesOK {
+		// A partial listing would undercount the total; delete no entry.
 		rp.log.Warn("cache reaper: listing entries failed", "error", err)
 		res.Errors++
-	} else {
-		for _, o := range entries {
-			res.Entries++
-			res.Bytes += o.Size
-		}
-		del := selectEntries(entries, now, rp.ttl, rp.maxBytes)
-		keys := make([]string, len(del))
-		for i, o := range del {
-			keys[i] = o.Key
-		}
-		failed := rp.deleteAll(ctx, keys)
-		res.Errors += len(failed)
-		for _, o := range del {
-			if !slices.Contains(failed, o.Key) {
-				res.DeletedEntries++
-				res.DeletedBytes += o.Size
-			}
-		}
+		entries = nil
+	}
+	for _, o := range entries {
+		res.Entries++
+		res.Bytes += o.Size
 	}
 
 	var staged []object
@@ -152,12 +198,37 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		staged = append(staged, o)
 		return true
 	}); err != nil {
+		// Without the staging listing the cap counts entries only, which
+		// can only delete fewer.
 		rp.log.Warn("cache reaper: listing staging failed", "error", err)
 		res.Errors++
-	} else {
-		keys := selectStaging(staged, root, now, stagingMaxAge)
-		failed := rp.deleteAll(ctx, keys)
-		res.DeletedStaging, res.Errors = len(keys)-len(failed), res.Errors+len(failed)
+		staged = nil
+	}
+	for _, o := range staged {
+		res.StagingBytes += o.Size
+	}
+
+	delEntries, delStaging := selectReap(entries, staged, entriesOK, root, now, rp.ttl, rp.maxBytes)
+	if len(delStaging) > 0 {
+		failed := deleteBatched(ctx, rp.st, rp.log, delStaging)
+		res.DeletedStaging, res.Errors = len(delStaging)-len(failed), res.Errors+len(failed)
+	}
+	if len(delEntries) > 0 {
+		keys := make([]string, len(delEntries))
+		for i, o := range delEntries {
+			keys[i] = o.Key
+		}
+		failed := map[string]bool{}
+		for _, k := range deleteBatched(ctx, rp.st, rp.log, keys) {
+			failed[k] = true
+		}
+		res.Errors += len(failed)
+		for _, o := range delEntries {
+			if !failed[o.Key] {
+				res.DeletedEntries++
+				res.DeletedBytes += o.Size
+			}
+		}
 	}
 
 	var stale []pendingUpload
@@ -178,7 +249,7 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		res.AbortedUploads++
 	}
 	rp.log.Info("cache reaper pass",
-		"entries", res.Entries, "bytes", res.Bytes,
+		"entries", res.Entries, "bytes", res.Bytes, "staging_bytes", res.StagingBytes,
 		"deleted_entries", res.DeletedEntries, "deleted_bytes", res.DeletedBytes,
 		"deleted_staging", res.DeletedStaging, "aborted_uploads", res.AbortedUploads,
 		"errors", res.Errors)

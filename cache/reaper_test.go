@@ -3,6 +3,8 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,29 +27,38 @@ func keysOf(objs []object) string {
 	return strings.Join(ks, " ")
 }
 
+// mib is minAccountedBytes: sizes in these tests are multiples of it, so
+// accounting and real sizes agree.
+const mib = int64(minAccountedBytes)
+
+func selectEntries(entries []object, now time.Time, ttl time.Duration, maxBytes int64) []object {
+	del, _ := selectReap(entries, nil, true, "staging/", now, ttl, maxBytes)
+	return del
+}
+
 func TestSelectEntries(t *testing.T) {
 	now := time.Now()
 	day := 24 * time.Hour
 	entries := []object{
-		obj("fresh", 10, time.Hour, now),
-		obj("expired", 10, 8*day, now),
-		obj("older", 30, 3*day, now),
-		obj("old", 30, 2*day, now),
-		obj("new", 30, day, now),
+		obj("fresh", 10*mib, time.Hour, now),
+		obj("expired", 10*mib, 8*day, now),
+		obj("older", 30*mib, 3*day, now),
+		obj("old", 30*mib, 2*day, now),
+		obj("new", 30*mib, day, now),
 	}
 	if got := keysOf(selectEntries(entries, now, 7*day, 0)); got != "expired" {
 		t.Fatalf("ttl only: %q", got)
 	}
-	// 100 bytes kept against a cap of 100: under it, nothing more.
-	if got := keysOf(selectEntries(entries, now, 7*day, 100)); got != "expired" {
+	// 100 MiB kept against a cap of 100: under it, nothing more.
+	if got := keysOf(selectEntries(entries, now, 7*day, 100*mib)); got != "expired" {
 		t.Fatalf("at cap: %q", got)
 	}
 	// Cap 90 → target 81: delete oldest-first until ≤ 81 (100 → 70).
-	if got := keysOf(selectEntries(entries, now, 7*day, 90)); got != "expired older" {
+	if got := keysOf(selectEntries(entries, now, 7*day, 90*mib)); got != "expired older" {
 		t.Fatalf("over cap: %q", got)
 	}
 	// Cap 50 → target 45: 100 → 70 → 40.
-	if got := keysOf(selectEntries(entries, now, 7*day, 50)); got != "expired older old" {
+	if got := keysOf(selectEntries(entries, now, 7*day, 50*mib)); got != "expired older old" {
 		t.Fatalf("well over cap: %q", got)
 	}
 	if got := selectEntries(nil, now, day, 1); len(got) != 0 {
@@ -55,9 +66,33 @@ func TestSelectEntries(t *testing.T) {
 	}
 	// An entry of MaxEntryBytesFor(cap), the largest config admits, survives
 	// the pass right after it is saved.
-	big := MaxEntryBytesFor(100)
-	if got := keysOf(selectEntries([]object{obj("a", 11, time.Hour, now), obj("just-saved", big, 0, now)}, now, 7*day, 100)); got != "a" {
+	big := MaxEntryBytesFor(100 * mib)
+	if got := keysOf(selectEntries([]object{obj("a", 11*mib, time.Hour, now), obj("just-saved", big, 0, now)}, now, 7*day, 100*mib)); got != "a" {
 		t.Fatalf("largest entry: %q", got)
+	}
+	// The cap trims to 90 %, not 100 %: 105 over a cap of 100 loses two
+	// 10 MiB entries (to 85), not one (to 95).
+	var tens []object
+	for i := range 10 {
+		tens = append(tens, obj(fmt.Sprintf("e%d", i), 10*mib, time.Duration(20-i)*time.Hour, now))
+	}
+	tens = append(tens, obj("small", 5*mib, 0, now))
+	if got := keysOf(selectEntries(tens, now, 7*day, 100*mib)); got != "e0 e1" {
+		t.Fatalf("hysteresis: %q", got)
+	}
+}
+
+// Every entry counts for at least 1 MiB, so many tiny entries are capped
+// by count.
+func TestTinyEntriesCountAgainstTheCap(t *testing.T) {
+	now := time.Now()
+	var tiny []object
+	for i := range 10 {
+		tiny = append(tiny, obj(fmt.Sprintf("t%d", i), 1, time.Duration(10-i)*time.Minute, now))
+	}
+	// 10 accounted MiB against a 5 MiB cap: trim to 4.5, keeping 4.
+	if got := keysOf(selectEntries(tiny, now, 24*time.Hour, 5*mib)); got != "t0 t1 t2 t3 t4 t5" {
+		t.Fatalf("%q", got)
 	}
 }
 
@@ -72,9 +107,43 @@ func TestSelectStagingKeepsLiveReservationsWhole(t *testing.T) {
 		obj(root+"live/block/02", 1, time.Minute, now),
 		obj(root+"recent/blob", 1, time.Hour, now),
 	}
-	got := strings.Join(selectStaging(objs, root, now, stagingMaxAge), " ")
-	if got != root+"abandoned/block/01 "+root+"abandoned/manifest" {
+	_, del := selectReap(nil, objs, true, root, now, 7*24*time.Hour, 0)
+	if got := strings.Join(del, " "); got != root+"abandoned/block/01 "+root+"abandoned/manifest" {
 		t.Fatalf("%q", got)
+	}
+}
+
+// Staging counts against the cap and goes first, oldest reservation first,
+// but never one written within the upload URL lifetime.
+func TestStagingCountsAgainstTheCap(t *testing.T) {
+	now := time.Now()
+	root := "staging/"
+	entries := []object{obj("v1/entry", 30*mib, 72*time.Hour, now)}
+	staged := []object{
+		obj(root+"idle/block/01", 25*mib, 10*time.Hour, now),
+		obj(root+"idle/block/02", 25*mib, 7*time.Hour, now),
+		// Its first block is old, its newest within uploadURLTTL: in flight.
+		obj(root+"live/block/01", 25*mib, 20*time.Hour, now),
+		obj(root+"live/block/02", 25*mib, uploadURLTTL-time.Minute, now),
+	}
+	// 130 MiB over a cap of 100 → target 90: the idle reservation goes
+	// whole (130 → 80) and the older entry stays.
+	de, ds := selectReap(entries, staged, true, root, now, 7*24*time.Hour, 100*mib)
+	if keysOf(de) != "" || strings.Join(ds, " ") != root+"idle/block/01 "+root+"idle/block/02" {
+		t.Fatalf("cap 100: entries %q staging %q", keysOf(de), ds)
+	}
+	// Cap 60 → target 54: the idle reservation, then the entry; the live
+	// reservation is never a candidate.
+	de, ds = selectReap(entries, staged, true, root, now, 7*24*time.Hour, 60*mib)
+	if keysOf(de) != "v1/entry" || strings.Join(ds, " ") != root+"idle/block/01 "+root+"idle/block/02" {
+		t.Fatalf("cap 60: entries %q staging %q", keysOf(de), ds)
+	}
+	// A failed entry listing: no entry is deleted and the cap is not
+	// applied; abandoned staging still goes.
+	staged = append(staged, obj(root+"abandoned/blob", 1, 30*time.Hour, now))
+	de, ds = selectReap(nil, staged, false, root, now, 7*24*time.Hour, 1)
+	if len(de) != 0 || strings.Join(ds, " ") != root+"abandoned/blob" {
+		t.Fatalf("failed listing: entries %q staging %q", keysOf(de), ds)
 	}
 }
 
@@ -101,9 +170,12 @@ func (l *logRecorder) snapshot() []string {
 
 func TestReaperPass(t *testing.T) {
 	logs := &logRecorder{}
-	// MaxBytes 15: after the expired entry, 30 bytes remain; the oldest go
-	// until at most 14 (90 %) remain, which takes "oldest" and "stuck".
-	h := newHarness(t, func(o *Options) { o.MaxBytes = 15; o.Log = slog.New(logs) })
+	// Every object counts as 1 MiB. MaxBytes 2.5 MiB: after the expired
+	// entry and the abandoned reservation, 3 entries and 1 live
+	// reservation (4 MiB) remain; the oldest entries go until at most
+	// 2.25 MiB remain, which takes "oldest" and "stuck". The live
+	// reservation, written within the upload URL lifetime, stays.
+	h := newHarness(t, func(o *Options) { o.MaxBytes = 5 * mib / 2; o.Log = slog.New(logs) })
 	now := h.clk.now()
 	l := h.srv.lay
 	day := 24 * time.Hour
@@ -119,6 +191,8 @@ func TestReaperPass(t *testing.T) {
 	h.st.uploads = []pendingUpload{
 		{Key: l.entryKey("1", "s", v1, "a"), UploadID: "stale", Initiated: now.Add(-25 * time.Hour)},
 		{Key: l.entryKey("1", "s", v1, "b"), UploadID: "live", Initiated: now.Add(-time.Hour)},
+		// Another application's upload in a shared bucket.
+		{Key: "other-app/x", UploadID: "foreign", Initiated: now.Add(-48 * time.Hour)},
 	}
 	// "stuck" fails to delete this pass.
 	h.st.failDelete = map[string]bool{l.entryKey("2", "s", v1, "stuck"): true}
@@ -127,7 +201,7 @@ func TestReaperPass(t *testing.T) {
 	if !ran {
 		t.Fatal("pass did not run")
 	}
-	want := reapResult{Entries: 4, Bytes: 31, DeletedEntries: 2, DeletedBytes: 11, DeletedStaging: 1, AbortedUploads: 1, Errors: 1}
+	want := reapResult{Entries: 4, Bytes: 31, StagingBytes: 2, DeletedEntries: 2, DeletedBytes: 11, DeletedStaging: 1, AbortedUploads: 1, Errors: 1}
 	if res != want {
 		t.Fatalf("result %+v, want %+v", res, want)
 	}
@@ -137,11 +211,11 @@ func TestReaperPass(t *testing.T) {
 			t.Errorf("%s was deleted", k)
 		}
 	}
-	if len(h.st.uploads) != 1 || h.st.uploads[0].UploadID != "live" {
+	if len(h.st.uploads) != 2 || h.st.uploads[0].UploadID != "live" || h.st.uploads[1].UploadID != "foreign" {
 		t.Errorf("uploads %+v", h.st.uploads)
 	}
-	if !contains(logs.lines, "cache reaper pass") {
-		t.Errorf("no summary line: %q", logs.lines)
+	if !contains(logs.snapshot(), "cache reaper pass") {
+		t.Errorf("no summary line: %q", logs.snapshot())
 	}
 	// The failed delete is retried next pass.
 	h.st.failDelete = nil
@@ -149,6 +223,73 @@ func TestReaperPass(t *testing.T) {
 	if res.DeletedEntries != 1 || res.Errors != 0 {
 		t.Fatalf("second pass %+v", res)
 	}
+}
+
+// A listing that fails part-way deletes no entry: the oldest of a partial
+// listing is not the oldest overall.
+func TestReaperDeletesNoEntryFromAPartialListing(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxBytes = 2 * mib })
+	now := h.clk.now()
+	l := h.srv.lay
+	var all []string
+	for i := range 6 {
+		k := l.entryKey("1", "s", v1, fmt.Sprintf("e%d", i))
+		age := 8 * 24 * time.Hour // expired too
+		if i%2 == 1 {
+			age = time.Hour
+		}
+		h.st.setAt(k, []byte("x"), now.Add(-age))
+		all = append(all, k)
+	}
+	h.st.failList = map[string]error{l.entriesRoot(): errors.New("page 2: InternalError")}
+	res, _ := h.srv.reaper.pass(context.Background())
+	if res.DeletedEntries != 0 || res.Errors != 1 {
+		t.Fatalf("%+v", res)
+	}
+	h.st.failList = nil
+	if got := h.st.keys(l.entriesRoot()); len(got) != len(all) {
+		t.Fatalf("entries left %q", got)
+	}
+}
+
+// More than 1000 staged objects are deleted in batches S3 accepts.
+func TestStagingCleanupIsBatched(t *testing.T) {
+	h := newHarness(t)
+	tok := h.is.token(t, "100", writeMain())
+	h.reserve(tok, "k", v1)
+	id, err := h.srv.auth.verify(context.Background(), "Bearer "+tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := h.srv.lay.stagingKey(id.RepoID, id.WriteScope, v1, "k", id.TokenHash)
+	for i := range 2500 {
+		h.st.set(fmt.Sprintf("%s/block/%04x", staging, i), []byte("x"))
+	}
+	h.srv.cleanStaging(context.Background(), staging)
+	if left := h.st.keys(staging + "/"); len(left) != 0 || h.st.deleteCalls != 3 {
+		t.Fatalf("%d left after %d calls", len(left), h.st.deleteCalls)
+	}
+}
+
+// Each pass runs under a deadline of one reap interval.
+func TestReaperPassHasDeadline(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.ReapInterval = time.Minute })
+	st := &deadlineStore{memStore: h.st}
+	h.srv.reaper.st = st
+	h.srv.reaper.pass(context.Background())
+	if st.deadline.IsZero() || time.Until(st.deadline) > time.Minute {
+		t.Fatalf("listing ran with deadline %v", st.deadline)
+	}
+}
+
+type deadlineStore struct {
+	*memStore
+	deadline time.Time
+}
+
+func (d *deadlineStore) list(ctx context.Context, prefix string, fn func(object) bool) error {
+	d.deadline, _ = ctx.Deadline()
+	return d.memStore.list(ctx, prefix, fn)
 }
 
 func contains(s []string, v string) bool {

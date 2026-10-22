@@ -130,6 +130,9 @@ func (s *Server) stageObject(ctx context.Context, r *http.Request, key string, l
 	// The store reads exactly n bytes; the transport bounds the body to
 	// Content-Length, so a short body fails the write.
 	if err := s.st.put(ctx, key, r.Body, n, md5); err != nil {
+		if errors.Is(err, errBadDigest) {
+			return 0, azerr(http.StatusBadRequest, "Md5Mismatch", "the MD5 of the body does not match Content-MD5")
+		}
 		return 0, fmt.Errorf("stage %s: %w", key, err)
 	}
 	return n, nil
@@ -158,6 +161,18 @@ func (s *Server) putBlob(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	if r.ContentLength == 0 {
 		return azerr(http.StatusBadRequest, "InvalidInput", "an empty archive is not stored")
+	}
+	if _, err := bodyLength(r, s.entryLimit()); err != nil {
+		return err
+	}
+	// The SDK sends either one Put Blob or blocks, never both; refusing the
+	// mix keeps a reservation's staged bytes within one entry.
+	hasBlocks := false
+	if err := s.st.list(ctx, staging+"/block/", func(object) bool { hasBlocks = true; return false }); err != nil {
+		return fmt.Errorf("list blocks: %w", err)
+	}
+	if hasBlocks {
+		return azerr(http.StatusConflict, "InvalidBlobOrBlock", "blocks are already staged for this upload; Put Blob cannot follow Put Block")
 	}
 	key := staging + "/blob"
 	n, err := s.stageObject(ctx, r, key, s.entryLimit())
@@ -192,18 +207,32 @@ func (s *Server) putBlock(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if _, err := bodyLength(r, limit); err != nil {
 		return err
 	}
-	// The reservation's staged blocks plus this one must fit in an entry.
-	// Concurrent blocks can each pass this check, so the overshoot is
-	// bounded by the client's concurrency times the block size.
-	staged := r.ContentLength
-	err = s.st.list(ctx, staging+"/block/", func(o object) bool {
-		if o.Key != key {
-			staged += o.Size
+	// The reservation's staged bytes plus this block must fit in an entry,
+	// and its blocks in maxParts. Concurrent blocks can each pass this
+	// check, so the overshoot is bounded by the client's concurrency times
+	// the block size; Put Block List and the reaper's cap bound the rest.
+	staged, blocks, blob := r.ContentLength, 1, false
+	blockPrefix := staging + "/block/"
+	err = s.st.list(ctx, staging+"/", func(o object) bool {
+		switch {
+		case o.Key == staging+"/blob":
+			blob = true
+			return false
+		case o.Key == key || !strings.HasPrefix(o.Key, blockPrefix):
+			return true
 		}
-		return staged <= s.o.MaxEntryBytes
+		staged += o.Size
+		blocks++
+		return staged <= s.o.MaxEntryBytes && blocks <= maxParts
 	})
 	if err != nil {
 		return fmt.Errorf("list blocks: %w", err)
+	}
+	if blob {
+		return azerr(http.StatusConflict, "InvalidBlobOrBlock", "a blob is already staged for this upload; Put Block cannot follow Put Blob")
+	}
+	if blocks > maxParts {
+		return azerr(http.StatusBadRequest, "BlockCountExceedsLimit", "an upload holds at most %d blocks", maxParts)
 	}
 	if staged > s.o.MaxEntryBytes {
 		return azerr(http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "the staged blocks exceed %d bytes", s.o.MaxEntryBytes)
@@ -240,6 +269,14 @@ func (s *Server) putBlockList(ctx context.Context, w http.ResponseWriter, r *htt
 	if len(bl.Items) > maxParts {
 		return azerr(http.StatusBadRequest, "InvalidBlockList", "%d blocks exceed the limit of %d", len(bl.Items), maxParts)
 	}
+	// One listing of the staged blocks replaces a HEAD per listed block.
+	staged := map[string]int64{}
+	if err := s.st.list(ctx, staging+"/block/", func(o object) bool {
+		staged[o.Key] = o.Size
+		return true
+	}); err != nil {
+		return fmt.Errorf("list blocks: %w", err)
+	}
 	m := manifest{Parts: make([]manifestPart, 0, len(bl.Items))}
 	seen := map[string]bool{}
 	for i, it := range bl.Items {
@@ -256,23 +293,20 @@ func (s *Server) putBlockList(ctx context.Context, w http.ResponseWriter, r *htt
 			return azerr(http.StatusBadRequest, "InvalidBlockList", "block %d is listed twice", i)
 		}
 		seen[key] = true
-		o, err := s.st.head(ctx, key)
-		if errors.Is(err, errNotFound) {
+		size, ok := staged[key]
+		if !ok {
 			return azerr(http.StatusBadRequest, "InvalidBlockList", "block %d was not uploaded", i)
 		}
-		if err != nil {
-			return fmt.Errorf("head block: %w", err)
-		}
 		// S3 needs every multipart part but the last to be at least 5 MiB.
-		if i < len(bl.Items)-1 && o.Size < minPartBytes {
+		if i < len(bl.Items)-1 && size < minPartBytes {
 			return azerr(http.StatusBadRequest, "InvalidBlockList",
-				"block %d is %d bytes; every block but the last must be at least %d bytes (5 MiB)", i, o.Size, minPartBytes)
+				"block %d is %d bytes; every block but the last must be at least %d bytes (5 MiB)", i, size, minPartBytes)
 		}
-		m.Size += o.Size
+		m.Size += size
 		if m.Size > s.o.MaxEntryBytes {
 			return azerr(http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "the blob exceeds %d bytes", s.o.MaxEntryBytes)
 		}
-		m.Parts = append(m.Parts, manifestPart{Key: key, Size: o.Size})
+		m.Parts = append(m.Parts, manifestPart{Key: key, Size: size})
 	}
 	if err := s.writeManifest(ctx, staging, m); err != nil {
 		return err

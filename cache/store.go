@@ -25,6 +25,8 @@ var (
 	errNotFound = errors.New("object not found")
 	// errExists reports a conditional write that lost to an existing object.
 	errExists = errors.New("object already exists")
+	// errBadDigest reports a put whose bytes do not match its MD5.
+	errBadDigest = errors.New("content MD5 mismatch")
 )
 
 // store is the object storage the cache needs. The S3 implementation is
