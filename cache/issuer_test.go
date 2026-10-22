@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,6 +20,11 @@ type testIssuer struct {
 	URL string
 	key *rsa.PrivateKey
 	kid string
+	// down makes discovery answer 503.
+	down                    atomic.Bool
+	// extra, once set, is published as "rotated-key" too.
+	extra                   atomic.Pointer[rsa.PrivateKey]
+	discoveryHits, jwksHits atomic.Int64
 }
 
 func newTestIssuer(t testing.TB) *testIssuer {
@@ -33,19 +39,32 @@ func newTestIssuer(t testing.TB) *testIssuer {
 	t.Cleanup(srv.Close)
 	is.URL = srv.URL
 	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		is.discoveryHits.Add(1)
+		if is.down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"issuer": is.URL, "jwks_uri": is.URL + "/.well-known/jwks",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
 	})
 	mux.HandleFunc("GET /.well-known/jwks", func(w http.ResponseWriter, _ *http.Request) {
-		pub := is.key.PublicKey
-		json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "RSA", "alg": "RS256", "use": "sig", "kid": is.kid,
-			"n": b64(pub.N.Bytes()), "e": b64(big.NewInt(int64(pub.E)).Bytes()),
-		}}})
+		is.jwksHits.Add(1)
+		keys := []map[string]string{jwk(&is.key.PublicKey, is.kid)}
+		if k := is.extra.Load(); k != nil {
+			keys = append(keys, jwk(&k.PublicKey, "rotated-key"))
+		}
+		json.NewEncoder(w).Encode(map[string]any{"keys": keys})
 	})
 	return is
+}
+
+func jwk(pub *rsa.PublicKey, kid string) map[string]string {
+	return map[string]string{
+		"kty": "RSA", "alg": "RS256", "use": "sig", "kid": kid,
+		"n": b64(pub.N.Bytes()), "e": b64(big.NewInt(int64(pub.E)).Bytes()),
+	}
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

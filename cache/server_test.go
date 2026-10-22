@@ -386,6 +386,20 @@ func (h *harness) callRaw(token, method, ct string, body []byte) twirpResult {
 	r, _ := http.NewRequest(http.MethodPost, h.http.URL+twirpPrefix+method, bytes.NewReader(body))
 	r.Header.Set("Content-Type", ct)
 	r.Header.Set("Authorization", "Bearer "+token)
+	return h.doRaw(r)
+}
+
+// callRawAuthz posts a JSON body with a verbatim Authorization header.
+func (h *harness) callRawAuthz(authz, method string, body []byte) twirpResult {
+	h.t.Helper()
+	r, _ := http.NewRequest(http.MethodPost, h.http.URL+twirpPrefix+method, bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", authz)
+	return h.doRaw(r)
+}
+
+func (h *harness) doRaw(r *http.Request) twirpResult {
+	h.t.Helper()
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		h.t.Fatal(err)

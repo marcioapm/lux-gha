@@ -245,11 +245,15 @@ func (s *Server) serveTwirp(w http.ResponseWriter, r *http.Request, method strin
 	id, err := s.auth.verify(r.Context(), r.Header.Get("Authorization"))
 	if err != nil {
 		if errors.Is(err, errIssuerDown) {
-			s.log.Warn("cache: token issuer unavailable", "error", err)
+			if s.logOnce.allow("issuer-down") {
+				s.log.Warn("cache: token issuer unavailable (logged at most once a minute)", "error", err)
+			}
 			writeTwirpError(w, twerr(twirpUnavailable, "token issuer unavailable"))
 			return
 		}
-		s.log.Info("cache: rejected token", "method", method, "error", err)
+		if s.logOnce.allow("rejected-token") {
+			s.log.Info("cache: rejected token (logged at most once a minute)", "method", method, "error", err)
+		}
 		writeTwirpError(w, twerr(twirpUnauthenticated, "invalid runtime token"))
 		return
 	}

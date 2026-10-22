@@ -58,9 +58,12 @@ type verifier struct {
 	issuer string
 	client *http.Client
 	now    func() time.Time
+	// keyRefresh is the least time between JWKS fetches.
+	keyRefresh time.Duration
 
 	mu        sync.Mutex
 	v         *oidc.IDTokenVerifier
+	keys      *keySet
 	lastTry   time.Time
 	lastError error
 }
@@ -72,7 +75,7 @@ func newVerifier(issuer string, client *http.Client, now func() time.Time) *veri
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &verifier{issuer: issuer, client: client, now: now}
+	return &verifier{issuer: issuer, client: client, now: now, keyRefresh: defaultKeyRefresh}
 }
 
 func (v *verifier) idTokenVerifier() (*oidc.IDTokenVerifier, error) {
@@ -85,21 +88,18 @@ func (v *verifier) idTokenVerifier() (*oidc.IDTokenVerifier, error) {
 		return nil, fmt.Errorf("%w: %v", errIssuerDown, v.lastError)
 	}
 	v.lastTry = v.now()
-	// The provider's key set outlives this request, so it gets a context
-	// carrying only the HTTP client.
-	pctx := oidc.ClientContext(context.Background(), v.client)
-	dctx, cancel := context.WithTimeout(pctx, 15*time.Second)
+	dctx, cancel := context.WithTimeout(oidc.ClientContext(context.Background(), v.client), 15*time.Second)
 	defer cancel()
 	p, err := oidc.NewProvider(dctx, v.issuer)
 	if err != nil {
 		v.lastError = err
 		return nil, fmt.Errorf("%w: %v", errIssuerDown, err)
 	}
-	keys := oidc.NewRemoteKeySet(pctx, providerJWKS(p))
+	v.keys = newKeySet(providerJWKS(p), v.client, v.now, v.keyRefresh)
 	// No audience check: the runtime token's audience names the issuing
 	// service and the run, not this server, so there is no stable value to
 	// require. Issuer, signature, exp and nbf are checked.
-	v.v = oidc.NewVerifier(v.issuer, keys, &oidc.Config{
+	v.v = oidc.NewVerifier(v.issuer, v.keys, &oidc.Config{
 		SkipClientIDCheck:    true,
 		SupportedSigningAlgs: []string{oidc.RS256},
 		Now:                  v.now,
