@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -30,7 +31,10 @@ type memStore struct {
 	failHead map[string]error
 	// lastWriterWins disables the conditional write.
 	lastWriterWins bool
-	deleteCalls    int
+	// loseAssembleReply makes the next assemble store the object and then
+	// report an error, as a lost CompleteMultipartUpload response.
+	loseAssembleReply bool
+	deleteCalls       int
 }
 
 type memObj struct {
@@ -54,7 +58,7 @@ func (m *memStore) head(_ context.Context, key string) (object, error) {
 	if !ok {
 		return object{}, errNotFound
 	}
-	return object{Key: key, Size: int64(len(o.data)), LastModified: o.mod}, nil
+	return object{Key: key, Size: int64(len(o.data)), LastModified: o.mod, Owner: o.meta}, nil
 }
 
 func (m *memStore) list(_ context.Context, prefix string, fn func(object) bool) error {
@@ -152,7 +156,7 @@ func (m *memStore) deleteKeys(_ context.Context, keys []string) ([]string, error
 	return failed, nil
 }
 
-func (m *memStore) assemble(_ context.Context, dst string, parts []string) error {
+func (m *memStore) assemble(_ context.Context, dst string, parts []string, owner string) error {
 	var buf bytes.Buffer
 	for _, p := range parts {
 		b, ok := m.get(p)
@@ -166,7 +170,11 @@ func (m *memStore) assemble(_ context.Context, dst string, parts []string) error
 	if _, ok := m.objs[dst]; ok && !m.lastWriterWins {
 		return errExists
 	}
-	m.objs[dst] = memObj{data: buf.Bytes(), mod: m.now()}
+	m.objs[dst] = memObj{data: buf.Bytes(), mod: m.now(), meta: owner}
+	if m.loseAssembleReply {
+		m.loseAssembleReply = false
+		return errors.New("connection reset reading the CompleteMultipartUpload response")
+	}
 	return nil
 }
 

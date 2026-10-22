@@ -370,8 +370,17 @@ func (s *Server) finalize(ctx context.Context, id *identity, r *http.Request, c 
 	for i, p := range m.Parts {
 		parts[i] = p.Key
 	}
-	err = s.st.assemble(ctx, final, parts)
+	err = s.st.assemble(ctx, final, parts, staging)
 	if errors.Is(err, errExists) {
+		// A retry after a lost success finds this reservation's own entry.
+		o, herr := s.st.head(ctx, final)
+		if herr != nil && !errors.Is(herr, errNotFound) {
+			return nil, fmt.Errorf("head entry: %w", herr)
+		}
+		if herr == nil && o.Owner == staging {
+			s.cleanStaging(ctx, staging)
+			return finalizeResponse{OK: true, EntryID: entryID(final)}, nil
+		}
 		s.cleanStaging(ctx, staging)
 		return finalizeResponse{Message: "another job saved this key and version first"}, nil
 	}

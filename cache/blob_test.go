@@ -448,6 +448,11 @@ func TestConcurrentSavesOfOneKey(t *testing.T) {
 					won++
 				}
 			}
+			// A store that ignores the condition: every finalize succeeds
+			// and the last one's archive is the entry.
+			if lww && won != jobs {
+				t.Fatalf("%d of %d finalizes succeeded on a last-writer-wins store", won, jobs)
+			}
 			if !lww && won != 1 {
 				t.Fatalf("%d finalizes succeeded, want 1", won)
 			}

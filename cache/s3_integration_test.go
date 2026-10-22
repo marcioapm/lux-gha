@@ -129,16 +129,19 @@ func TestS3StoreAssembleIsFirstWriterWins(t *testing.T) {
 	must(st.put(ctx, prefix+"/s/1", bytes.NewReader(partA), int64(len(partA)), ""))
 	must(st.put(ctx, prefix+"/s/2", bytes.NewReader(partB), int64(len(partB)), ""))
 	dst := prefix + "/v1/entry"
-	must(st.assemble(ctx, dst, []string{prefix + "/s/1", prefix + "/s/2"}))
+	must(st.assemble(ctx, dst, []string{prefix + "/s/1", prefix + "/s/2"}, "owner-a"))
 	b, err := st.getSmall(ctx, dst, 10<<20)
 	must(err)
 	if !bytes.Equal(b, append(append([]byte{}, partA...), partB...)) {
 		t.Fatalf("assembled %d bytes", len(b))
 	}
-	if err := st.assemble(ctx, dst, []string{prefix + "/s/2"}); !errors.Is(err, errExists) {
+	if o, err := st.head(ctx, dst); err != nil || o.Owner != "owner-a" {
+		t.Fatalf("owner metadata: %+v %v", o, err)
+	}
+	if err := st.assemble(ctx, dst, []string{prefix + "/s/2"}, "owner-b"); !errors.Is(err, errExists) {
 		t.Fatalf("second assemble: %v", err)
 	}
-	if err := st.assemble(ctx, prefix+"/v1/other", []string{prefix + "/s/missing"}); !errors.Is(err, errNotFound) {
+	if err := st.assemble(ctx, prefix+"/v1/other", []string{prefix + "/s/missing"}, "x"); !errors.Is(err, errNotFound) {
 		t.Fatalf("missing part: %v", err)
 	}
 
@@ -155,7 +158,7 @@ func TestS3StoreAssembleIsFirstWriterWins(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = st.assemble(ctx, race, []string{fmt.Sprintf("%s/r/%d", prefix, i)})
+			errs[i] = st.assemble(ctx, race, []string{fmt.Sprintf("%s/r/%d", prefix, i)}, fmt.Sprint(i))
 		}()
 	}
 	wg.Wait()

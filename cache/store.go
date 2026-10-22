@@ -12,6 +12,9 @@ type object struct {
 	Key          string
 	Size         int64
 	LastModified time.Time
+	// Owner is the reservation that assembled an entry; head sets it,
+	// list does not.
+	Owner string
 }
 
 // pendingUpload is an incomplete multipart upload.
@@ -44,10 +47,11 @@ type store interface {
 	// deleteKeys deletes the keys and returns the ones that failed.
 	deleteKeys(ctx context.Context, keys []string) (failed []string, err error)
 	// assemble writes dst as the concatenation of parts, made visible in
-	// one step. It returns errExists, and leaves dst unchanged, when dst
-	// already exists and the store enforces conditional writes, and
-	// errNotFound when a part is missing.
-	assemble(ctx context.Context, dst string, parts []string) error
+	// one step and recording owner (see object.Owner). It returns
+	// errExists, and leaves dst unchanged, when dst already exists and the
+	// store enforces conditional writes, and errNotFound when a part is
+	// missing.
+	assemble(ctx context.Context, dst string, parts []string, owner string) error
 	presignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
 	listUploads(ctx context.Context, prefix string, fn func(pendingUpload) bool) error
 	abortUpload(ctx context.Context, u pendingUpload) error

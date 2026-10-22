@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -33,14 +34,36 @@ type s3Store struct {
 	// plainHTTP endpoints cannot carry a trailing checksum or sign an
 	// unseekable body, so uploads there send UNSIGNED-PAYLOAD.
 	plainHTTP bool
+	// controlTimeout bounds each metadata call (HEAD, one LIST page, a
+	// manifest GET, DeleteObjects, multipart create and abort); copyTimeout
+	// bounds one part copy and the multipart complete, which move or
+	// stitch up to gigabytes server-side. A PutObject has no timeout of
+	// its own: it streams a client's body, which has an idle deadline.
+	controlTimeout time.Duration
+	copyTimeout    time.Duration
 }
 
+const (
+	defaultControlTimeout = 30 * time.Second
+	defaultCopyTimeout    = 15 * time.Minute
+	// ownerMetaKey is the user metadata naming the reservation that
+	// assembled an entry (x-amz-meta-reservation).
+	ownerMetaKey = "reservation"
+)
+
 func newS3Store(ctx context.Context, o S3Options) (*s3Store, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(o.Region))
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(o.Region),
+		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+			t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+			t.MaxIdleConns = 4 * maxIdleConnsPerHost
+		})))
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
-	st := &s3Store{bucket: o.Bucket, plainHTTP: strings.HasPrefix(o.Endpoint, "http://")}
+	st := &s3Store{
+		bucket: o.Bucket, plainHTTP: strings.HasPrefix(o.Endpoint, "http://"),
+		controlTimeout: defaultControlTimeout, copyTimeout: defaultCopyTimeout,
+	}
 	st.c = s3.NewFromConfig(cfg, func(so *s3.Options) {
 		if o.Endpoint != "" {
 			so.BaseEndpoint = aws.String(o.Endpoint)
@@ -54,6 +77,10 @@ func newS3Store(ctx context.Context, o S3Options) (*s3Store, error) {
 	return st, nil
 }
 
+func (s *s3Store) control(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, s.controlTimeout)
+}
+
 func isNotFound(err error) bool {
 	var nf *types.NotFound
 	var nk *types.NoSuchKey
@@ -65,6 +92,8 @@ func isNotFound(err error) bool {
 }
 
 func (s *s3Store) head(ctx context.Context, key string) (object, error) {
+	ctx, cancel := s.control(ctx)
+	defer cancel()
 	out, err := s.c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if isNotFound(err) {
@@ -72,13 +101,15 @@ func (s *s3Store) head(ctx context.Context, key string) (object, error) {
 		}
 		return object{}, err
 	}
-	return object{Key: key, Size: aws.ToInt64(out.ContentLength), LastModified: aws.ToTime(out.LastModified)}, nil
+	return object{Key: key, Size: aws.ToInt64(out.ContentLength), LastModified: aws.ToTime(out.LastModified), Owner: out.Metadata[ownerMetaKey]}, nil
 }
 
 func (s *s3Store) list(ctx context.Context, prefix string, fn func(object) bool) error {
 	p := s3.NewListObjectsV2Paginator(s.c, &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix})
 	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
+		pctx, cancel := s.control(ctx)
+		page, err := p.NextPage(pctx)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -111,6 +142,8 @@ func (s *s3Store) put(ctx context.Context, key string, body io.Reader, size int6
 }
 
 func (s *s3Store) getSmall(ctx context.Context, key string, limit int64) ([]byte, error) {
+	ctx, cancel := s.control(ctx)
+	defer cancel()
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if isNotFound(err) {
@@ -133,6 +166,8 @@ func (s *s3Store) deleteKeys(ctx context.Context, keys []string) ([]string, erro
 	if len(keys) == 0 {
 		return nil, nil
 	}
+	ctx, cancel := s.control(ctx)
+	defer cancel()
 	ids := make([]types.ObjectIdentifier, len(keys))
 	for i := range keys {
 		ids[i] = types.ObjectIdentifier{Key: aws.String(keys[i])}
@@ -160,16 +195,19 @@ const copyConcurrency = 8
 // the last complete win, still atomically. Blocks are staged as separate
 // objects and copied here because the Azure client stages them in
 // parallel under opaque IDs, so their part numbers are known only once
-// the block list arrives.
-func (s *s3Store) assemble(ctx context.Context, dst string, parts []string) (err error) {
+// the block list arrives. dst carries owner as metadata.
+func (s *s3Store) assemble(ctx context.Context, dst string, parts []string, owner string) (err error) {
 	if _, err := s.head(ctx, dst); err == nil {
 		return errExists
 	} else if !errors.Is(err, errNotFound) {
 		return err
 	}
-	mu, err := s.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	cctx, cancel := s.control(ctx)
+	mu, err := s.c.CreateMultipartUpload(cctx, &s3.CreateMultipartUploadInput{
 		Bucket: &s.bucket, Key: &dst, ContentType: aws.String("application/octet-stream"),
+		Metadata: map[string]string{ownerMetaKey: owner},
 	})
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -177,43 +215,18 @@ func (s *s3Store) assemble(ctx context.Context, dst string, parts []string) (err
 	defer func() {
 		if !completed {
 			// A fresh context: the request's may be what failed.
-			actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.controlTimeout)
 			defer cancel()
 			_, _ = s.c.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId})
 		}
 	}()
-	done := make([]types.CompletedPart, len(parts))
-	errs := make([]error, len(parts))
-	sem := make(chan struct{}, copyConcurrency)
-	var wg sync.WaitGroup
-	for i, p := range parts {
-		n := int32(i + 1)
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer func() { <-sem; wg.Done() }()
-			out, err := s.c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
-				Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId, PartNumber: aws.Int32(n),
-				CopySource: aws.String(s.bucket + "/" + copySourceEscape(p)),
-			})
-			if err != nil {
-				errs[i] = err
-				return
-			}
-			done[i] = types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag}
-		}()
+	done, err := s.copyParts(ctx, dst, aws.ToString(mu.UploadId), parts)
+	if err != nil {
+		return err
 	}
-	wg.Wait()
-	for i, err := range errs {
-		if err == nil {
-			continue
-		}
-		if isNotFound(err) {
-			return errNotFound
-		}
-		return fmt.Errorf("copy part %d: %w", i+1, err)
-	}
-	_, err = s.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	cctx, cancel = context.WithTimeout(ctx, s.copyTimeout)
+	defer cancel()
+	_, err = s.c.CompleteMultipartUpload(cctx, &s3.CompleteMultipartUploadInput{
 		Bucket: &s.bucket, Key: &dst, UploadId: mu.UploadId,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: done},
 		IfNoneMatch:     aws.String("*"),
@@ -227,6 +240,70 @@ func (s *s3Store) assemble(ctx context.Context, dst string, parts []string) (err
 	}
 	completed = true
 	return nil
+}
+
+// copyParts copies parts as parts 1..n of the upload, copyConcurrency at a
+// time. The first failure cancels the copies in flight and starts no more.
+func (s *s3Store) copyParts(ctx context.Context, dst, uploadID string, parts []string) ([]types.CompletedPart, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+		cancel()
+	}
+	done := make([]types.CompletedPart, len(parts))
+	sem := make(chan struct{}, copyConcurrency)
+loop:
+	for i, p := range parts {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
+		if ctx.Err() != nil {
+			<-sem
+			break
+		}
+		n := int32(i + 1)
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			pctx, pcancel := context.WithTimeout(ctx, s.copyTimeout)
+			defer pcancel()
+			out, err := s.c.UploadPartCopy(pctx, &s3.UploadPartCopyInput{
+				Bucket: &s.bucket, Key: &dst, UploadId: &uploadID, PartNumber: aws.Int32(n),
+				CopySource: aws.String(s.bucket + "/" + copySourceEscape(p)),
+			})
+			if err != nil {
+				if isNotFound(err) {
+					err = errNotFound
+				} else {
+					err = fmt.Errorf("copy part %d: %w", n, err)
+				}
+				fail(err)
+				return
+			}
+			done[i] = types.CompletedPart{PartNumber: aws.Int32(n), ETag: out.CopyPartResult.ETag}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	// The caller's context ended before every part was started.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return done, nil
 }
 
 // copySourceEscape URL-escapes a key for x-amz-copy-source, keeping '/'.
@@ -255,7 +332,9 @@ func (s *s3Store) presignGet(ctx context.Context, key string, ttl time.Duration)
 func (s *s3Store) listUploads(ctx context.Context, prefix string, fn func(pendingUpload) bool) error {
 	p := s3.NewListMultipartUploadsPaginator(s.c, &s3.ListMultipartUploadsInput{Bucket: &s.bucket, Prefix: &prefix})
 	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
+		pctx, cancel := s.control(ctx)
+		page, err := p.NextPage(pctx)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -269,6 +348,8 @@ func (s *s3Store) listUploads(ctx context.Context, prefix string, fn func(pendin
 }
 
 func (s *s3Store) abortUpload(ctx context.Context, u pendingUpload) error {
+	ctx, cancel := s.control(ctx)
+	defer cancel()
 	_, err := s.c.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &s.bucket, Key: &u.Key, UploadId: &u.UploadID})
 	return err
 }
