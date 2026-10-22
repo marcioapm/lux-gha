@@ -682,7 +682,9 @@ endpoint as well as to `publicURL`.
 time, and logs one `cache reaper pass` line with the entry count and bytes
 and what it deleted. It deletes entries older than `ttl`, then the oldest
 while over `maxBytes`, staging uploads untouched for 24 hours, and multipart
-uploads under `prefix` started more than 24 hours ago. A failed delete is
+uploads under `prefix` started more than 24 hours ago (without a `prefix`,
+every multipart upload in the bucket: give the cache its own bucket or a
+prefix). A failed delete is
 retried next pass. As a backstop, give the bucket a lifecycle rule that
 aborts incomplete multipart uploads after a day or more.
 
