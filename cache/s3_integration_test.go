@@ -70,8 +70,8 @@ func TestS3StorePrimitives(t *testing.T) {
 	if err := st.put(ctx, k+"-md5", strings.NewReader("hello"), 5, "XUFAKrxLKna5cZ2REBfFkg=="); err != nil {
 		t.Fatalf("put with MD5: %v", err)
 	}
-	if err := st.put(ctx, k+"-badmd5", strings.NewReader("hello"), 5, "AAAAAAAAAAAAAAAAAAAAAA=="); err == nil {
-		t.Fatal("put with a wrong MD5 succeeded")
+	if err := st.put(ctx, k+"-badmd5", strings.NewReader("hello"), 5, "AAAAAAAAAAAAAAAAAAAAAA=="); !errors.Is(err, errBadDigest) {
+		t.Fatalf("put with a wrong MD5: %v", err)
 	}
 	if err := st.put(ctx, k+"-short", strings.NewReader("hel"), 5, ""); err == nil {
 		t.Fatal("short body stored")
