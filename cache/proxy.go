@@ -7,6 +7,17 @@ import (
 	"net/url"
 )
 
+// maxIdleConnsPerHost keeps connections to one upstream or S3 endpoint
+// for reuse across concurrent runners (net/http's default keeps 2).
+const maxIdleConnsPerHost = 64
+
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	t.MaxIdleConns = 4 * maxIdleConnsPerHost
+	return t
+}
+
 // newProxy forwards a request to the fixed upstream with its method, path,
 // query, headers (Authorization included) and body, and streams the
 // response back. Only the scheme and host change; the upstream is never
@@ -18,6 +29,7 @@ func newProxy(upstream *url.URL, log *slog.Logger) *httputil.ReverseProxy {
 			// SetURL joins the upstream path; an upstream with no path
 			// leaves the request's path, raw encoding included, as it was.
 		},
+		Transport: newTransport(),
 		// Flush every write: artifact downloads and long polls stream.
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
