@@ -21,7 +21,7 @@ type testIssuer struct {
 	key *rsa.PrivateKey
 	kid string
 	// down makes discovery answer 503.
-	down                    atomic.Bool
+	down atomic.Bool
 	// extra, once set, is published as "rotated-key" too.
 	extra                   atomic.Pointer[rsa.PrivateKey]
 	discoveryHits, jwksHits atomic.Int64
