@@ -868,6 +868,9 @@ LUXGHA_CACHE_S3_ENDPOINT=http://127.0.0.1:59240 LUXGHA_CACHE_S3_BUCKET=cache-buc
 
 `LUXGHA_CACHE_S3_CONDITIONAL=1` fails the run unless the server enforces
 `If-None-Match` on `CompleteMultipartUpload`, as AWS S3 and versitygw do.
+`make test` covers the S3 requests themselves (conditional complete, part
+order, copy-source escaping, error mapping, abort and cancellation) against
+an in-process fake S3 (`cache/s3store_test.go`).
 
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, one
 `go test -race -v` run that fails if any test skipped, and `make dist VERSION=v0.0.0`; `shellcheck`, `sh -n`
