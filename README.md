@@ -21,6 +21,7 @@ process.
   - a startup compatibility check
 - `webhook`: signed `workflow_job` ingress that calls an injected function, and optionally `installation` and `installation_repositories` ingress.
 - `reconcile`: the single reconciler that provisions and removes runners.
+- `cache`: an optional GitHub Actions cache server (cache service v2) backed by S3, on its own listener ([Actions cache](#actions-cache)).
 - `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
 The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)). Besides the runner and rootless Docker, it ships `moby/buildkit` for its own architecture, pinned by digest. The entrypoint loads it into each Run's Docker store, so that `docker/setup-buildx-action`'s default `docker-container` builder does not pull BuildKit from Docker Hub on every job. Workflows should pin `driver-opts: image=moby/buildkit:<version>` to the version the image carries (its `io.github.marcioapm.lux-gha.buildkit` label). With `buildx-stable-1`, buildx downloads a newer BuildKit once that tag moves ([BuildKit driver](images/runner/README.md#buildkit-driver)).
@@ -582,6 +583,110 @@ image's BuildKit archive into it (a failed load only warns).
 - **Routing**: a job is routed only when **every** label it requests is in exactly one route's label set. Label comparison is case-insensitive. Configuration is rejected if one route's label set contains another's, because a job could then match both.
 - **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
+- **`cache`**: optional; absent, nothing below runs ([Actions cache](#actions-cache)).
+
+### Actions cache
+
+```json
+"cache": {
+  "listen": "0.0.0.0:8090",
+  "publicURL": "https://gha-cache.example.com",
+  "s3": {"bucket": "cache-bucket", "region": "eu-west-1", "prefix": "gha-cache"},
+  "signingKeyFile": "/etc/lux-gha/cache-signing-keys",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "upstreamResultsURL": "https://results-receiver.actions.githubusercontent.com",
+  "downloadURLTTL": "10m", "ttl": "168h", "maxBytes": 0, "maxEntryBytes": 10737418240,
+  "reapInterval": "1h"
+}
+```
+
+With `cache` present, lux-gha serves the GitHub Actions cache service (v2,
+the API `@actions/cache` 4 and later and `actions/cache@v4` use) on a second
+listener; the webhook listener is unchanged. Runners use `publicURL` as
+`ACTIONS_RESULTS_URL` (pointing runners at it is not part of lux-gha).
+
+- **`listen`**, **`publicURL`**, **`s3.bucket`**, **`s3.region`** and
+  **`signingKeyFile`** are required. `publicURL` is a scheme and host with no
+  path, HTTPS except on loopback; signed upload URLs are built from it.
+  `listen` must differ from the top-level `listen`.
+- **`s3`**: credentials come only from the AWS default chain (an instance
+  role, the environment, shared config); there is no key field. `prefix`
+  (optional) holds every object. `endpoint` (optional) names an
+  S3-compatible server, addressed path-style; HTTPS except on loopback.
+- **`signingKeyFile`**: one key per line, each at least 32 bytes, used to
+  HMAC-sign upload URLs. The first line signs; every line verifies. To rotate,
+  add the new key as the first line and restart, then remove the old one
+  after 6 hours (the upload URL lifetime).
+- **`issuer`**: the runtime token issuer, discovered through
+  `/.well-known/openid-configuration`; the default is GitHub's.
+- **`upstreamResultsURL`**: every request that is not a cache request
+  (artifacts, logs, other Results calls) is passed here unchanged, method,
+  path, query, headers and body included, and the response is streamed
+  back. The upstream is fixed; no request chooses it.
+- **`downloadURLTTL`** (1 m to 7 d): lifetime of a presigned S3 download URL.
+- **`ttl`** (at least 1 h): entries are deleted this long after they were
+  saved. **`maxBytes`** (0: no cap): when entries exceed it, the oldest are
+  deleted until 90 % remain. **`maxEntryBytes`**: the largest archive
+  accepted (default 10 GiB). **`reapInterval`** (at least 1 m): how often the
+  reaper runs.
+
+**Authentication.** Every cache call carries the job's runtime token
+(`ACTIONS_RUNTIME_TOKEN`), a JWT the issuer signs. Its signature (RS256,
+against the issuer's JWKS), exact issuer, `exp` and `nbf` are checked; there
+is no setting that turns this off. The audience is not checked: the runtime
+token's audience names GitHub's service and the run, not this server, so no
+stable value exists to require. Two claims are used. `repository_id`
+partitions every entry, so a job never reads or writes another repository's
+cache. `ac` is a JSON string holding `[{"Scope": "<ref>", "Permission": n}]`,
+read 1 and write 2: a job saves only to its one writable scope (its own ref)
+and restores from its readable scopes, its own first and then the others in
+token order (for a pull request, the base branch). A missing or malformed
+claim is `401`; a save with no writable scope is `403`
+(`cache write denied: ...`), which the client reports as a warning.
+
+**Matching.** Within each scope in that order: the exact key, then the
+newest entry whose key starts with the key, then the same for each restore
+key in order. Only entries of the requested version (the client's hash of
+paths and compression) match. A miss is `ok: false`, not an error.
+
+**Saving.** `CreateCacheEntry` returns `ok: false` when the key and version
+already exist in the job's scope, and otherwise a signed upload URL on this
+server, bound by HMAC to the repository, scope, key, version and runtime
+token, valid for 6 hours. The client uploads to it with the Azure Blob SDK;
+lux-gha implements the three requests that client sends: one `Put Blob` up
+to 128 MiB, or `Put Block` per 64 MiB block followed by `Put Block List`.
+Every block but the last must be at least 5 MiB, S3's multipart minimum.
+`@actions/cache` meets that; BuildKit's `type=gha` cache, which uploads 1 MiB
+blocks, is not supported. Blocks are streamed to S3, never held in memory.
+`FinalizeCacheEntryUpload` checks the uploaded size against `size_bytes`
+and only then makes the entry visible, as one server-side multipart copy
+completed with `If-None-Match: *`: of two jobs saving the same key and
+version, the first to finalize wins and the other gets `ok: false`. A store
+that ignores the condition makes the last finalize win instead; either way a
+reader sees one whole archive.
+
+**Restoring.** `GetCacheEntryDownloadURL` returns a presigned S3 `GET` URL;
+the client downloads it with plain HTTP, so runners need egress to the S3
+endpoint as well as to `publicURL`.
+
+**Storage.** S3 is the only state; there is no database. Under `prefix`:
+
+| Objects | Holds |
+|---|---|
+| `v1/<repository_id>/<sha256(scope)>/<version>/<key>` | finalized entries. The key is escaped (bytes outside `A-Za-z0-9._-`, and a leading `.`, as `%XX`) so that a key prefix is an S3 listing prefix. |
+| `staging/<reservation>/…` | uploads not yet finalized; never read by a restore. |
+
+**Expiry.** The reaper runs at start and every `reapInterval`, one pass at a
+time, and logs one `cache reaper pass` line with the entry count and bytes
+and what it deleted. It deletes entries older than `ttl`, then the oldest
+while over `maxBytes`, staging uploads untouched for 24 hours, and multipart
+uploads under `prefix` started more than 24 hours ago. A failed delete is
+retried next pass. As a backstop, give the bucket a lifecycle rule that
+aborts incomplete multipart uploads after a day or more.
+
+**Bucket permissions.** `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`,
+`s3:ListBucket`, `s3:ListBucketMultipartUploads` and
+`s3:AbortMultipartUpload` on the bucket and `prefix`.
 
 ### Sizes
 
