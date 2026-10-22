@@ -265,8 +265,15 @@ func TestS3AssembleCancelsCopiesOnFirstFailure(t *testing.T) {
 	if started > copyConcurrency {
 		t.Fatalf("%d copies started after the first failed, want at most %d", started, copyConcurrency)
 	}
-	if len(cancelled) != copyConcurrency-1 {
-		t.Fatalf("%d in-flight copies were cancelled, want %d", len(cancelled), copyConcurrency-1)
+	// Every copy that reached the server, but part 1, sees its request
+	// cancelled; the server notices the closed connection asynchronously.
+	deadline := time.After(5 * time.Second)
+	for got := 0; got < started-1; got++ {
+		select {
+		case <-cancelled:
+		case <-deadline:
+			t.Fatalf("%d of %d in-flight copies were cancelled", got, started-1)
+		}
 	}
 	if f.aborts != 1 || len(f.completes) != 0 {
 		t.Fatalf("aborts %d completes %d", f.aborts, len(f.completes))
