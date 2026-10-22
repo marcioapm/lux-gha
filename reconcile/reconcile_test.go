@@ -50,6 +50,8 @@ type env struct {
 	lux   *fakeLux
 	cfg   *config.Config
 	rec   *Reconciler
+	// identityKey is set when cfg has a registry.
+	identityKey []byte
 }
 
 func newEnv(t *testing.T, edits ...func(string) string) *env {
@@ -64,6 +66,9 @@ func newEnv(t *testing.T, edits ...func(string) string) *env {
 	}
 	clock := &fakeClock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
 	e := &env{t: t, clock: clock, gh: newFakeGitHub(clock), lux: newFakeLux(clock), cfg: cfg}
+	if cfg.Registry != nil {
+		e.identityKey = testIdentityKey
+	}
 	// The runner process connects once its Run starts.
 	e.lux.onCreate = func(r luxclient.Run) {
 		e.lux.setState(r.ID, "running")
@@ -75,7 +80,7 @@ func newEnv(t *testing.T, edits ...func(string) string) *env {
 
 func (e *env) newReconciler() *Reconciler {
 	r, err := New(Options{Config: e.cfg, GitHub: e.gh, Lux: e.lux, Host: "api.github.com", Now: e.clock.Now,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), IdentityKey: e.identityKey})
 	if err != nil {
 		e.t.Fatal(err)
 	}

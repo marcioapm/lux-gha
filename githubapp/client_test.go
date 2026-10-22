@@ -719,3 +719,29 @@ func TestRepositoryPathRejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestListTagsAndDefaultBranch(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/tags":
+			if r.URL.Query().Get("page") != "2" || r.URL.Query().Get("per_page") != "100" {
+				http.Error(w, "query", 400)
+				return
+			}
+			w.Header().Set("Link", `<https://api.github.com/x?page=3>; rel="next"`)
+			w.Write([]byte(`[{"name":"v1.0","commit":{"sha":"abc","url":"u"},"zipball_url":"z"}]`))
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo":
+			w.Write([]byte(`{"id":5,"full_name":"octo-org/app.repo","default_branch":"trunk"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	page, err := c.ListTags(context.Background(), repo, PageOptions{Page: 2, PerPage: 100})
+	if err != nil || !page.HasNext || len(page.Tags) != 1 || page.Tags[0].Name != "v1.0" || page.Tags[0].Commit.SHA != "abc" {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	info, err := c.GetRepository(context.Background(), repo)
+	if err != nil || info.DefaultBranch != "trunk" {
+		t.Fatalf("info=%+v err=%v", info, err)
+	}
+}

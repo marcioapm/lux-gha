@@ -56,6 +56,10 @@ type fakeRepo struct {
 	archived, disabled, uninstalled bool
 	checkRuns                       []githubapp.CheckRun
 	forceCancels                    []int64
+	// defaultBranch is GET /repos' default_branch ("main" when empty);
+	// tags is GET /repos/.../tags, newest first.
+	defaultBranch string
+	tags          []githubapp.Tag
 }
 
 // Fake GitHub operations, for fail.
@@ -152,7 +156,29 @@ func (f *fakeGitHub) GetRepository(_ context.Context, repo githubapp.Repository)
 	if err != nil {
 		return githubapp.RepositoryInfo{}, err
 	}
-	return githubapp.RepositoryInfo{ID: r.id, FullName: repo.Owner + "/" + repo.Name}, nil
+	return githubapp.RepositoryInfo{ID: r.id, FullName: repo.Owner + "/" + repo.Name, DefaultBranch: cmp.Or(r.defaultBranch, "main")}, nil
+}
+
+const opTags = "tags"
+
+func (f *fakeGitHub) ListTags(_ context.Context, repo githubapp.Repository, opts githubapp.PageOptions) (githubapp.TagPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opTags, repo, opts.Page)
+	if err != nil {
+		return githubapp.TagPage{}, err
+	}
+	items, next := page(r.tags, opts, f.perPage)
+	return githubapp.TagPage{Tags: items, HasNext: next}, nil
+}
+
+// tag adds a tag at sha to acme/widgets.
+func (f *fakeGitHub) tag(name, sha string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t := githubapp.Tag{Name: name}
+	t.Commit.SHA = sha
+	f.repos[widgets].tags = append([]githubapp.Tag{t}, f.repos[widgets].tags...)
 }
 
 func (r *fakeRepo) runStatus(runID int64) string {
@@ -430,7 +456,7 @@ func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository
 		return githubapp.WorkflowRun{}, err
 	}
 	run := r.runs[runID]
-	run.ID, run.RunAttempt = runID, 0
+	run.ID, run.RunAttempt, run.HeadSHA = runID, 0, fakeSHA(runID)
 	for _, j := range r.jobs {
 		if j.runID == runID {
 			run.RunAttempt = max(run.RunAttempt, attemptOf(j))

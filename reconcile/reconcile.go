@@ -27,6 +27,7 @@ import (
 
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/internal/identity"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -46,6 +47,17 @@ const (
 	JITConfigPath = "/run/lux-gha/jitconfig"
 	JITConfigEnv  = "LUXGHA_JITCONFIG_FILE"
 	jitSecretName = "jitconfig"
+)
+
+// With a registry configured, each Run also gets its identity token as a
+// file secret and the env the runner image's registry hook reads.
+const (
+	IdentityPath       = "/run/lux-gha/identity"
+	IdentityEnv        = "LUXGHA_IDENTITY_FILE"
+	RunnerEndpointEnv  = "LUXGHA_RUNNER_ENDPOINT"
+	RegistryHostEnv    = "LUXGHA_REGISTRY_HOST"
+	RegistryRegionEnv  = "LUXGHA_REGISTRY_REGION"
+	identitySecretName = "identity"
 )
 
 // LiveStates are the Lux Run states in which a runner may still start or run.
@@ -93,6 +105,9 @@ type Options struct {
 	// After replaces time.After for the gap between passes.
 	After func(time.Duration) <-chan time.Time
 	Log   *slog.Logger
+	// IdentityKey signs each Run's registry identity token; required
+	// exactly when Config.Registry is set.
+	IdentityKey []byte
 }
 
 // Status is the last pass's outcome, served on GET /status. It holds counts
@@ -159,11 +174,17 @@ type Reconciler struct {
 
 	mu     sync.Mutex
 	status Status
+
+	identityKey []byte
+	att         *attribution // nil without a registry
 }
 
 func New(o Options) (*Reconciler, error) {
 	if o.Config == nil || o.GitHub == nil || o.Lux == nil || o.Host == "" {
 		return nil, errors.New("reconcile: config, GitHub, Lux and host are required")
+	}
+	if (o.Config.Registry != nil) != (len(o.IdentityKey) > 0) {
+		return nil, errors.New("reconcile: an identity key is required exactly when a registry is configured")
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -192,6 +213,10 @@ func New(o Options) (*Reconciler, error) {
 	}
 	if o.Config.DiscoverRepositories() {
 		r.disc = newDiscovery()
+	}
+	if o.Config.Registry != nil {
+		r.identityKey = slices.Clone(o.IdentityKey)
+		r.att = newAttribution()
 	}
 	return r, nil
 }
@@ -473,6 +498,7 @@ func (p *pass) readGitHub(repositories []string) error {
 			continue
 		}
 		p.repos = append(p.repos, v)
+		p.r.att.observe(v)
 		for _, route := range v.demand {
 			p.st.Demand[route.Name]++
 		}
@@ -909,6 +935,12 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	for _, h := range route.EgressHosts {
 		spec.Egress = append(spec.Egress, luxclient.EgressRule{Host: h})
+	}
+	if g := r.cfg.Registry; g != nil {
+		// Deterministic in the runner name, so a replayed key's spec is unchanged.
+		spec.Secrets = append(spec.Secrets, luxclient.FileSecret{Name: identitySecretName, Value: identity.Token(r.identityKey, name), Path: IdentityPath})
+		maps.Copy(spec.Env, map[string]string{IdentityEnv: IdentityPath, RunnerEndpointEnv: g.RunnerEndpoint,
+			RegistryHostEnv: g.Host, RegistryRegionEnv: g.Region})
 	}
 	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%s/%d", r.host, r.cfg.Instance, repoID, job, gen), spec)
 	if run != nil && !carries(*run, owned, gen, jobPrefix) {

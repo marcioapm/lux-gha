@@ -163,8 +163,9 @@ func (c *Client) GenerateRepoJITConfig(ctx context.Context, repo Repository, req
 
 // RepositoryInfo is the subset of GET /repos/{owner}/{repo} the bridge reads.
 type RepositoryInfo struct {
-	ID       int64  `json:"id"`
-	FullName string `json:"full_name"`
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 // GetRepository resolves the numeric repository ID, which unlike owner/name
@@ -286,10 +287,11 @@ func (c *Client) listPath(ctx context.Context, installationID int64, path string
 // InstallationRepository is the subset of a repository in
 // GET /installation/repositories the bridge reads.
 type InstallationRepository struct {
-	ID       int64  `json:"id"`
-	FullName string `json:"full_name"`
-	Archived bool   `json:"archived"`
-	Disabled bool   `json:"disabled"`
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	Archived      bool   `json:"archived"`
+	Disabled      bool   `json:"disabled"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 type InstallationRepositoryPage struct {
@@ -319,6 +321,30 @@ func (c *Client) ListInstallationRepositories(ctx context.Context, installationI
 		}
 	}
 	return out, nil
+}
+
+// Tag is the subset of an entry of GET /repos/{owner}/{repo}/tags the bridge reads.
+type Tag struct {
+	Name   string `json:"name"`
+	Commit struct {
+		SHA string `json:"sha"`
+	} `json:"commit"`
+}
+
+type TagPage struct {
+	Tags    []Tag
+	HasNext bool
+}
+
+// ListTags lists one page of the repository's tags (Metadata read).
+func (c *Client) ListTags(ctx context.Context, repo Repository, opts PageOptions) (TagPage, error) {
+	var out TagPage
+	q, err := opts.query()
+	if err != nil {
+		return out, err
+	}
+	out.HasNext, err = c.list(ctx, repo, "/tags", q, &out.Tags)
+	return out, err
 }
 
 func (o PageOptions) query() (url.Values, error) {

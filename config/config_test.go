@@ -338,3 +338,93 @@ func TestLoadSecretsTrimsNewlineAndRedacts(t *testing.T) {
 		t.Fatalf("expected empty-file error naming field, got %v", err)
 	}
 }
+
+const registryBlock = `"registry": {"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
+    "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "10.0.0.5:8081",
+    "runnerEndpoint": "http://10.0.0.5:8081/", "identityKeyFile": "/i"},
+  "repositories"`
+
+func withRegistry(old, new string) []byte {
+	return []byte(strings.Replace(strings.Replace(validConfig, `"repositories"`, registryBlock, 1), old, new, 1))
+}
+
+func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil || c.Registry != nil {
+		t.Fatalf("absent block: %+v err=%v", c.Registry, err)
+	}
+	c, err = Parse(withRegistry("", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := c.Registry
+	if g.RepositoryPrefix != "gha" || !slices.Equal(g.TrustedRefs, []string{"<default branch>", "refs/heads/release/*", "refs/tags/v*"}) ||
+		g.RunnerEndpoint != "http://10.0.0.5:8081" {
+		t.Fatalf("defaults: %+v", g)
+	}
+	c, err = Parse(withRegistry(`"region"`, `"repositoryPrefix": "ci/cache", "trustedRefs": ["refs/heads/main"], "region"`))
+	if err != nil || c.Registry.RepositoryPrefix != "ci/cache" || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/main"}) {
+		t.Fatalf("overrides: %+v err=%v", c.Registry, err)
+	}
+}
+
+func TestRegistryValidation(t *testing.T) {
+	for name, tc := range map[string]struct{ old, new, want string }{
+		"bad role":          {`role/lux-gha-registry`, `user/x`, "registry.roleArn"},
+		"bad region":        {`"region": "eu-west-1"`, `"region": "Europe"`, "registry.region"},
+		"host other region": {`dkr.ecr.eu-west-1`, `dkr.ecr.us-east-1`, "registry.host"},
+		"host with scheme":  {`"host": "`, `"host": "https://`, "registry.host"},
+		"bad prefix":        {`"region"`, `"repositoryPrefix": "GHA/", "region"`, "registry.repositoryPrefix"},
+		"bad ref":           {`"region"`, `"trustedRefs": ["main"], "region"`, "registry.trustedRefs"},
+		"bad glob":          {`"region"`, `"trustedRefs": ["refs/heads/[x"], "region"`, "registry.trustedRefs"},
+		"bad listen":        {`"10.0.0.5:8081",`, `"10.0.0.5",`, "registry.runnerListen"},
+		"same listen":       {`"10.0.0.5:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},
+		"endpoint path":     {`8081/"`, `8081/runner"`, "registry.runnerEndpoint"},
+		"endpoint scheme":   {`"http://10`, `"ftp://10`, "registry.runnerEndpoint"},
+		"no key file":       {`"identityKeyFile": "/i"`, `"identityKeyFile": ""`, "registry.identityKeyFile"},
+		"unknown field":     {`"region"`, `"identityKey": "x", "region"`, "unknown field"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse(withRegistry(tc.old, tc.new))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegistryIdentityKeyIsLoadedOnlyWithTheBlock(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, v string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	c, _ := Parse([]byte(validConfig))
+	c.GitHub.PrivateKeyFile, c.GitHub.WebhookSecretFile, c.Lux.APIKeyFile = write("k", "k"), write("w", "w"), write("l", "l")
+	s, err := c.LoadSecrets()
+	if err != nil || s.RegistryIdentityKey != nil {
+		t.Fatalf("without registry: %v err=%v", s.RegistryIdentityKey != nil, err)
+	}
+	r, err := Parse(withRegistry("", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.GitHub, r.Lux = c.GitHub, c.Lux
+	key := strings.Repeat("k", 32)
+	r.Registry.IdentityKeyFile = write("id", key+"\n")
+	s, err = r.LoadSecrets()
+	if err != nil || string(s.RegistryIdentityKey) != key || strings.Contains(fmt.Sprintf("%+v %#v", s, s), key) {
+		t.Fatalf("identity key: err=%v", err)
+	}
+	r.Registry.IdentityKeyFile = write("short", strings.Repeat("k", 31))
+	if _, err := r.LoadSecrets(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("short key: %v", err)
+	}
+	r.Registry.IdentityKeyFile = filepath.Join(dir, "absent")
+	if _, err := r.LoadSecrets(); err == nil || !strings.Contains(err.Error(), "registry.identityKeyFile") {
+		t.Fatalf("missing key: %v", err)
+	}
+}
