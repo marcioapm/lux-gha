@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -33,12 +34,13 @@ type certReloader struct {
 	cert     *tls.Certificate
 	stamp    [2]fileStamp
 	checked  time.Time
-	failing  bool      // the files changed and the last load failed
+	failing  bool      // the last load failed; retried on every check
 	expiryAt time.Time // when the expiry warning was last logged
 }
 
 // fileStamp is what a stat reveals of a change; err is set when the stat
-// failed, so a file that stays missing is not reported again.
+// failed or the path is not a regular file, so a file that stays missing is
+// not reported again.
 type fileStamp struct {
 	mod  time.Time
 	size int64
@@ -57,11 +59,12 @@ func statStamp(path string) fileStamp {
 	return fileStamp{mod: fi.ModTime(), size: fi.Size(), ino: inode(fi)}
 }
 
-// loadPair reads a pair that statStamp found regular, and its leaf.
+// loadPair loads the pair and parses its leaf. A failed stat in stamp is
+// returned without reading either file, so a FIFO is never opened.
 func loadPair(stamp [2]fileStamp, certFile, keyFile string) (*tls.Certificate, error) {
 	for _, s := range stamp {
 		if s.err != "" {
-			return nil, fmt.Errorf("%s", s.err)
+			return nil, errors.New(s.err)
 		}
 	}
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
