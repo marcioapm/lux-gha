@@ -480,8 +480,8 @@ func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
 		add("cache.maxEntryBytes must be between 1 and %d (default %d, 10 GiB, or 90 %% of cache.maxBytes if smaller)",
 			int64(MaxCacheEntryBytes), int64(cache.DefaultMaxEntryBytes))
 	}
-	// The reaper trims to 90 % of maxBytes; a larger entry would be deleted
-	// by the first capped pass after it is saved.
+	// Entries are trimmed to the entry budget, 90 % of maxBytes; a larger
+	// entry would be deleted by the first capped pass after it is saved.
 	if cc.MaxBytes > 0 && cc.MaxEntryBytes > cache.MaxEntryBytesFor(cc.MaxBytes) {
 		add("cache.maxEntryBytes %d must not exceed 90 %% of cache.maxBytes (%d); omit it for the default, 10 GiB or 90 %% of cache.maxBytes if smaller",
 			cc.MaxEntryBytes, cache.MaxEntryBytesFor(cc.MaxBytes))

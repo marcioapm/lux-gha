@@ -165,14 +165,18 @@ func (s *Server) putBlob(ctx context.Context, w http.ResponseWriter, r *http.Req
 	if _, err := bodyLength(r, s.entryLimit()); err != nil {
 		return err
 	}
-	// The SDK sends either one Put Blob or blocks, never both; refusing the
-	// mix keeps a reservation's staged bytes within one entry.
-	hasBlocks := false
-	if err := s.st.list(ctx, staging+"/block/", func(object) bool { hasBlocks = true; return false }); err != nil {
+	// A Put Blob starts the upload afresh: blocks left by an earlier
+	// attempt of this reservation are deleted, so they never count beside
+	// the blob, and a later block list cannot name them.
+	var blocks []string
+	if err := s.st.list(ctx, staging+"/block/", func(o object) bool {
+		blocks = append(blocks, o.Key)
+		return true
+	}); err != nil {
 		return fmt.Errorf("list blocks: %w", err)
 	}
-	if hasBlocks {
-		return azerr(http.StatusConflict, "InvalidBlobOrBlock", "blocks are already staged for this upload; Put Blob cannot follow Put Block")
+	if failed := deleteBatched(ctx, s.st, s.log, blocks); len(failed) > 0 {
+		return fmt.Errorf("delete %d earlier blocks", len(failed))
 	}
 	key := staging + "/blob"
 	n, err := s.stageObject(ctx, r, key, s.entryLimit())
@@ -207,29 +211,27 @@ func (s *Server) putBlock(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if _, err := bodyLength(r, limit); err != nil {
 		return err
 	}
-	// The reservation's staged bytes plus this block must fit in an entry,
-	// and its blocks in maxParts. Concurrent blocks can each pass this
-	// check, so the overshoot is bounded by the client's concurrency times
-	// the block size; Put Block List and the reaper's cap bound the rest.
-	staged, blocks, blob := r.ContentLength, 1, false
+	// The reservation's staged bytes (blocks, and a blob an earlier attempt
+	// left) plus this block must fit in an entry, and its blocks in
+	// maxParts. Concurrent blocks can each pass this check, so the
+	// overshoot is bounded by the client's concurrency times the block
+	// size; Put Block List and the reaper's staging budget bound the rest.
+	staged, blocks := r.ContentLength, 1
 	blockPrefix := staging + "/block/"
 	err = s.st.list(ctx, staging+"/", func(o object) bool {
 		switch {
 		case o.Key == staging+"/blob":
-			blob = true
-			return false
+			staged += o.Size
 		case o.Key == key || !strings.HasPrefix(o.Key, blockPrefix):
 			return true
+		default:
+			staged += o.Size
+			blocks++
 		}
-		staged += o.Size
-		blocks++
 		return staged <= s.o.MaxEntryBytes && blocks <= maxParts
 	})
 	if err != nil {
 		return fmt.Errorf("list blocks: %w", err)
-	}
-	if blob {
-		return azerr(http.StatusConflict, "InvalidBlobOrBlock", "a blob is already staged for this upload; Put Block cannot follow Put Blob")
 	}
 	if blocks > maxParts {
 		return azerr(http.StatusBadRequest, "BlockCountExceedsLimit", "an upload holds at most %d blocks", maxParts)

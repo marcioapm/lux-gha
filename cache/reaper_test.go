@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -49,15 +50,15 @@ func TestSelectEntries(t *testing.T) {
 	if got := keysOf(selectEntries(entries, now, 7*day, 0)); got != "expired" {
 		t.Fatalf("ttl only: %q", got)
 	}
-	// 100 MiB kept against a cap of 100: under it, nothing more.
-	if got := keysOf(selectEntries(entries, now, 7*day, 100*mib)); got != "expired" {
-		t.Fatalf("at cap: %q", got)
+	// Cap 112 → entry budget 100.8: the 100 MiB kept fit, nothing more.
+	if got := keysOf(selectEntries(entries, now, 7*day, 112*mib)); got != "expired" {
+		t.Fatalf("within budget: %q", got)
 	}
-	// Cap 90 → target 81: delete oldest-first until ≤ 81 (100 → 70).
+	// Cap 90 → entry budget 81: delete oldest-first until ≤ 81 (100 → 70).
 	if got := keysOf(selectEntries(entries, now, 7*day, 90*mib)); got != "expired older" {
 		t.Fatalf("over cap: %q", got)
 	}
-	// Cap 50 → target 45: 100 → 70 → 40.
+	// Cap 50 → entry budget 45: 100 → 70 → 40.
 	if got := keysOf(selectEntries(entries, now, 7*day, 50*mib)); got != "expired older old" {
 		t.Fatalf("well over cap: %q", got)
 	}
@@ -70,8 +71,9 @@ func TestSelectEntries(t *testing.T) {
 	if got := keysOf(selectEntries([]object{obj("a", 11*mib, time.Hour, now), obj("just-saved", big, 0, now)}, now, 7*day, 100*mib)); got != "a" {
 		t.Fatalf("largest entry: %q", got)
 	}
-	// The cap trims to 90 %, not 100 %: 105 over a cap of 100 loses two
-	// 10 MiB entries (to 85), not one (to 95).
+	// Entries are measured against the entry budget, 90 % of the cap, not
+	// the cap: 105 against a cap of 100 loses two 10 MiB entries (to 85),
+	// not one (to 95).
 	var tens []object
 	for i := range 10 {
 		tens = append(tens, obj(fmt.Sprintf("e%d", i), 10*mib, time.Duration(20-i)*time.Hour, now))
@@ -90,7 +92,7 @@ func TestTinyEntriesCountAgainstTheCap(t *testing.T) {
 	for i := range 10 {
 		tiny = append(tiny, obj(fmt.Sprintf("t%d", i), 1, time.Duration(10-i)*time.Minute, now))
 	}
-	// 10 accounted MiB against a 5 MiB cap: trim to 4.5, keeping 4.
+	// 10 accounted MiB against a 5 MiB cap (entry budget 4.5): keep 4.
 	if got := keysOf(selectEntries(tiny, now, 24*time.Hour, 5*mib)); got != "t0 t1 t2 t3 t4 t5" {
 		t.Fatalf("%q", got)
 	}
@@ -113,37 +115,132 @@ func TestSelectStagingKeepsLiveReservationsWhole(t *testing.T) {
 	}
 }
 
-// Staging counts against the cap and goes first, oldest reservation first,
-// but never one written within the upload URL lifetime.
-func TestStagingCountsAgainstTheCap(t *testing.T) {
+// Staging has its own budget, a tenth of maxBytes, and never pushes out an
+// entry: entries are measured against the rest. Over its budget staging
+// loses whole reservations, oldest newest-object first, live ones
+// included, but never the newest.
+func TestStagingBudget(t *testing.T) {
 	now := time.Now()
 	root := "staging/"
+	day := 24 * time.Hour
 	entries := []object{obj("v1/entry", 30*mib, 72*time.Hour, now)}
 	staged := []object{
-		obj(root+"idle/block/01", 25*mib, 10*time.Hour, now),
-		obj(root+"idle/block/02", 25*mib, 7*time.Hour, now),
-		// Its first block is old, its newest within uploadURLTTL: in flight.
-		obj(root+"live/block/01", 25*mib, 20*time.Hour, now),
-		obj(root+"live/block/02", 25*mib, uploadURLTTL-time.Minute, now),
+		obj(root+"older/block/01", 3*mib, 3*time.Hour, now),
+		obj(root+"older/block/02", 3*mib, 2*time.Hour, now),
+		// Its first block is oldest, but its newest is the most recent of
+		// the three: it goes last.
+		obj(root+"live/block/01", 3*mib, 20*time.Hour, now),
+		obj(root+"live/block/02", 3*mib, time.Minute, now),
+		obj(root+"mid/blob", 3*mib, time.Hour, now),
 	}
-	// 130 MiB over a cap of 100 → target 90: the idle reservation goes
-	// whole (130 → 80) and the older entry stays.
-	de, ds := selectReap(entries, staged, true, root, now, 7*24*time.Hour, 100*mib)
-	if keysOf(de) != "" || strings.Join(ds, " ") != root+"idle/block/01 "+root+"idle/block/02" {
+	// Cap 100: staging budget 10, staging 15 → "older" goes (15 → 9). The
+	// entry, 30 of a 90 budget, stays.
+	de, ds := selectReap(entries, staged, true, root, now, 7*day, 100*mib)
+	if keysOf(de) != "" || strings.Join(ds, " ") != root+"older/block/01 "+root+"older/block/02" {
 		t.Fatalf("cap 100: entries %q staging %q", keysOf(de), ds)
 	}
-	// Cap 60 → target 54: the idle reservation, then the entry; the live
-	// reservation is never a candidate.
-	de, ds = selectReap(entries, staged, true, root, now, 7*24*time.Hour, 60*mib)
-	if keysOf(de) != "v1/entry" || strings.Join(ds, " ") != root+"idle/block/01 "+root+"idle/block/02" {
-		t.Fatalf("cap 60: entries %q staging %q", keysOf(de), ds)
+	// Cap 40: staging budget 4 → "older" and "mid" go; the newest stays
+	// though it alone exceeds the budget. Entry budget 36: the entry stays.
+	de, ds = selectReap(entries, staged, true, root, now, 7*day, 40*mib)
+	if keysOf(de) != "" || strings.Join(ds, " ") != root+"older/block/01 "+root+"older/block/02 "+root+"mid/blob" {
+		t.Fatalf("cap 40: entries %q staging %q", keysOf(de), ds)
 	}
-	// A failed entry listing: no entry is deleted and the cap is not
-	// applied; abandoned staging still goes.
-	staged = append(staged, obj(root+"abandoned/blob", 1, 30*time.Hour, now))
-	de, ds = selectReap(nil, staged, false, root, now, 7*24*time.Hour, 1)
-	if len(de) != 0 || strings.Join(ds, " ") != root+"abandoned/blob" {
+	// A failed entry listing deletes no entry; staging is still trimmed.
+	de, ds = selectReap(nil, staged, false, root, now, 7*day, 40*mib)
+	if len(de) != 0 || len(ds) != 3 {
 		t.Fatalf("failed listing: entries %q staging %q", keysOf(de), ds)
+	}
+	// No cap: only reservations untouched for stagingMaxAge go.
+	stale := append(slices.Clone(staged), obj(root+"abandoned/blob", 1, 25*time.Hour, now))
+	if _, ds = selectReap(nil, stale, false, root, now, 7*day, 0); strings.Join(ds, " ") != root+"abandoned/blob" {
+		t.Fatalf("no cap: staging %q", ds)
+	}
+}
+
+// The probe of a job flooding staging: ten small entries and twenty live
+// 9 MiB reservations (180 MiB) under a 100 MiB cap. Every entry survives;
+// staging is trimmed to its 10 MiB budget, which keeps only the newest.
+func TestLiveStagingNeverEvictsEntries(t *testing.T) {
+	now := time.Now()
+	root := "staging/"
+	var entries, staged []object
+	for i := range 10 {
+		entries = append(entries, obj(fmt.Sprintf("v1/e%d", i), mib, time.Duration(10-i)*time.Hour, now))
+	}
+	for i := range 20 {
+		staged = append(staged, obj(fmt.Sprintf("%sjunk-%02d/blob", root, i), 9*mib, time.Duration(20-i)*time.Minute, now))
+	}
+	de, ds := selectReap(entries, staged, true, root, now, 7*24*time.Hour, 100*mib)
+	if len(de) != 0 {
+		t.Fatalf("entries deleted: %q", keysOf(de))
+	}
+	if len(ds) != 19 || slices.Contains(ds, root+"junk-19/blob") {
+		t.Fatalf("staging deleted: %q", ds)
+	}
+}
+
+// A just-saved entry of MaxEntryBytesFor(cap) survives a capped pass that
+// also sees older entries and a full staging budget.
+func TestJustSavedEntrySurvivesWithStaging(t *testing.T) {
+	now := time.Now()
+	root := "staging/"
+	const capBytes = 100 * mib
+	entries := []object{
+		obj("v1/old", 20*mib, time.Hour, now),
+		obj("v1/just-saved", MaxEntryBytesFor(capBytes), 0, now),
+	}
+	staged := []object{
+		obj(root+"a/blob", 9*mib, time.Minute, now),
+		obj(root+"b/blob", 9*mib, 0, now),
+	}
+	de, ds := selectReap(entries, staged, true, root, now, 7*24*time.Hour, capBytes)
+	if keysOf(de) != "v1/old" || strings.Join(ds, " ") != root+"a/blob" {
+		t.Fatalf("entries %q staging %q", keysOf(de), ds)
+	}
+}
+
+// Every staging object counts at least 1 MiB, so 10,000 one-byte blocks
+// are 10,000 MiB, not 1 MiB, against the staging budget.
+func TestStagingObjectsCountAtLeastOneMiB(t *testing.T) {
+	now := time.Now()
+	root := "staging/"
+	var staged []object
+	for i := range 20 {
+		staged = append(staged, obj(fmt.Sprintf("%stiny/block/%04x", root, i), 1, time.Hour, now))
+	}
+	staged = append(staged, obj(root+"newest/blob", 1, 0, now))
+	// 21 accounted MiB against a 2 MiB budget (cap 20): "tiny" goes.
+	_, ds := selectReap(nil, staged, true, root, now, 7*24*time.Hour, 20*mib)
+	if len(ds) != 20 || slices.Contains(ds, root+"newest/blob") {
+		t.Fatalf("staging deleted: %d %q", len(ds), ds)
+	}
+	// Cap 30 (budget 3): counted per reservation, "tiny" would be 1 MiB and
+	// stay; per object it is 20 MiB and goes.
+	if _, ds = selectReap(nil, staged, true, root, now, 7*24*time.Hour, 30*mib); len(ds) != 20 {
+		t.Fatalf("cap 30: %d deleted", len(ds))
+	}
+}
+
+// A live upload trimmed by the staging budget finalizes as expired, and
+// nothing is saved.
+func TestFinalizeAfterStagingEvictionIsExpired(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxBytes = 20 * mib })
+	tok := h.is.token(t, "100", writeMain())
+	h.putBlobOK(h.reserve(tok, "evicted", v1), make([]byte, mib))
+	h.clk.add(time.Minute)
+	h.putBlobOK(h.reserve(tok, "newer", v1), make([]byte, 2*mib))
+	// 3 MiB of live staging against a 2 MiB budget: the older upload goes.
+	if res, _ := h.srv.reaper.pass(t.Context()); res.DeletedStaging != 2 {
+		t.Fatalf("%+v", res)
+	}
+	if f := h.finalize(tok, "evicted", v1, int(mib)); f.status != http.StatusOK || f.ok() || !strings.Contains(str(f.body["message"]), "the uploaded data has expired; save again") {
+		t.Fatalf("evicted upload: %+v", f)
+	}
+	if r := h.restore(tok, "evicted", v1); r.body["ok"] != nil {
+		t.Fatalf("an entry exists: %+v", r)
+	}
+	if f := h.finalize(tok, "newer", v1, int(2*mib)); !f.ok() {
+		t.Fatalf("newest upload: %+v", f)
 	}
 }
 
@@ -170,12 +267,11 @@ func (l *logRecorder) snapshot() []string {
 
 func TestReaperPass(t *testing.T) {
 	logs := &logRecorder{}
-	// Every object counts as 1 MiB. MaxBytes 2.5 MiB: after the expired
-	// entry and the abandoned reservation, 3 entries and 1 live
-	// reservation (4 MiB) remain; the oldest entries go until at most
-	// 2.25 MiB remain, which takes "oldest" and "stuck". The live
-	// reservation, written within the upload URL lifetime, stays.
-	h := newHarness(t, func(o *Options) { o.MaxBytes = 5 * mib / 2; o.Log = slog.New(logs) })
+	// Every object counts as 1 MiB. MaxBytes 2 MiB: entry budget 1.8 MiB.
+	// After the expired entry, 3 entries remain; the oldest go until at
+	// most 1.8 MiB remain, which takes "oldest" and "stuck". Staging: the
+	// abandoned reservation goes; the live one is the newest and stays.
+	h := newHarness(t, func(o *Options) { o.MaxBytes = 2 * mib; o.Log = slog.New(logs) })
 	now := h.clk.now()
 	l := h.srv.lay
 	day := 24 * time.Hour

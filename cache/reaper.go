@@ -35,14 +35,15 @@ type reapResult struct {
 	Errors         int
 }
 
-// minAccountedBytes is the least size an entry or a staging reservation
-// counts for against maxBytes, so the cap also bounds how many objects the
-// reaper lists and holds in memory (maxBytes / 1 MiB).
+// minAccountedBytes is the least size any entry or staging object counts
+// for against its budget, so the budgets also bound how many objects the
+// reaper lists and holds in memory (about maxBytes / 1 MiB).
 const minAccountedBytes = 1 << 20
 
 func accounted(size int64) int64 { return max(size, minAccountedBytes) }
 
-// reservation is one upload's staging objects.
+// reservation is one upload's staging objects; bytes is the sum of their
+// accounted sizes.
 type reservation struct {
 	name   string
 	newest time.Time
@@ -67,7 +68,7 @@ func groupStaging(objs []object, root string) []reservation {
 		if o.LastModified.After(r.newest) {
 			r.newest = o.LastModified
 		}
-		r.bytes += o.Size
+		r.bytes += accounted(o.Size)
 		r.keys = append(r.keys, o.Key)
 	}
 	slices.SortFunc(res, func(a, b reservation) int {
@@ -79,22 +80,38 @@ func groupStaging(objs []object, root string) []reservation {
 	return res
 }
 
-// selectReap returns the entries and staging objects to delete:
-//   - every entry last modified before now-ttl;
-//   - every staging reservation whose newest object is older than
-//     stagingMaxAge, whole, so a pass never removes part of a live upload;
-//   - then, while entries and staging together exceed maxBytes (each
-//     counted at least minAccountedBytes), staging reservations oldest
-//     first, never one written to within uploadURLTTL, and then the oldest
-//     entries, until 90 % of maxBytes remain. maxBytes 0 is no cap.
+// selectReap returns the entries and staging objects to delete. maxBytes
+// is split into two budgets (StagingBudgetFor, EntryBudgetFor); 0 is no
+// cap. Every entry and staging object counts at least minAccountedBytes.
 //
-// entriesOK false means the entry listing failed: no entry is deleted and
-// the cap is not applied, since the total is unknown.
+//   - Every staging reservation whose newest object is older than
+//     stagingMaxAge goes, whole, so a pass never removes part of an upload.
+//   - While the remaining staging exceeds the staging budget, whole
+//     reservations go, oldest newest-object first, live ones included. The
+//     newest reservation always stays: one upload is bounded on its own by
+//     maxEntryBytes, so a single save completes under any budget.
+//   - Every entry last modified before now-ttl goes.
+//   - While the remaining entries exceed the entry budget, the oldest go.
+//     Staging never counts here, so an upload never pushes out an entry,
+//     and since maxEntryBytes ≤ the entry budget, the newest entry stays.
+//
+// entriesOK false means the entry listing failed: no entry is deleted,
+// since the total is unknown; staging is still trimmed.
 func selectReap(entries, staged []object, entriesOK bool, root string, now time.Time, ttl time.Duration, maxBytes int64) (delEntries []object, delStaging []string) {
 	groups := groupStaging(staged, root)
 	g := 0
 	for ; g < len(groups) && groups[g].newest.Before(now.Add(-stagingMaxAge)); g++ {
 		delStaging = append(delStaging, groups[g].keys...)
+	}
+	if maxBytes > 0 {
+		var total int64
+		for _, r := range groups[g:] {
+			total += r.bytes
+		}
+		for ; g < len(groups)-1 && total > StagingBudgetFor(maxBytes); g++ {
+			delStaging = append(delStaging, groups[g].keys...)
+			total -= groups[g].bytes
+		}
 	}
 	if !entriesOK {
 		return nil, delStaging
@@ -117,20 +134,7 @@ func selectReap(entries, staged []object, entriesOK bool, root string, now time.
 	for _, o := range sorted[i:] {
 		total += accounted(o.Size)
 	}
-	for _, r := range groups[g:] {
-		total += accounted(r.bytes)
-	}
-	if total <= maxBytes {
-		return delEntries, delStaging
-	}
-	target := maxBytes - maxBytes/10
-	// Groups are ordered by their newest object, so the first one written
-	// within uploadURLTTL ends the staging candidates.
-	for ; g < len(groups) && total > target && groups[g].newest.Before(now.Add(-uploadURLTTL)); g++ {
-		delStaging = append(delStaging, groups[g].keys...)
-		total -= accounted(groups[g].bytes)
-	}
-	for ; i < len(sorted) && total > target; i++ {
+	for ; i < len(sorted) && total > EntryBudgetFor(maxBytes); i++ {
 		delEntries = append(delEntries, sorted[i])
 		total -= accounted(sorted[i].Size)
 	}

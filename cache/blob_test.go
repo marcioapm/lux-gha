@@ -226,26 +226,62 @@ func TestBlockListErrors(t *testing.T) {
 	azureErr(t, "GET", gresp, string(gb), http.StatusMethodNotAllowed, "UnsupportedHttpVerb", "only PUT")
 }
 
-// The SDK sends Put Blob or blocks, never both: the mix is refused, so a
-// reservation stages at most one entry's bytes.
-func TestPutBlobAndPutBlockDoNotMix(t *testing.T) {
-	h := newHarness(t)
+// A save retried by the same job reuses its reservation, so either upload
+// form may follow the other's leftovers. Put Blob starts afresh and drops
+// earlier blocks; Put Block counts an earlier blob toward the size bound.
+func TestPutBlobAndPutBlockMix(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxEntryBytes = 2*minPartBytes + 10 })
 	tok := h.is.token(t, "100", writeMain())
-	blobFirst := h.reserve(tok, "a", v1)
-	h.putBlobOK(blobFirst, []byte("whole"))
-	resp, b := h.put(blobFirst, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, []byte("x"))
-	azureErr(t, "block after blob", resp, b, http.StatusConflict, "InvalidBlobOrBlock", "Put Block cannot follow Put Blob")
-	// Re-putting the blob still works (the SDK retries).
-	h.putBlobOK(blobFirst, []byte("whole"))
 
-	blocksFirst := h.reserve(tok, "b", v1)
-	if resp, b := h.put(blocksFirst, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, []byte("x")); resp.StatusCode != http.StatusCreated {
+	// Blocks first: the first attempt stages a block and stops.
+	up := h.reserve(tok, "blocks-then-blob", v1)
+	if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, make([]byte, minPartBytes)); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("block: %d %s", resp.StatusCode, b)
 	}
-	resp, b = h.put(blocksFirst, "", map[string]string{"x-ms-blob-type": "BlockBlob"}, []byte("whole"))
-	azureErr(t, "blob after block", resp, b, http.StatusConflict, "InvalidBlobOrBlock", "Put Blob cannot follow Put Block")
-	if f := h.finalize(tok, "a", v1, 5); !f.ok() {
-		t.Fatalf("finalize a: %+v", f)
+	staging := h.stagingOf(tok, "blocks-then-blob", v1)
+	// The retry: a fresh Create, then Put Blob.
+	h.putBlobOK(h.reserve(tok, "blocks-then-blob", v1), []byte("whole"))
+	if left := h.st.keys(staging + "/block/"); len(left) != 0 {
+		t.Fatalf("earlier blocks kept: %q", left)
+	}
+	// A block list naming the dropped block finds nothing.
+	resp, b := h.put(up, "comp=blocklist", nil, blockListXML(blockID(0)))
+	azureErr(t, "list of a dropped block", resp, b, http.StatusBadRequest, "InvalidBlockList", "block 0 was not uploaded")
+	if f := h.finalize(tok, "blocks-then-blob", v1, 5); !f.ok() {
+		t.Fatalf("finalize after blocks then blob: %+v", f)
+	}
+	if got := h.restored(h.restore(tok, "blocks-then-blob", v1)); string(got) != "whole" {
+		t.Fatalf("restored %q", got)
+	}
+
+	// Blob first: the first attempt's Finalize fails on its size, which
+	// leaves the blob staged; the retry uploads blocks.
+	up = h.reserve(tok, "blob-then-blocks", v1)
+	h.putBlobOK(up, make([]byte, minPartBytes))
+	if f := h.finalize(tok, "blob-then-blocks", v1, 1); f.ok() {
+		t.Fatalf("wrong-size finalize: %+v", f)
+	}
+	up = h.reserve(tok, "blob-then-blocks", v1)
+	// The blob counts: blob + 5 MiB + 11 bytes exceeds the bound.
+	resp, b = h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, make([]byte, minPartBytes+11))
+	azureErr(t, "block over the bound with the blob", resp, b, http.StatusRequestEntityTooLarge, "RequestBodyTooLarge", "staged blocks exceed")
+	a, c := bytes.Repeat([]byte("a"), minPartBytes), []byte("tail")
+	for i, data := range [][]byte{a, c} {
+		if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(i)), nil, data); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("block %d: %d %s", i, resp.StatusCode, b)
+		}
+	}
+	if resp, b := h.put(up, "comp=blocklist", nil, blockListXML(blockID(0), blockID(1))); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("block list: %d %s", resp.StatusCode, b)
+	}
+	if f := h.finalize(tok, "blob-then-blocks", v1, len(a)+len(c)); !f.ok() {
+		t.Fatalf("finalize after blob then blocks: %+v", f)
+	}
+	if got := h.restored(h.restore(tok, "blob-then-blocks", v1)); !bytes.Equal(got, append(a, c...)) {
+		t.Fatalf("restored %d bytes", len(got))
+	}
+	if left := h.st.keys(h.srv.lay.stagingRoot()); len(left) != 0 {
+		t.Fatalf("staging left %q", left)
 	}
 }
 

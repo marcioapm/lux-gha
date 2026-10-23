@@ -36,14 +36,27 @@ const (
 	maxKeys  = 10
 )
 
-// MaxEntryBytesFor returns the largest entry a cap of maxBytes admits: 90 %
-// of it, the size the reaper trims to, so a just-saved entry survives a
-// capped pass. With no cap (0) it is DefaultMaxEntryBytes.
+// maxBytes is split into two budgets the reaper enforces separately:
+// uploads not yet finalized (staging) get a tenth, finalized entries the
+// rest. Staging never evicts an entry, and entries never evict staging.
+
+// StagingBudgetFor is the share of maxBytes uploads in progress may hold.
+func StagingBudgetFor(maxBytes int64) int64 { return maxBytes / 10 }
+
+// EntryBudgetFor is the share of maxBytes finalized entries may hold.
+func EntryBudgetFor(maxBytes int64) int64 { return maxBytes - StagingBudgetFor(maxBytes) }
+
+// MaxEntryBytesFor returns the largest entry a cap of maxBytes admits: the
+// entry budget, so the newest entry alone always fits it and a just-saved
+// entry survives a capped pass. It need not fit the staging budget: the
+// newest upload is never trimmed, so one upload of any admitted size
+// completes; the staging budget bounds how many run at once. With no cap
+// (0) it is DefaultMaxEntryBytes.
 func MaxEntryBytesFor(maxBytes int64) int64 {
 	if maxBytes <= 0 {
 		return DefaultMaxEntryBytes
 	}
-	return maxBytes - maxBytes/10
+	return EntryBudgetFor(maxBytes)
 }
 
 // DefaultMaxEntryBytesFor is the maxEntryBytes default for a cap of
@@ -359,7 +372,9 @@ func (s *Server) finalize(ctx context.Context, id *identity, r *http.Request, c 
 	staging := s.lay.stagingKey(id.RepoID, id.WriteScope, req.Version, req.Key, id.TokenHash)
 	b, err := s.st.getSmall(ctx, staging+"/manifest", maxManifestBytes)
 	if errors.Is(err, errNotFound) {
-		return finalizeResponse{Message: "no completed upload for this key and version"}, nil
+		// The reaper deletes a reservation whole, manifest included, so an
+		// upload it trimmed and one never committed look the same here.
+		return finalizeResponse{Message: "no completed upload for this key and version, or the uploaded data has expired; save again"}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
