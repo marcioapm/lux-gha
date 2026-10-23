@@ -631,7 +631,18 @@ points that route's jobs at it ([Using the cache server](#using-the-cache-server
   modification time or size changes, the pair is reloaded without a
   restart, so a renewal only has to rewrite the files. A pair that fails to
   load (for example a certificate written before its key) is logged once and
-  the previous certificate stays in service until the files change again.
+  the previous certificate stays in service; the load is retried on every
+  check until it succeeds, so a fix that changes neither file (`chmod`,
+  `chown`) is picked up too. An atomic replacement (rename over the path) is
+  seen by its new inode. The certificate's expiry is logged at load, and
+  within 7 days of it a warning is logged daily: a renewal that keeps
+  failing is otherwise silent until handshakes fail.
+- **Who may write the certificate files** is the trust boundary: whoever
+  can write them can install their own key and read every job's runtime
+  token. Keep the directory writable by root (or the ACME client) only and
+  the key readable by the lux-gha user only (mode `0600`); lux-gha warns at
+  startup about a key file other users can read or write, and refuses a
+  path that is not a regular file.
   A `listen` that is not a loopback address without TLS is logged as a
   warning at startup: every request carries a job's runtime token.
 - **Reaching the listener from Runs.** Runs reach the cache listener over

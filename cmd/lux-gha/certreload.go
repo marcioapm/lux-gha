@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,20 +13,28 @@ import (
 // certCheckInterval bounds how often the certificate files are stat'ed.
 const certCheckInterval = 30 * time.Second
 
+// certExpiryWarning is how close to its expiry the served certificate gets
+// a daily warning: a renewal that keeps failing is otherwise silent until
+// every job's TLS handshake fails.
+const certExpiryWarning = 7 * 24 * time.Hour
+
 // certReloader serves a PEM certificate and key pair and reloads it when
-// either file's modification time or size changes. A pair that fails to
-// load keeps the last good one in service and is logged once; it is retried
-// only after the files change again.
+// either file changes (modification time, size or inode). A pair that fails
+// to load keeps the last good one in service; the failure is logged once
+// per change of the files, and the load is retried on every check until it
+// succeeds, so a fix that changes neither file (chmod, chown) is picked up.
 type certReloader struct {
 	certFile, keyFile string
 	interval          time.Duration
 	now               func() time.Time
 	log               *slog.Logger
 
-	mu      sync.Mutex
-	cert    *tls.Certificate
-	stamp   [2]fileStamp
-	checked time.Time
+	mu       sync.Mutex
+	cert     *tls.Certificate
+	stamp    [2]fileStamp
+	checked  time.Time
+	failing  bool      // the files changed and the last load failed
+	expiryAt time.Time // when the expiry warning was last logged
 }
 
 // fileStamp is what a stat reveals of a change; err is set when the stat
@@ -33,6 +42,7 @@ type certReloader struct {
 type fileStamp struct {
 	mod  time.Time
 	size int64
+	ino  uint64
 	err  string
 }
 
@@ -41,17 +51,43 @@ func statStamp(path string) fileStamp {
 	if err != nil {
 		return fileStamp{err: err.Error()}
 	}
-	return fileStamp{mod: fi.ModTime(), size: fi.Size()}
+	if !fi.Mode().IsRegular() {
+		return fileStamp{err: path + ": not a regular file"}
+	}
+	return fileStamp{mod: fi.ModTime(), size: fi.Size(), ino: inode(fi)}
+}
+
+// loadPair reads a pair that statStamp found regular, and its leaf.
+func loadPair(stamp [2]fileStamp, certFile, keyFile string) (*tls.Certificate, error) {
+	for _, s := range stamp {
+		if s.err != "" {
+			return nil, fmt.Errorf("%s", s.err)
+		}
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	if cert.Leaf == nil {
+		if cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return nil, err
+		}
+	}
+	return &cert, nil
 }
 
 func newCertReloader(certFile, keyFile string, log *slog.Logger) (*certReloader, error) {
 	r := &certReloader{certFile: certFile, keyFile: keyFile, interval: certCheckInterval, now: time.Now, log: log}
 	r.stamp = r.stat()
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	cert, err := loadPair(r.stamp, certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("cache.tlsCertFile, cache.tlsKeyFile: %w", err)
 	}
-	r.cert, r.checked = &cert, r.now()
+	if fi, err := os.Stat(keyFile); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		log.Warn("cache listener: the TLS key file is readable or writable by other users", "tlsKeyFile", keyFile, "mode", fi.Mode().Perm().String())
+	}
+	r.cert, r.checked = cert, r.now()
+	r.log.Info("cache listener: TLS certificate loaded", "tlsCertFile", certFile, "notAfter", cert.Leaf.NotAfter)
 	return r, nil
 }
 
@@ -67,20 +103,37 @@ func (r *certReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, e
 		return r.cert, nil
 	}
 	r.checked = now
+	defer r.warnExpiry(now)
 	stamp := r.stat()
-	if stamp == r.stamp {
+	changed := stamp != r.stamp
+	if !changed && !r.failing {
 		return r.cert, nil
 	}
 	r.stamp = stamp
-	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	cert, err := loadPair(stamp, r.certFile, r.keyFile)
 	if err != nil {
-		r.log.Error("cache listener: TLS certificate reload failed; serving the previous certificate",
-			"tlsCertFile", r.certFile, "tlsKeyFile", r.keyFile, "error", err)
+		if changed {
+			r.log.Error("cache listener: TLS certificate reload failed; serving the previous certificate",
+				"tlsCertFile", r.certFile, "tlsKeyFile", r.keyFile, "error", err)
+		}
+		r.failing = true
 		return r.cert, nil
 	}
-	r.cert = &cert
-	r.log.Info("cache listener: TLS certificate reloaded", "tlsCertFile", r.certFile)
+	r.cert, r.failing = cert, false
+	r.log.Info("cache listener: TLS certificate reloaded", "tlsCertFile", r.certFile, "notAfter", cert.Leaf.NotAfter)
 	return r.cert, nil
+}
+
+// warnExpiry logs, at most once a day, that the served certificate expires
+// within certExpiryWarning. Call with r.mu held.
+func (r *certReloader) warnExpiry(now time.Time) {
+	left := r.cert.Leaf.NotAfter.Sub(now)
+	if left > certExpiryWarning || now.Sub(r.expiryAt) < 24*time.Hour {
+		return
+	}
+	r.expiryAt = now
+	r.log.Warn("cache listener: the TLS certificate expires soon; check its renewal",
+		"tlsCertFile", r.certFile, "notAfter", r.cert.Leaf.NotAfter, "left", left.Round(time.Hour).String())
 }
 
 func (r *certReloader) tlsConfig() *tls.Config {

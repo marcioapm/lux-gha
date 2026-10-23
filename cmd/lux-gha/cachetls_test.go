@@ -150,7 +150,7 @@ func TestRunServesCacheOverTLS(t *testing.T) {
 	}
 	// A TLS 1.1 client is refused.
 	old := trusting(cert)
-	old.MaxVersion = tls.VersionTLS11
+	old.MinVersion, old.MaxVersion = tls.VersionTLS10, tls.VersionTLS11 // offered, so the server's MinVersion decides
 	if c, err := tls.Dial("tcp", cacheAddr, old); err == nil {
 		c.Close()
 		t.Fatal("TLS 1.1 handshake succeeded")
@@ -170,15 +170,19 @@ func TestRunRefusesCacheTLSWithoutALoadablePair(t *testing.T) {
 	dir := t.TempDir()
 	keyFile := filepath.Join(dir, "signing")
 	os.WriteFile(keyFile, []byte(strings.Repeat("k", 32)+"\n"), 0o600)
-	certFile, tlsKeyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-	for name, setup := range map[string]func(){
-		"missing": func() {},
-		"garbage": func() {
+	for _, c := range []struct {
+		name  string
+		setup func(certFile, keyFile string)
+	}{
+		{"missing", func(string, string) {}},
+		{"garbage", func(certFile, keyFile string) {
 			os.WriteFile(certFile, []byte("not a certificate"), 0o600)
-			os.WriteFile(tlsKeyFile, []byte("not a key"), 0o600)
-		},
+			os.WriteFile(keyFile, []byte("not a key"), 0o600)
+		}},
 	} {
-		setup()
+		name, files := c.name, t.TempDir()
+		certFile, tlsKeyFile := filepath.Join(files, "cert.pem"), filepath.Join(files, "key.pem")
+		c.setup(certFile, tlsKeyFile)
 		path := writeConfig(t, fakeLux(t, "v0.1.14"), closedGitHub, func(c map[string]any) {
 			c["cache"] = map[string]any{
 				"listen": "127.0.0.1:0", "publicURL": "https://127.0.0.1:1",
