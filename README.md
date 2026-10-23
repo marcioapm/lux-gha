@@ -659,11 +659,13 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
   the largest archive accepted: default 10 GiB, or 90 % of `maxBytes` if
   that is smaller, and never more than 90 % of `maxBytes` (the entry
   budget), so the cap never deletes an entry just saved. It may exceed the
-  10 % upload budget: the newest upload is never trimmed, so one save of
-  any accepted size completes; the upload budget bounds how many uploads
-  run at once (a 10 % budget of a 100 GiB cap holds one 10 GiB upload, or
-  ten 1 GiB ones). **`reapInterval`** (at least 1 m): how often the
-  reaper runs.
+  10 % upload budget: the newest upload is never trimmed, so the newest
+  upload always completes; the upload budget bounds how many others
+  survive alongside it (a 10 % budget of a 100 GiB cap holds one 10 GiB
+  upload, or ten 1 GiB ones). Size the cap so that the upload budget is at
+  least the number of saves you expect at once times a typical archive
+  size; saves beyond it fail when a pass runs during them.
+  **`reapInterval`** (at least 1 m): how often the reaper runs.
 
 **Authentication.** Every cache call carries the job's runtime token
 (`ACTIONS_RUNTIME_TOKEN`), a JWT the issuer signs. Its signature (RS256,
@@ -729,11 +731,13 @@ bucket or a prefix). With `maxBytes` set it then enforces two budgets
 separately:
 
 - **Uploads in progress** (staging), 10 % of `maxBytes`: while staging
-  exceeds it, whole staging uploads are deleted, ordered by their most
-  recent write, oldest first, including uploads still running, but never
-  the most recent one. A deleted upload's `FinalizeCacheEntryUpload` gets
-  `ok: false` ("… the uploaded data has expired; save again"), which the
-  client reports as a failed save.
+  exceeds it, whole staging uploads are deleted, ordered by their first
+  write, oldest first, including uploads still running, but never the one
+  started last; writing to an upload again does not move it in this order.
+  A deleted upload's `FinalizeCacheEntryUpload` gets `ok: false` ("… the
+  uploaded data has expired; save again"), and a block upload deleted
+  before its `Put Block List` fails there (`400 InvalidBlockList`); the
+  client reports either as a failed save.
 - **Entries**, the other 90 %: while entries exceed it, the oldest are
   deleted. Staging never counts here, so uploads in progress never push out
   an entry, and since `maxEntryBytes` is at most this budget, an entry just
@@ -741,7 +745,7 @@ separately:
 
 Every entry and every staging object (each block, blob and manifest)
 counts as at least 1 MiB, so after a pass the reaper lists and holds about
-`maxBytes` / 1 MiB objects, plus the most recent upload's blocks (at most
+`maxBytes` / 1 MiB objects, plus the newest upload's blocks (at most
 10,000). A failed delete is
 retried next pass. As a backstop, give the bucket a lifecycle rule that
 aborts incomplete multipart uploads after a day or more.

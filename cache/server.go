@@ -49,9 +49,9 @@ func EntryBudgetFor(maxBytes int64) int64 { return maxBytes - StagingBudgetFor(m
 // MaxEntryBytesFor returns the largest entry a cap of maxBytes admits: the
 // entry budget, so the newest entry alone always fits it and a just-saved
 // entry survives a capped pass. It need not fit the staging budget: the
-// newest upload is never trimmed, so one upload of any admitted size
-// completes; the staging budget bounds how many run at once. With no cap
-// (0) it is DefaultMaxEntryBytes.
+// newest upload (the one started last) is never trimmed, so the newest
+// upload always completes; the staging budget bounds how many others
+// survive alongside it. With no cap (0) it is DefaultMaxEntryBytes.
 func MaxEntryBytesFor(maxBytes int64) int64 {
 	if maxBytes <= 0 {
 		return DefaultMaxEntryBytes

@@ -117,7 +117,7 @@ func TestSelectStagingKeepsLiveReservationsWhole(t *testing.T) {
 
 // Staging has its own budget, a tenth of maxBytes, and never pushes out an
 // entry: entries are measured against the rest. Over its budget staging
-// loses whole reservations, oldest newest-object first, live ones
+// loses whole reservations, oldest first object first, live ones
 // included, but never the newest.
 func TestStagingBudget(t *testing.T) {
 	now := time.Now()
@@ -127,27 +127,29 @@ func TestStagingBudget(t *testing.T) {
 	staged := []object{
 		obj(root+"older/block/01", 3*mib, 3*time.Hour, now),
 		obj(root+"older/block/02", 3*mib, 2*time.Hour, now),
-		// Its first block is oldest, but its newest is the most recent of
-		// the three: it goes last.
-		obj(root+"live/block/01", 3*mib, 20*time.Hour, now),
-		obj(root+"live/block/02", 3*mib, time.Minute, now),
+		// Its first block is the oldest of the three; writing to it a
+		// minute ago does not move it ahead: it goes first.
+		obj(root+"retouched/block/01", 3*mib, 20*time.Hour, now),
+		obj(root+"retouched/block/02", 3*mib, time.Minute, now),
 		obj(root+"mid/blob", 3*mib, time.Hour, now),
 	}
-	// Cap 100: staging budget 10, staging 15 → "older" goes (15 → 9). The
-	// entry, 30 of a 90 budget, stays.
+	// Cap 100: staging budget 10, staging 15 → "retouched" goes (15 → 9).
+	// The entry, 30 of a 90 budget, stays.
 	de, ds := selectReap(entries, staged, true, root, now, 7*day, 100*mib)
-	if keysOf(de) != "" || strings.Join(ds, " ") != root+"older/block/01 "+root+"older/block/02" {
+	if keysOf(de) != "" || strings.Join(ds, " ") != root+"retouched/block/01 "+root+"retouched/block/02" {
 		t.Fatalf("cap 100: entries %q staging %q", keysOf(de), ds)
 	}
-	// Cap 40: staging budget 4 → "older" and "mid" go; the newest stays
-	// though it alone exceeds the budget. Entry budget 36: the entry stays.
+	// Cap 40: staging budget 4 → "retouched" and "older" go; the newest,
+	// "mid", stays though it alone exceeds the budget. Entry budget 36:
+	// the entry stays.
 	de, ds = selectReap(entries, staged, true, root, now, 7*day, 40*mib)
-	if keysOf(de) != "" || strings.Join(ds, " ") != root+"older/block/01 "+root+"older/block/02 "+root+"mid/blob" {
+	want := root + "retouched/block/01 " + root + "retouched/block/02 " + root + "older/block/01 " + root + "older/block/02"
+	if keysOf(de) != "" || strings.Join(ds, " ") != want {
 		t.Fatalf("cap 40: entries %q staging %q", keysOf(de), ds)
 	}
 	// A failed entry listing deletes no entry; staging is still trimmed.
 	de, ds = selectReap(nil, staged, false, root, now, 7*day, 40*mib)
-	if len(de) != 0 || len(ds) != 3 {
+	if len(de) != 0 || strings.Join(ds, " ") != want {
 		t.Fatalf("failed listing: entries %q staging %q", keysOf(de), ds)
 	}
 	// No cap: only reservations untouched for stagingMaxAge go.

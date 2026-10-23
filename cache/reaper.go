@@ -42,17 +42,19 @@ const minAccountedBytes = 1 << 20
 
 func accounted(size int64) int64 { return max(size, minAccountedBytes) }
 
-// reservation is one upload's staging objects; bytes is the sum of their
+// reservation is one upload's staging objects: first and newest are the
+// earliest and latest LastModified among them, bytes the sum of their
 // accounted sizes.
 type reservation struct {
-	name   string
-	newest time.Time
-	bytes  int64
-	keys   []string
+	name          string
+	first, newest time.Time
+	bytes         int64
+	keys          []string
 }
 
-// groupStaging groups staging objects by reservation, oldest newest-object
-// first.
+// groupStaging groups staging objects by reservation, ordered by their
+// first object, oldest first. Writing to a reservation again moves its
+// newest object, not its first, so it cannot overtake later uploads.
 func groupStaging(objs []object, root string) []reservation {
 	idx := map[string]int{}
 	var res []reservation
@@ -62,17 +64,20 @@ func groupStaging(objs []object, root string) []reservation {
 		if !ok {
 			i = len(res)
 			idx[name] = i
-			res = append(res, reservation{name: name, newest: o.LastModified})
+			res = append(res, reservation{name: name, first: o.LastModified, newest: o.LastModified})
 		}
 		r := &res[i]
 		if o.LastModified.After(r.newest) {
 			r.newest = o.LastModified
 		}
+		if o.LastModified.Before(r.first) {
+			r.first = o.LastModified
+		}
 		r.bytes += accounted(o.Size)
 		r.keys = append(r.keys, o.Key)
 	}
 	slices.SortFunc(res, func(a, b reservation) int {
-		if c := a.newest.Compare(b.newest); c != 0 {
+		if c := a.first.Compare(b.first); c != 0 {
 			return c
 		}
 		return strings.Compare(a.name, b.name)
@@ -87,9 +92,10 @@ func groupStaging(objs []object, root string) []reservation {
 //   - Every staging reservation whose newest object is older than
 //     stagingMaxAge goes, whole, so a pass never removes part of an upload.
 //   - While the remaining staging exceeds the staging budget, whole
-//     reservations go, oldest newest-object first, live ones included. The
-//     newest reservation always stays: one upload is bounded on its own by
-//     maxEntryBytes, so a single save completes under any budget.
+//     reservations go, oldest first object first, live ones included. The
+//     newest reservation (latest first object) always stays: one upload is
+//     bounded on its own by maxEntryBytes, so the newest upload completes
+//     under any budget.
 //   - Every entry last modified before now-ttl goes.
 //   - While the remaining entries exceed the entry budget, the oldest go.
 //     Staging never counts here, so an upload never pushes out an entry,
@@ -98,19 +104,22 @@ func groupStaging(objs []object, root string) []reservation {
 // entriesOK false means the entry listing failed: no entry is deleted,
 // since the total is unknown; staging is still trimmed.
 func selectReap(entries, staged []object, entriesOK bool, root string, now time.Time, ttl time.Duration, maxBytes int64) (delEntries []object, delStaging []string) {
-	groups := groupStaging(staged, root)
-	g := 0
-	for ; g < len(groups) && groups[g].newest.Before(now.Add(-stagingMaxAge)); g++ {
-		delStaging = append(delStaging, groups[g].keys...)
+	var live []reservation
+	for _, r := range groupStaging(staged, root) {
+		if r.newest.Before(now.Add(-stagingMaxAge)) {
+			delStaging = append(delStaging, r.keys...)
+		} else {
+			live = append(live, r)
+		}
 	}
 	if maxBytes > 0 {
 		var total int64
-		for _, r := range groups[g:] {
+		for _, r := range live {
 			total += r.bytes
 		}
-		for ; g < len(groups)-1 && total > StagingBudgetFor(maxBytes); g++ {
-			delStaging = append(delStaging, groups[g].keys...)
-			total -= groups[g].bytes
+		for g := 0; g < len(live)-1 && total > StagingBudgetFor(maxBytes); g++ {
+			delStaging = append(delStaging, live[g].keys...)
+			total -= live[g].bytes
 		}
 	}
 	if !entriesOK {
