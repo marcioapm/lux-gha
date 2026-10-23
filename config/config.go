@@ -98,11 +98,9 @@ type Registry struct {
 	IdentityKeyFile string   `json:"identityKeyFile"`
 }
 
-// DefaultBranchRef in trustedRefs stands for the repository's default
-// branch. It contains a space, so it is never a valid git ref name.
-const DefaultBranchRef = "<default branch>"
-
-var DefaultTrustedRefs = []string{DefaultBranchRef, "refs/heads/release/*", "refs/tags/v*"}
+// DefaultTrustedRefs apply when trustedRefs is absent. The repository's
+// default branch is always trusted in addition, whatever the list holds.
+var DefaultTrustedRefs = []string{"refs/heads/release/*", "refs/tags/v*"}
 
 // MinIdentityKeyBytes is the shortest accepted registry identity key.
 const MinIdentityKeyBytes = 32
@@ -583,8 +581,8 @@ func (g *Registry) validate(listen string) []error {
 	}
 	for _, p := range g.TrustedRefs {
 		if _, err := path.Match(p, ""); err != nil ||
-			(p != DefaultBranchRef && !strings.HasPrefix(p, "refs/heads/") && !strings.HasPrefix(p, "refs/tags/")) {
-			add("trustedRefs: %q must be %q or a refs/heads/ or refs/tags/ glob", p, DefaultBranchRef)
+			(!strings.HasPrefix(p, "refs/heads/") && !strings.HasPrefix(p, "refs/tags/")) {
+			add("trustedRefs: %q must be a refs/heads/ or refs/tags/ glob (the default branch is always trusted)", p)
 		}
 	}
 	if _, port, err := net.SplitHostPort(g.RunnerListen); err != nil {

@@ -323,28 +323,86 @@ func (c *Client) ListInstallationRepositories(ctx context.Context, installationI
 	return out, nil
 }
 
-// Tag is the subset of an entry of GET /repos/{owner}/{repo}/tags the bridge reads.
-type Tag struct {
-	Name   string `json:"name"`
-	Commit struct {
-		SHA string `json:"sha"`
-	} `json:"commit"`
-}
-
-type TagPage struct {
-	Tags    []Tag
-	HasNext bool
-}
-
-// ListTags lists one page of the repository's tags (Metadata read).
-func (c *Client) ListTags(ctx context.Context, repo Repository, opts PageOptions) (TagPage, error) {
-	var out TagPage
-	q, err := opts.query()
+// TagCommit returns the commit SHA tag name points at, peeling an annotated
+// tag (GET /repos/{o}/{r}/commits/refs/tags/{name} as application/vnd.github.sha).
+// found is false when no such tag exists.
+func (c *Client) TagCommit(ctx context.Context, repo Repository, name string) (sha string, found bool, err error) {
+	suffix, err := refSuffix("/commits/refs/tags/", name)
 	if err != nil {
-		return out, err
+		return "", false, err
 	}
-	out.HasNext, err = c.list(ctx, repo, "/tags", q, &out.Tags)
-	return out, err
+	path, err := repo.path(suffix)
+	if err != nil {
+		return "", false, err
+	}
+	var out shaResponse
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	var apiErr *APIError
+	// GitHub answers 422 "No commit found" for a ref that does not exist.
+	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if !shaPattern(out.sha) {
+		return "", false, errors.New("githubapp: invalid commit SHA response")
+	}
+	return out.sha, true, nil
+}
+
+// BranchExists reports whether refs/heads/<name> exists
+// (GET /repos/{o}/{r}/git/ref/heads/{name}, an exact match).
+func (c *Client) BranchExists(ctx context.Context, repo Repository, name string) (bool, error) {
+	suffix, err := refSuffix("/git/ref/heads/", name)
+	if err != nil {
+		return false, err
+	}
+	path, err := repo.path(suffix)
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		Ref string `json:"ref"`
+	}
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return out.Ref == "refs/heads/"+name, nil
+}
+
+// shaResponse, as request's out, asks for application/vnd.github.sha and
+// receives the plain-text SHA.
+type shaResponse struct{ sha string }
+
+func shaPattern(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// refSuffix appends a ref name to prefix, escaping each '/'-separated
+// segment. Names git refuses (empty segments, "." or "..") are rejected.
+func refSuffix(prefix, name string) (string, error) {
+	segs := strings.Split(name, "/")
+	for i, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return "", errors.New("githubapp: invalid ref name")
+		}
+		segs[i] = url.PathEscape(s)
+	}
+	return prefix + strings.Join(segs, "/"), nil
 }
 
 func (o PageOptions) query() (url.Values, error) {

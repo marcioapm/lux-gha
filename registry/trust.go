@@ -4,46 +4,47 @@ import (
 	"context"
 	"errors"
 	"path"
+	"time"
 
-	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
 )
 
 var errRepository = errors.New("registry: repository id changed, or its name or default branch is missing")
 
-// forkEvents are the events whose run from a fork is read-only. A
-// pull_request_target run is not: it runs the base repository's workflow.
-var forkEvents = map[string]bool{"pull_request": true, "pull_request_review": true, "pull_request_review_comment": true}
-
-// trustedEvents may be trusted when their ref matches a trusted pattern. A
-// reusable workflow's run reports its caller's event.
+// trustedEvents may be trusted when their ref is trusted. Each can run on a
+// tag, so its ref is resolved against both tags and branches. A reusable
+// workflow's run reports its caller's event.
 var trustedEvents = map[string]bool{"push": true, "workflow_dispatch": true, "schedule": true, "release": true, "workflow_run": true}
 
-// trust maps the workflow run of the executing job to a trust level, first
-// match wins: a pull request from a fork is read-only; a trusted event on a
-// trusted ref is trusted; everything else is untrusted.
+// trust maps the workflow run of the executing job to a trust level. First
+// match wins:
+//  1. read-only: the run's head repository is missing or another repository
+//     (a fork), for every event;
+//  2. untrusted: the event is not a trusted event, or the run's ref does not
+//     resolve to exactly one of refs/tags/<name> at the run's head commit
+//     and refs/heads/<name>;
+//  3. trusted: the ref is the repository's default branch or matches a
+//     trustedRefs pattern;
+//  4. untrusted otherwise.
 func (s *Server) trust(ctx context.Context, repo githubapp.Repository, repoID int64, run githubapp.WorkflowRun) (string, error) {
-	if forkEvents[run.Event] && (run.HeadRepository == nil || run.HeadRepository.ID != repoID) {
+	if run.HeadRepository == nil || run.HeadRepository.ID != repoID {
 		return ReadOnly, nil
 	}
 	if !trustedEvents[run.Event] || run.HeadBranch == nil || *run.HeadBranch == "" {
 		return Untrusted, nil
 	}
-	ref, err := s.runRef(ctx, repo, run)
-	if err != nil {
-		return "", err
+	ref, ok, err := s.runRef(ctx, repo, repoID, *run.HeadBranch, run.HeadSHA)
+	if err != nil || !ok {
+		return Untrusted, err
 	}
 	def, err := s.defaultBranch(ctx, repo, repoID)
 	if err != nil {
 		return "", err
 	}
+	if ref == "refs/heads/"+def {
+		return Trusted, nil
+	}
 	for _, p := range s.o.Config.TrustedRefs {
-		if p == config.DefaultBranchRef {
-			if ref == "refs/heads/"+def {
-				return Trusted, nil
-			}
-			continue
-		}
 		if ok, _ := path.Match(p, ref); ok {
 			return Trusted, nil
 		}
@@ -51,37 +52,50 @@ func (s *Server) trust(ctx context.Context, repo githubapp.Repository, repoID in
 	return Untrusted, nil
 }
 
-// runRef is the run's full ref. The API reports a tag push, release or
-// dispatch on a tag by the tag's name in head_branch, like a branch. The
-// name is taken as a tag when a trusted tag pattern could match it and the
-// repository has that tag at the run's head commit; otherwise as a branch.
-func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, run githubapp.WorkflowRun) (string, error) {
-	name := *run.HeadBranch
-	tagRef := "refs/tags/" + name
-	couldBeTag := false
-	for _, p := range s.o.Config.TrustedRefs {
-		if ok, _ := path.Match(p, tagRef); ok {
-			couldBeTag = true
-		}
+type refKey struct {
+	repoID    int64
+	name, sha string
+}
+
+type cachedRef struct {
+	ref string // empty: ambiguous or unresolved
+	at  time.Time
+}
+
+// runRef resolves the run's head_branch, which the API fills with a tag's
+// name for a tag push, release or dispatch on a tag, to its full ref: the
+// tag when it points at the run's head commit, else the branch. ok is false
+// when the name is both such a tag and a branch, or neither. The answer is
+// reused for repositoryTTL per repository, name and commit.
+func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, repoID int64, name, sha string) (string, bool, error) {
+	key := refKey{repoID, name, sha}
+	now := s.o.Now()
+	s.mu.Lock()
+	c, hit := s.refs[key]
+	s.mu.Unlock()
+	if hit && now.Sub(c.at) < repositoryTTL {
+		return c.ref, c.ref != "", nil
 	}
-	if !couldBeTag {
-		return "refs/heads/" + name, nil
+	tagSHA, isTag, err := s.o.GitHub.TagCommit(ctx, repo, name)
+	if err != nil {
+		return "", false, err
 	}
-	for page := 1; page <= maxTagPages; page++ {
-		tp, err := s.o.GitHub.ListTags(ctx, repo, githubapp.PageOptions{Page: page, PerPage: 100})
-		if err != nil {
-			return "", err
-		}
-		for _, t := range tp.Tags {
-			if t.Name == name && t.Commit.SHA == run.HeadSHA {
-				return tagRef, nil
-			}
-		}
-		if !tp.HasNext {
-			break
-		}
+	isTag = isTag && tagSHA == sha
+	isBranch, err := s.o.GitHub.BranchExists(ctx, repo, name)
+	if err != nil {
+		return "", false, err
 	}
-	return "refs/heads/" + name, nil
+	ref := ""
+	switch {
+	case isTag && !isBranch:
+		ref = "refs/tags/" + name
+	case isBranch && !isTag:
+		ref = "refs/heads/" + name
+	}
+	s.mu.Lock()
+	s.refs[key] = cachedRef{ref: ref, at: now}
+	s.mu.Unlock()
+	return ref, ref != "", nil
 }
 
 func (s *Server) defaultBranch(ctx context.Context, repo githubapp.Repository, repoID int64) (string, error) {

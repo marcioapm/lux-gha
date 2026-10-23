@@ -58,9 +58,11 @@ type fakeRepo struct {
 	forceCancels                    []int64
 	// defaultBranch and fullName are GET /repos' default_branch ("main"
 	// when empty) and full_name (the requested owner/name when empty);
-	// tags is GET /repos/.../tags, newest first.
+	// tags maps a tag name to its (peeled) commit; branches holds the
+	// branch names that exist.
 	defaultBranch, fullName string
-	tags                    []githubapp.Tag
+	tags                    map[string]string
+	branches                map[string]bool
 }
 
 // Fake GitHub operations, for fail.
@@ -97,6 +99,7 @@ type fakeGitHub struct {
 	// calls per repository.
 	installCalls int
 	reads        map[string]int
+	opCount      map[string]int // calls per operation
 	// rateLimitUntil answers every call 429 until this time.
 	rateLimitUntil time.Time
 	// fail, when set, may fail an operation on a repository and page (0 for
@@ -120,13 +123,14 @@ type fakeGitHub struct {
 const widgets = "acme/widgets"
 
 func newFakeGitHub(clock *fakeClock) *fakeGitHub {
-	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2, reads: map[string]int{}, replaced: map[int64]int64{}}
+	f := &fakeGitHub{clock: clock, repos: map[string]*fakeRepo{}, nextID: 500, jitSecret: map[string]string{}, perPage: 2, reads: map[string]int{}, opCount: map[string]int{}, replaced: map[int64]int64{}}
 	f.addRepo(widgets, 1001)
 	return f
 }
 
 func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
-	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, runs: map[int64]githubapp.WorkflowRun{}, unlisted: map[string]bool{}}
+	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, runs: map[int64]githubapp.WorkflowRun{}, unlisted: map[string]bool{},
+		tags: map[string]string{}, branches: map[string]bool{"main": true}}
 	f.repos[full] = r
 	return r
 }
@@ -135,6 +139,7 @@ func (f *fakeGitHub) gate(op string, repo githubapp.Repository, page int) (*fake
 	f.calls++
 	full := repo.Owner + "/" + repo.Name
 	f.reads[full]++
+	f.opCount[op]++
 	if f.clock.Now().Before(f.rateLimitUntil) {
 		return nil, &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: f.rateLimitUntil}
 	}
@@ -160,26 +165,46 @@ func (f *fakeGitHub) GetRepository(_ context.Context, repo githubapp.Repository)
 	return githubapp.RepositoryInfo{ID: r.id, FullName: cmp.Or(r.fullName, repo.Owner+"/"+repo.Name), DefaultBranch: cmp.Or(r.defaultBranch, "main")}, nil
 }
 
-const opTags = "tags"
+const (
+	opTags   = "tags"
+	opBranch = "branch"
+)
 
-func (f *fakeGitHub) ListTags(_ context.Context, repo githubapp.Repository, opts githubapp.PageOptions) (githubapp.TagPage, error) {
+func (f *fakeGitHub) TagCommit(_ context.Context, repo githubapp.Repository, name string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	r, err := f.gate(opTags, repo, opts.Page)
+	r, err := f.gate(opTags, repo, 0)
 	if err != nil {
-		return githubapp.TagPage{}, err
+		return "", false, err
 	}
-	items, next := page(r.tags, opts, f.perPage)
-	return githubapp.TagPage{Tags: items, HasNext: next}, nil
+	sha, ok := r.tags[name]
+	return sha, ok, nil
+}
+
+func (f *fakeGitHub) BranchExists(_ context.Context, repo githubapp.Repository, name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.gate(opBranch, repo, 0)
+	if err != nil {
+		return false, err
+	}
+	return r.branches[name], nil
 }
 
 // tag adds a tag at sha to acme/widgets.
 func (f *fakeGitHub) tag(name, sha string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	t := githubapp.Tag{Name: name}
-	t.Commit.SHA = sha
-	f.repos[widgets].tags = append([]githubapp.Tag{t}, f.repos[widgets].tags...)
+	f.repos[widgets].tags[name] = sha
+}
+
+// branch adds or removes branches of acme/widgets.
+func (f *fakeGitHub) branch(exists bool, names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, n := range names {
+		f.repos[widgets].branches[n] = exists
+	}
 }
 
 func (r *fakeRepo) runStatus(runID int64) string {

@@ -358,13 +358,17 @@ func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := c.Registry
-	if !slices.Equal(g.TrustedRefs, []string{"<default branch>", "refs/heads/release/*", "refs/tags/v*"}) ||
+	if !slices.Equal(g.TrustedRefs, []string{"refs/heads/release/*", "refs/tags/v*"}) ||
 		g.RunnerEndpoint != "https://gha.example.com" {
 		t.Fatalf("defaults: %+v", g)
 	}
 	c, err = Parse(withRegistry(`"region"`, `"trustedRefs": ["refs/heads/main"], "region"`))
 	if err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/main"}) {
 		t.Fatalf("overrides: %+v err=%v", c.Registry, err)
+	}
+	contract := `"trustedRefs": ["refs/heads/release/*", "refs/tags/v*"], "region"`
+	if c, err = Parse(withRegistry(`"region"`, contract)); err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/release/*", "refs/tags/v*"}) {
+		t.Fatalf("contract list: %+v err=%v", c.Registry, err)
 	}
 }
 
@@ -376,6 +380,7 @@ func TestRegistryValidation(t *testing.T) {
 		"host with scheme":  {`"host": "`, `"host": "https://`, "registry.host"},
 		"removed prefix":    {`"region"`, `"repositoryPrefix": "gha", "region"`, `unknown field "repositoryPrefix"`},
 		"bad ref":           {`"region"`, `"trustedRefs": ["main"], "region"`, "registry.trustedRefs"},
+		"sentinel removed":  {`"region"`, `"trustedRefs": ["<default branch>"], "region"`, "registry.trustedRefs"},
 		"bad glob":          {`"region"`, `"trustedRefs": ["refs/heads/[x"], "region"`, "registry.trustedRefs"},
 		"bad listen":        {`"127.0.0.1:8081",`, `"127.0.0.1",`, "registry.runnerListen"},
 		"same listen":       {`"127.0.0.1:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},

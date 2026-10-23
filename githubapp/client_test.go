@@ -62,7 +62,8 @@ type fakeGitHub struct {
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Accept") != "application/vnd.github+json" || r.Header.Get("X-GitHub-Api-Version") != APIVersion || r.Header.Get("User-Agent") == "" {
+	accept := r.Header.Get("Accept")
+	if (accept != "application/vnd.github+json" && accept != "application/vnd.github.sha") || r.Header.Get("X-GitHub-Api-Version") != APIVersion || r.Header.Get("User-Agent") == "" {
 		http.Error(w, "bad headers", 400)
 		return
 	}
@@ -720,27 +721,55 @@ func TestRepositoryPathRejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestListTagsAndDefaultBranch(t *testing.T) {
+func TestTagCommitBranchExistsAndDefaultBranch(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/tags":
-			if r.URL.Query().Get("page") != "2" || r.URL.Query().Get("per_page") != "100" {
-				http.Error(w, "query", 400)
+		case r.Method == "GET" && r.URL.EscapedPath() == "/repos/octo-org/app.repo/commits/refs/tags/release/v1+1%23x":
+			if r.Header.Get("Accept") != "application/vnd.github.sha" {
+				http.Error(w, "accept", 415)
 				return
 			}
-			w.Header().Set("Link", `<https://api.github.com/x?page=3>; rel="next"`)
-			w.Write([]byte(`[{"name":"v1.0","commit":{"sha":"abc","url":"u"},"zipball_url":"z"}]`))
+			w.Write([]byte(sha))
+		case r.Method == "GET" && r.URL.EscapedPath() == "/repos/octo-org/app.repo/commits/refs/tags/bad":
+			w.Write([]byte("not-a-sha"))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/repos/octo-org/app.repo/commits/refs/tags/"):
+			http.Error(w, `{"message":"No commit found for SHA"}`, 422)
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/git/ref/heads/release/x":
+			w.Write([]byte(`{"ref":"refs/heads/release/x","object":{"sha":"` + sha + `"}}`))
+		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/git/ref/heads/down":
+			http.Error(w, "down", 502)
 		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo":
 			w.Write([]byte(`{"id":5,"full_name":"octo-org/app.repo","default_branch":"trunk"}`))
 		default:
 			http.NotFound(w, r)
 		}
 	})
-	page, err := c.ListTags(context.Background(), repo, PageOptions{Page: 2, PerPage: 100})
-	if err != nil || !page.HasNext || len(page.Tags) != 1 || page.Tags[0].Name != "v1.0" || page.Tags[0].Commit.SHA != "abc" {
-		t.Fatalf("page=%+v err=%v", page, err)
+	ctx := context.Background()
+	if got, found, err := c.TagCommit(ctx, repo, "release/v1+1#x"); err != nil || !found || got != sha {
+		t.Fatalf("tag: %q %v %v", got, found, err)
 	}
-	info, err := c.GetRepository(context.Background(), repo)
+	if _, found, err := c.TagCommit(ctx, repo, "missing"); err != nil || found {
+		t.Fatalf("missing tag: %v %v", found, err)
+	}
+	if _, _, err := c.TagCommit(ctx, repo, "bad"); err == nil {
+		t.Fatal("accepted a malformed SHA")
+	}
+	for _, bad := range []string{"", "a//b", "../x", "a/."} {
+		if _, _, err := c.TagCommit(ctx, repo, bad); err == nil {
+			t.Errorf("tag name %q accepted", bad)
+		}
+	}
+	if ok, err := c.BranchExists(ctx, repo, "release/x"); err != nil || !ok {
+		t.Fatalf("branch: %v %v", ok, err)
+	}
+	if ok, err := c.BranchExists(ctx, repo, "nope"); err != nil || ok {
+		t.Fatalf("missing branch: %v %v", ok, err)
+	}
+	if _, err := c.BranchExists(ctx, repo, "down"); err == nil {
+		t.Fatal("502 reported as an answer")
+	}
+	info, err := c.GetRepository(ctx, repo)
 	if err != nil || info.DefaultBranch != "trunk" {
 		t.Fatalf("info=%+v err=%v", info, err)
 	}

@@ -52,7 +52,8 @@ type GitHub interface {
 	GetRepository(context.Context, githubapp.Repository) (githubapp.RepositoryInfo, error)
 	GetWorkflowJob(context.Context, githubapp.Repository, int64) (githubapp.WorkflowJob, error)
 	GetWorkflowRun(context.Context, githubapp.Repository, int64) (githubapp.WorkflowRun, error)
-	ListTags(context.Context, githubapp.Repository, githubapp.PageOptions) (githubapp.TagPage, error)
+	TagCommit(ctx context.Context, repo githubapp.Repository, name string) (sha string, found bool, err error)
+	BranchExists(ctx context.Context, repo githubapp.Repository, name string) (bool, error)
 }
 
 type STS interface {
@@ -92,8 +93,6 @@ const (
 	// repositoryTTL bounds how long a repository's name and default branch
 	// are reused.
 	repositoryTTL = 10 * time.Minute
-	// maxTagPages bounds the tag listing that tells a tag push from a branch push.
-	maxTagPages = 10
 	// Token bucket per runner: burstTokens, refilled at refillPerSecond.
 	burstTokens     = 30
 	refillPerSecond = 0.5
@@ -113,6 +112,7 @@ type Server struct {
 	mu      sync.Mutex
 	runners map[string]*runnerState
 	repos   map[int64]cachedRepository
+	refs    map[refKey]cachedRef
 	pruned  time.Time
 }
 
@@ -157,7 +157,7 @@ func New(o Options) (*Server, error) {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]cachedRepository{}}, nil
+	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]cachedRepository{}, refs: map[refKey]cachedRef{}}, nil
 }
 
 // Handler serves only the two runner routes.
@@ -272,6 +272,11 @@ func (s *Server) take(runner string) (*runnerState, bool) {
 		for name, st := range s.runners {
 			if now.Sub(st.lastSeen) > idleForget {
 				delete(s.runners, name)
+			}
+		}
+		for k, c := range s.refs {
+			if now.Sub(c.at) >= repositoryTTL {
+				delete(s.refs, k)
 			}
 		}
 	}

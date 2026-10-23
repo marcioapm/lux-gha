@@ -72,6 +72,7 @@ func newListener(t *testing.T) *listener {
 		t.Fatal(err)
 	}
 	l.srv = srv
+	e.gh.branch(true, "trunk", "release/x", "feature", "releasex/1", "fix")
 	return l
 }
 
@@ -124,39 +125,76 @@ func str(s string) *string { return &s }
 func headRepo(id int64) *githubapp.HeadRepository { return &githubapp.HeadRepository{ID: id} }
 
 // One case per row of the trust table, decided from the workflow run of the
-// job the runner executes.
+// job the runner executes. The run's head commit is fakeSHA(70); acme/widgets
+// has branches main (default), trunk, release/x, feature, releasex/1 and fix.
 func TestRegistryTrustTable(t *testing.T) {
 	read := regHost + "/acme/widgets"
+	run := func(event, branch string, head *githubapp.HeadRepository) githubapp.WorkflowRun {
+		return githubapp.WorkflowRun{Event: event, HeadBranch: str(branch), HeadRepository: head}
+	}
+	same, fork := headRepo(1001), headRepo(2002)
+	tagAtHead := func(name string) func(*listener) { return func(l *listener) { l.gh.tag(name, fakeSHA(70)) } }
 	for _, tc := range []struct {
 		name  string
 		run   githubapp.WorkflowRun
-		tag   bool
+		setup func(*listener)
 		trust string
 		push  string
 	}{
-		{"fork pull_request", githubapp.WorkflowRun{Event: "pull_request", HeadBranch: str("main"), HeadRepository: headRepo(2002)}, false, "read-only", ""},
-		{"fork pull_request_review", githubapp.WorkflowRun{Event: "pull_request_review", HeadBranch: str("fix"), HeadRepository: headRepo(2002)}, false, "read-only", ""},
-		{"same-repo pull_request", githubapp.WorkflowRun{Event: "pull_request", HeadBranch: str("feature"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"pull_request_target", githubapp.WorkflowRun{Event: "pull_request_target", HeadBranch: str("main"), HeadRepository: headRepo(2002)}, false, "untrusted", read + "/pr"},
-		{"merge_group", githubapp.WorkflowRun{Event: "merge_group", HeadBranch: str("gh-readonly-queue/main/pr-1-abc"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"push on main", githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)}, false, "trusted", read},
-		{"push on release/x", githubapp.WorkflowRun{Event: "push", HeadBranch: str("release/x"), HeadRepository: headRepo(1001)}, false, "trusted", read},
-		{"tag v1", githubapp.WorkflowRun{Event: "push", HeadBranch: str("v1"), HeadRepository: headRepo(1001)}, true, "trusted", read},
-		{"branch named v1, no tag", githubapp.WorkflowRun{Event: "push", HeadBranch: str("v1"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"push on feature branch", githubapp.WorkflowRun{Event: "push", HeadBranch: str("feature"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"push on releasex", githubapp.WorkflowRun{Event: "push", HeadBranch: str("releasex/1"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"dispatch on main", githubapp.WorkflowRun{Event: "workflow_dispatch", HeadBranch: str("main"), HeadRepository: headRepo(1001)}, false, "trusted", read},
-		{"dispatch on branch", githubapp.WorkflowRun{Event: "workflow_dispatch", HeadBranch: str("feature"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
-		{"schedule", githubapp.WorkflowRun{Event: "schedule", HeadBranch: str("main"), HeadRepository: headRepo(1001)}, false, "trusted", read},
-		{"issue_comment on main", githubapp.WorkflowRun{Event: "issue_comment", HeadBranch: str("main"), HeadRepository: headRepo(1001)}, false, "untrusted", read + "/pr"},
+		// 1. read-only: no head repository, or another one, for every event.
+		{"fork pull_request", run("pull_request", "main", fork), nil, "read-only", ""},
+		{"fork pull_request_review", run("pull_request_review", "fix", fork), nil, "read-only", ""},
+		{"fork pull_request_review_comment", run("pull_request_review_comment", "main", fork), nil, "read-only", ""},
+		{"fork pull_request_target", run("pull_request_target", "main", fork), nil, "read-only", ""},
+		{"fork workflow_run on main", run("workflow_run", "main", fork), nil, "read-only", ""},
+		{"fork workflow_run on release/x", run("workflow_run", "release/x", fork), nil, "read-only", ""},
+		{"pull_request, head repository gone", run("pull_request", "main", nil), nil, "read-only", ""},
+		{"push, head repository gone", run("push", "main", nil), nil, "read-only", ""},
+		// 3. trusted: trusted event on the default branch or a trustedRefs ref.
+		{"push on main", run("push", "main", same), nil, "trusted", read},
+		{"push on release/x", run("push", "release/x", same), nil, "trusted", read},
+		{"push of tag v1", run("push", "v1", same), tagAtHead("v1"), "trusted", read},
+		{"release v1", run("release", "v1", same), tagAtHead("v1"), "trusted", read},
+		{"dispatch on main", run("workflow_dispatch", "main", same), nil, "trusted", read},
+		{"dispatch on tag v1", run("workflow_dispatch", "v1", same), tagAtHead("v1"), "trusted", read},
+		{"schedule", run("schedule", "main", same), nil, "trusted", read},
+		{"same-repo workflow_run on main", run("workflow_run", "main", same), nil, "trusted", read},
+		{"contract trustedRefs, push on main", run("push", "main", same), func(l *listener) {
+			l.cfg.Registry.TrustedRefs = []string{"refs/heads/release/*", "refs/tags/v*"}
+		}, "trusted", read},
+		{"empty trustedRefs, push on main", run("push", "main", same), func(l *listener) { l.cfg.Registry.TrustedRefs = []string{} }, "trusted", read},
+		// 2 and 4. untrusted.
+		{"same-repo pull_request", run("pull_request", "feature", same), nil, "untrusted", read + "/pr"},
+		{"same-repo pull_request from release/x", run("pull_request", "release/x", same), nil, "untrusted", read + "/pr"},
+		{"same-repo pull_request_target", run("pull_request_target", "main", same), nil, "untrusted", read + "/pr"},
+		{"merge_group", run("merge_group", "gh-readonly-queue/main/pr-1-abc", same), nil, "untrusted", read + "/pr"},
+		{"issue_comment on main", run("issue_comment", "main", same), nil, "untrusted", read + "/pr"},
+		{"push on feature branch", run("push", "feature", same), nil, "untrusted", read + "/pr"},
+		{"push on releasex", run("push", "releasex/1", same), nil, "untrusted", read + "/pr"},
+		{"dispatch on branch", run("workflow_dispatch", "feature", same), nil, "untrusted", read + "/pr"},
+		{"branch named v1, no tag", run("push", "v1", same), func(l *listener) { l.gh.branch(true, "v1") }, "untrusted", read + "/pr"},
+		{"branch v1, tag v1 at another commit", run("push", "v1", same), func(l *listener) {
+			l.gh.branch(true, "v1")
+			l.gh.tag("v1", fakeSHA(1))
+		}, "untrusted", read + "/pr"},
+		{"tag v1 at another commit, no branch", run("push", "v1", same), func(l *listener) { l.gh.tag("v1", fakeSHA(1)) }, "untrusted", read + "/pr"},
+		{"tag named main", run("push", "main", same), tagAtHead("main"), "untrusted", read + "/pr"},
+		{"dispatch on tag named main", run("workflow_dispatch", "main", same), tagAtHead("main"), "untrusted", read + "/pr"},
+		{"tag named release/x, no such branch", run("push", "release/x", same), func(l *listener) {
+			l.gh.branch(false, "release/x")
+			l.gh.tag("release/x", fakeSHA(70))
+		}, "untrusted", read + "/pr"},
+		{"v1 both a tag and a branch", run("push", "v1", same), func(l *listener) {
+			l.gh.branch(true, "v1")
+			l.gh.tag("v1", fakeSHA(70))
+		}, "untrusted", read + "/pr"},
+		{"neither tag nor branch", run("push", "gone", same), nil, "untrusted", read + "/pr"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newListener(t)
-			if tc.tag {
-				l.gh.tag("v1", fakeSHA(70))
+			if tc.setup != nil {
+				tc.setup(l)
 			}
-			// A tag at another commit does not make the run a tag run.
-			l.gh.tag("v1-old", fakeSHA(1))
 			runner := l.provisionAndRun(7, tc.run)
 			code, a := l.registry(runner)
 			if code != http.StatusOK {
@@ -165,18 +203,75 @@ func TestRegistryTrustTable(t *testing.T) {
 			if a.Trust != tc.trust || a.Push != tc.push || a.Read != read || a.Registry != regHost {
 				t.Fatalf("answer %+v", a)
 			}
-			if exp, err := time.Parse(time.RFC3339, a.ExpiresAt); err != nil || !exp.Equal(l.clock.Now().Add(time.Hour)) {
+			if exp, err := time.Parse(time.RFC3339, a.ExpiresAt); err != nil || !exp.Equal(l.clock.Now().Add(registry.SessionDuration)) {
 				t.Fatalf("expiresAt %q", a.ExpiresAt)
 			}
 			reqs := l.sts.requests()
-			if len(reqs) != 1 || tagValue(reqs[0], "lux-trust") != tc.trust {
-				t.Fatalf("sts requests %d, trust tag %q", len(reqs), tagValue(reqs[0], "lux-trust"))
+			if len(reqs) != 1 {
+				t.Fatalf("sts requests %d", len(reqs))
+			}
+			if got := tagValue(reqs[0], "lux-trust"); got != tc.trust {
+				t.Fatalf("trust tag %q", got)
 			}
 			want, err := registry.SessionPolicy(l.cfg.Registry, "acme", "widgets", tc.trust)
 			if err != nil || aws.ToString(reqs[0].Policy) != want {
 				t.Fatalf("session policy %s, want %s (%v)", aws.ToString(reqs[0].Policy), want, err)
 			}
 		})
+	}
+}
+
+// The ref of a run is resolved once per repository, name and commit for
+// the repository TTL, and again after it; GitHub failing to answer is 503,
+// never a guess.
+func TestRegistryRefResolutionIsCachedAndFailsClosed(t *testing.T) {
+	l := newListener(t)
+	l.gh.tag("v1", fakeSHA(70))
+	a := l.provisionAndRun(7, githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("v1"), HeadSHA: fakeSHA(70), HeadRepository: headRepo(1001)})
+	l.gh.takeReads()
+	reads := func() (tags, branches int) {
+		l.gh.mu.Lock()
+		defer l.gh.mu.Unlock()
+		return l.gh.opCount[opTags], l.gh.opCount[opBranch]
+	}
+	if _, got := l.registry(a); got.Trust != "trusted" {
+		t.Fatalf("first: %+v", got)
+	}
+	// A second job of the same run, on the same tag and commit.
+	l.gh.queueIn(widgets, 70, 8, "queued", "self-hosted", "lux")
+	l.pass()
+	b := "lux-gha-t1-1001-8-0"
+	if err := l.gh.pick(b, 8); err != nil {
+		t.Fatal(err)
+	}
+	l.pass()
+	if _, got := l.registry(b); got.Trust != "trusted" {
+		t.Fatalf("second: %+v", got)
+	}
+	if tags, branches := reads(); tags != 1 || branches != 1 {
+		t.Fatalf("ref reads within the TTL: tags %d branches %d", tags, branches)
+	}
+
+	// After the TTL a third job reads again, and a GitHub failure is 503.
+	l.clock.Add(10 * time.Minute)
+	l.gh.queueIn(widgets, 70, 9, "queued", "self-hosted", "lux")
+	l.pass()
+	c := "lux-gha-t1-1001-9-0"
+	if err := l.gh.pick(c, 9); err != nil {
+		t.Fatal(err)
+	}
+	l.pass()
+	for _, op := range []string{opTags, opBranch} {
+		l.gh.fail = func(o, _ string, _ int) error {
+			return map[bool]error{true: &githubapp.APIError{StatusCode: http.StatusBadGateway}}[o == op]
+		}
+		if code, _ := l.registry(c); code != http.StatusServiceUnavailable {
+			t.Fatalf("%s down: %d", op, code)
+		}
+	}
+	l.gh.fail = nil
+	if code, got := l.registry(c); code != http.StatusOK || got.Trust != "trusted" {
+		t.Fatalf("after recovery: %d %+v", code, got)
 	}
 }
 
