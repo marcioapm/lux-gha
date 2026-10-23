@@ -301,6 +301,20 @@ func TestRouteCacheURLSetsEnvAndEgress(t *testing.T) {
 	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "cache.example.com"}, {Host: "github.com"}}) {
 		t.Fatalf("listed host: egress %v", s.Egress)
 	}
+
+	// Listed in another case: still one rule (hostnames are case-insensitive).
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "https://Cache.Example.com", "egressHosts": ["cache.example.com"]`))
+	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "cache.example.com"}}) {
+		t.Fatalf("listed host in another case: egress %v", s.Egress)
+	}
+
+	// A loopback IP: the env, and no rule (no rule is ever added for an IP).
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "http://127.0.0.1:8090", "egressHosts": ["github.com"]`))
+	if s := specs["default"]; s.Env[CacheURLEnv] != "http://127.0.0.1:8090" || !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "github.com"}}) {
+		t.Fatalf("loopback IP: env %v egress %v", s.Env, s.Egress)
+	}
 }
 
 func mapsEqual(a, b map[string]string) bool {

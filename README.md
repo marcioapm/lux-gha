@@ -852,12 +852,14 @@ runner image therefore ships `images/runner/patch-worker.sh`:
   the file changes. The build pins the literal's count for the runner version
   (`RUNNER_RESULTS_URL_LITERALS`) and fails on a mismatch; a runner bump
   re-measures it with `patch-worker.sh count`.
-- **When.** The image ships the Worker unpatched. The build adds a step to
-  `run-helper.sh.template`, which `run.sh` copies and runs before every
-  listener start, that patches it when `LUXGHA_ACTIONS_RESULTS_URL` is set.
-  A JIT runner cannot turn self-update off, and an update replaces `bin/`
-  with a fresh copy and restarts the listener before it takes the job; the
-  step patches that copy too.
+- **When.** The image ships the Worker unpatched. With a cache server, the
+  entrypoint sets `BASH_ENV` to `pre-listener.sh`, which bash runs at the
+  start of `run-helper.sh` (the script `run.sh` restarts before every
+  listener start): it patches the Worker that `bin/` names, then unsets
+  `BASH_ENV`, so the listener and job steps never see it. A JIT runner
+  cannot turn self-update off; an update replaces `bin/` and every script in
+  the runner directory, then restarts the listener before it takes the job.
+  The environment survives that, so the fresh copy is patched too.
 - **The value.** The job-started hook appends
   `ACTIONS_RESULTS_URL=<cacheURL>` to `$GITHUB_ENV`, so every step sees it,
   including steps in a job `container:` (the runner passes a container only
@@ -865,8 +867,9 @@ runner image therefore ships `images/runner/patch-worker.sh`:
 - **Fail-open.** The Worker is patched only when the hook will write the
   URL: the entrypoint passes `LUXGHA_ACTIONS_RESULTS_URL` on to the runner
   only after installing the hook and checking the URL, and unsets it (with a
-  warning) when the image already names another job-started hook, the hook
-  file is missing, or the URL is not one the hook can write. If the Worker
+  warning) when the image already names another job-started hook or sets
+  `BASH_ENV`, the hook or `pre-listener.sh` is missing, or the URL is not one
+  the hook can write. If the Worker
   cannot be patched (a runner version the script does not recognise), the
   helper step warns and the listener starts anyway; the hook then writes
   nothing and the job log gets a `::warning::` that the job uses GitHub's

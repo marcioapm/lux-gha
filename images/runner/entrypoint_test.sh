@@ -359,6 +359,7 @@ src=$(dirname "$ep")
 locate() { if [ -f "$src/$1" ]; then echo "$src/$1"; else echo "$2"; fi; }
 hook=$(locate job-started.sh /usr/local/lib/lux-gha/job-started.sh)
 patcher=$(locate patch-worker.sh /usr/local/lib/lux-gha/patch-worker.sh)
+prelistener=$(locate pre-listener.sh /usr/local/lib/lux-gha/pre-listener.sh)
 wrapper=$(locate docker-credential-lux-gha.sh /usr/local/bin/docker-credential-lux-gha)
 creds=$(locate lux-gha-aws-credentials.sh /usr/local/bin/lux-gha-aws-credentials)
 command -v jq >/dev/null || { echo "entrypoint_test: jq is required (the image has it)" >&2; exit 2; }
@@ -651,10 +652,15 @@ check "an unpatched Worker: nothing written" "$nothing_written"
 check "a workflow warning saying the job uses GitHub's cache service" \
 	'[ "$(cat "$d/out")" = "::warning::lux-gha: this runner'"'"'s Runner.Worker.dll is not patched; this job uses GitHub'"'"'s cache service" ]'
 
+run_cache_hook cache-mixed 1 1 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
+check "a mixed Worker counts as unpatched: nothing written, a warning" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
+
 run_cache_hook cache-no-literal 0 0 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
 check "a Worker without the literal: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
 name=cache-no-worker
-rm -f "$d/runner/bin/Runner.Worker.dll"
+d=$root/$name
+mkdir -p "$d/runner/bin"
+: >"$d/github_env"
 rc=0
 env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" GITHUB_ENV="$d/github_env" RUNNER_DIR="$d/runner" \
 	LUXGHA_PATCH_WORKER="$patcher" LUXGHA_ACTIONS_RESULTS_URL="$cache_url" \
@@ -673,6 +679,13 @@ LD_PRELOAD=/tmp/x' 'https://cache.example.com/a b' 'https://cache.example.com/$(
 		'[ "$(wc -l <"$d/out")" = 1 ] && grep -q "^::warning::.*malformed; this job uses GitHub'"'"'s cache service" "$d/out"'
 done
 
+run_cache_hook cache-no-github-env 0 1 LUXGHA_ACTIONS_RESULTS_URL="$cache_url" GITHUB_ENV=
+check "GITHUB_ENV empty: exits 0 with one workflow warning" \
+	'[ "$rc" = 0 ] && [ "$(wc -l <"$d/out")" = 1 ] && grep -q "^::warning::lux-gha: GITHUB_ENV is not set" "$d/out"'
+run_cache_hook cache-github-env-unwritable 0 1 LUXGHA_ACTIONS_RESULTS_URL="$cache_url" GITHUB_ENV="$root/no-such-dir/env"
+check "an unwritable GITHUB_ENV: exits 0 with one workflow warning" \
+	'[ "$rc" = 0 ] && grep -q "^::warning::lux-gha: could not write GITHUB_ENV" "$d/out"'
+
 run_cache_hook cache-unset 0 1
 check "without LUXGHA_ACTIONS_RESULTS_URL: exits 0, silent, nothing written" \
 	'[ "$rc" = 0 ] && [ ! -s "$d/out" ] && [ ! -s "$d/err" ] && '"$nothing_written"
@@ -685,8 +698,9 @@ check "both: GITHUB_ENV gets the cache URL, then the registry" \
 	'[ "$(cat "$d/github_env")" = "$(printf "ACTIONS_RESULTS_URL=%s\nLUX_REGISTRY=%s" "$cache_url" "$reg/acme/widgets")" ]'
 
 # The entrypoint exports the hook for the cache server alone, too.
-run_case cache-hook LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook"
+run_case cache-hook LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" LUXGHA_PRE_LISTENER="$prelistener"
 check "exits 0" '[ "$rc" = 0 ]'
+check "BASH_ENV names pre-listener.sh" 'grep -qx "BASH_ENV=$prelistener" "$d/runner.env"'
 check "ACTIONS_RUNNER_HOOK_JOB_STARTED names the hook without a registry" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" "$d/runner.env"'
 check "LUXGHA_ACTIONS_RESULTS_URL reaches the runner" 'grep -qx "LUXGHA_ACTIONS_RESULTS_URL=$cache_url" "$d/runner.env"'
 check "no Docker config without a registry" '[ ! -e "$d/.docker" ]'
@@ -697,7 +711,8 @@ check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/o
 check "one warning naming both features" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "jobs run without LUX_REGISTRY and the cache server" "$d/err"'
 # Without our hook nothing would write the URL, so the Worker must stay as
 # shipped: run.sh (whose helper step patches) must not see the variable.
-check "run.sh does not see LUXGHA_ACTIONS_RESULTS_URL" '! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
+check "run.sh sees neither LUXGHA_ACTIONS_RESULTS_URL nor BASH_ENV" \
+	'! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env" && ! grep -q "^BASH_ENV=" "$d/runner.env"'
 
 run_case cache-no-hook-file LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$root/does-not-exist"
 check "exits 0" '[ "$rc" = 0 ]'
@@ -711,9 +726,19 @@ check "a URL the hook cannot write: no hook, run.sh does not see it" \
 	'! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env" && ! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
 check "one warning" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "not a URL the hook can write" "$d/err"'
 
-run_case cache-ipv6-url LUXGHA_ACTIONS_RESULTS_URL='http://[::1]:8090' LUXGHA_JOB_STARTED_HOOK="$hook"
+run_case cache-ipv6-url LUXGHA_ACTIONS_RESULTS_URL='http://[::1]:8090' LUXGHA_JOB_STARTED_HOOK="$hook" LUXGHA_PRE_LISTENER="$prelistener"
 check "an IPv6 loopback URL is accepted" \
 	'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" "$d/runner.env" && grep -qx "LUXGHA_ACTIONS_RESULTS_URL=http://\[::1\]:8090" "$d/runner.env" && [ ! -s "$d/err" ]'
+
+run_case cache-bash-env-preset LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" LUXGHA_PRE_LISTENER="$prelistener" BASH_ENV=/opt/own-env.sh
+check "a BASH_ENV already set is kept, and run.sh does not see the URL" \
+	'grep -qx "BASH_ENV=/opt/own-env.sh" "$d/runner.env" && ! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
+check "one warning" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "BASH_ENV is already set" "$d/err"'
+
+run_case cache-no-pre-listener LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" LUXGHA_PRE_LISTENER="$root/does-not-exist"
+check "no pre-listener.sh: run.sh sees neither the URL nor BASH_ENV" \
+	'! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env" && ! grep -q "^BASH_ENV=" "$d/runner.env"'
+check "one warning" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "no $root/does-not-exist" "$d/err"'
 
 run_case cache-with-registry-preset LUXGHA_REGISTRY_HOST="$reg" LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
 check "registry and cache with a preset hook: run.sh does not see the URL" '! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'

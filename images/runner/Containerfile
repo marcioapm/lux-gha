@@ -79,6 +79,7 @@ ARG RUNNER_VERSION=2.338.0
 # bin/Runner.Worker.dll (patch-worker.sh count), the same on every
 # architecture. A runner bump that changes it fails the build: re-measure
 # and check that patch-worker.sh still applies (README "Using the cache server").
+# The image ships the Worker unpatched; pre-listener.sh patches it at run time.
 ARG RUNNER_RESULTS_URL_LITERALS=1
 # SHA-256 of actions-runner-linux-<arch>-2.338.0.tar.gz, from the v2.338.0
 # release notes (also the asset digests the GitHub releases API reports).
@@ -179,6 +180,7 @@ RUN userdel -r ubuntu; \
     install -d -o runner -g runner -m 0755 /opt/hostedtoolcache
 
 COPY --chmod=755 patch-worker.sh /usr/local/lib/lux-gha/patch-worker.sh
+COPY --chmod=644 pre-listener.sh /usr/local/lib/lux-gha/pre-listener.sh
 WORKDIR /home/runner/actions-runner
 RUN case "$TARGETARCH" in \
       arm64) arch=arm64 sha=$RUNNER_SHA256_ARM64 ;; \
@@ -191,7 +193,6 @@ RUN case "$TARGETARCH" in \
     tar -xzf /tmp/runner.tar.gz; \
     rm /tmp/runner.tar.gz; \
     /usr/local/lib/lux-gha/patch-worker.sh check "$RUNNER_RESULTS_URL_LITERALS" bin/Runner.Worker.dll; \
-    /usr/local/lib/lux-gha/patch-worker.sh helper run-helper.sh.template; \
     apt-get update; \
     ./bin/installdependencies.sh; \
     rm -rf /var/lib/apt/lists/*; \

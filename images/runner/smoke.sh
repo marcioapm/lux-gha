@@ -245,12 +245,12 @@ pin=$(containerfile_arg RUNNER_RESULTS_URL_LITERALS)
 run -e PIN="$pin" --entrypoint sh "$TAG" -euc '
 	pw=/usr/local/lib/lux-gha/patch-worker.sh
 	[ "$(stat -c "%U %a" "$pw")" = "root 755" ] || { echo "$pw is $(stat -c "%U %a" "$pw"), want root 755" >&2; exit 1; }
-	# Shipped unpatched: the helper patches before each listener start.
+	pl=/usr/local/lib/lux-gha/pre-listener.sh
+	[ "$(stat -c "%U %a" "$pl")" = "root 644" ] || { echo "$pl is $(stat -c "%U %a" "$pl"), want root 644" >&2; exit 1; }
+	bash -n "$pl"
+	# Shipped unpatched: pre-listener.sh patches at every run-helper.sh start.
 	"$pw" check "$PIN" "$RUNNER_DIR/bin/Runner.Worker.dll"
-	t=$RUNNER_DIR/run-helper.sh.template
-	[ "$(grep -c "^# lux-gha: point jobs at the Actions cache server" "$t")" = 1 ] || { echo "$t lacks the patch step" >&2; exit 1; }
-	bash -n "$t"
-	echo "Runner.Worker.dll unpatched with $PIN literal(s); run-helper.sh.template has the patch step"
+	echo "Runner.Worker.dll unpatched with $PIN literal(s); pre-listener.sh installed"
 	# A copy patches cleanly, as the helper would.
 	cp "$RUNNER_DIR/bin/Runner.Worker.dll" /tmp/w.dll
 	"$pw" apply /tmp/w.dll

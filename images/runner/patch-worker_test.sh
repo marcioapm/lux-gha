@@ -1,18 +1,22 @@
 #!/bin/sh
-# Tests for patch-worker.sh against synthetic Worker DLLs and a minimal
-# run-helper template, including a simulated runner self-update. Runs under
-# any POSIX sh; needs perl (the runner's Ubuntu base has it).
+# Tests for patch-worker.sh and pre-listener.sh against synthetic Worker
+# DLLs and a minimal run-helper, including a simulated runner self-update.
+# Runs under any POSIX sh; needs perl and bash 4 or later (the runner image
+# has both). bash 3.2 (macOS) sets $0 to "bash" while it reads BASH_ENV, so
+# there the pre-listener cases are skipped: make entrypoint-test runs them.
 #
 # Usage: sh patch-worker_test.sh [path/to/patch-worker.sh]
+# pre-listener.sh is taken from the same directory.
 #
 # SC2016: every check condition is single-quoted so it expands when check
 # evals it, as in entrypoint_test.sh. SC2034/SC2209: rc, ino and name are
-# read inside those conditions.
-# SC2012: ls -i is the portable way to read an inode.
+# read inside those conditions. SC2012: ls -i is the portable way to read an
+# inode.
 # shellcheck disable=SC2016,SC2034,SC2209,SC2012
 set -eu
 
 pw=${1:-$(dirname "$0")/patch-worker.sh}
+pl=$(dirname "$pw")/pre-listener.sh
 root=$PWD/.scratch/patch-worker-$$
 mkdir -p "$root"
 trap 'rm -rf "$root"' EXIT
@@ -57,9 +61,15 @@ run check 2 "$root/a.dll"
 check "a different pin fails, naming what it found" '[ "$rc" != 0 ] && grep -q "found \"1 0\"" "$root/err"'
 dll "$root/patched.dll" 0 1
 run check 1 "$root/patched.dll"
-check "an already patched DLL fails the build check" '[ "$rc" != 0 ]'
+check "an already patched DLL fails the build check" '[ "$rc" != 0 ] && grep -q "found \"0 1\"" "$root/err"'
+dll "$root/mixed.dll" 1 1
+run check 1 "$root/mixed.dll"
+check "a mixed DLL fails the build check" '[ "$rc" != 0 ] && grep -q "found \"1 1\"" "$root/err"'
+dll "$root/none.dll" 0 0
+run check 0 "$root/none.dll"
+check "a pin of 0 is refused: such a DLL cannot be patched" '[ "$rc" != 0 ] && grep -q "positive number" "$root/err"'
 run check x "$root/a.dll"
-check "a non-numeric pin is refused" '[ "$rc" != 0 ]'
+check "a non-numeric pin is refused" '[ "$rc" != 0 ] && grep -q "positive number" "$root/err"'
 
 name=apply
 cp "$root/a.dll" "$root/before.dll"
@@ -77,17 +87,16 @@ dll "$root/three.dll" 3 0
 run apply "$root/three.dll"
 check "patches every occurrence" '[ "$rc" = 0 ] && [ "$(sh "$pw" count "$root/three.dll")" = "0 3" ]'
 
-dll "$root/none.dll" 0 0
 run apply "$root/none.dll"
 check "no literal at all fails" '[ "$rc" != 0 ] && grep -q "unexpected state: 0 original and 0 patched" "$root/err"'
 
-dll "$root/mixed.dll" 1 1
 cp "$root/mixed.dll" "$root/mixed.before"
 run apply "$root/mixed.dll"
-check "a mixed state fails and leaves the file as it was" '[ "$rc" != 0 ] && cmp -s "$root/mixed.dll" "$root/mixed.before"'
+check "a mixed state is refused as such, the file left as it was" \
+	'[ "$rc" != 0 ] && grep -q "unexpected state: 1 original and 1 patched" "$root/err" && cmp -s "$root/mixed.dll" "$root/mixed.before"'
 
 run apply "$root/missing.dll"
-check "a missing file fails" '[ "$rc" != 0 ]'
+check "a missing file fails" '[ "$rc" != 0 ] && grep -q "not found" "$root/err"'
 
 name=mode
 dll "$root/m.dll" 1 0
@@ -97,44 +106,25 @@ run apply "$root/m.dll"
 check "the file keeps its inode and mode" \
 	'[ "$(ls -i "$root/m.dll" | awk "{print \$1}")" = "$ino" ] && [ "$(ls -l "$root/m.dll" | cut -c1-10)" = "-rw-r-----" ]'
 
-# A minimal run-helper template: the real one's anchor line, with the
-# listener replaced by a script that records the Worker's counts.
-name=helper
-tpl=$root/run-helper.sh.template
-cat >"$tpl" <<'EOF'
+# A runner directory as GitHub ships it, reduced: run-helper.sh is a copy of
+# run-helper.sh.template (a bash script, as the real one) that starts
+# bin/Runner.Listener. The fake listener records the Worker's counts and
+# whether BASH_ENV reached it.
+rd=$root/runner
+mkdir -p "$rd/bin.2.338.0" "$rd/bin.2.339.0"
+cat >"$rd/run-helper.sh.template" <<'EOF'
 #!/bin/bash
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 "$DIR"/bin/Runner.Listener run $*
-returnCode=$?
-exit $returnCode
+exit $?
 EOF
-cp "$tpl" "$root/tpl.orig"
-run helper "$tpl"
-check "inserts the step" '[ "$rc" = 0 ] && grep -q "inserted" "$root/out"'
-check "exactly one marker, five lines before the listener line" \
-	'[ "$(grep -c "^# lux-gha: point jobs at the Actions cache server" "$tpl")" = 1 ] &&
-	 [ "$(grep -n "^# lux-gha: point jobs" "$tpl" | cut -d: -f1)" -eq "$(($(grep -n "bin/Runner.Listener run" "$tpl" | cut -d: -f1) - 5))" ]'
-check "still valid bash" 'bash -n "$tpl"'
-run helper "$tpl"
-check "inserting again is a no-op" '[ "$rc" = 0 ] && grep -q "already present" "$root/out" && [ "$(grep -c "lux-gha: point jobs" "$tpl")" = 1 ]'
-printf '#!/bin/bash\necho no listener here\n' >"$root/noanchor.tpl"
-run helper "$root/noanchor.tpl"
-check "a template without the anchor fails" '[ "$rc" != 0 ] && grep -q "found 0" "$root/err"'
-cat "$root/tpl.orig" "$root/tpl.orig" >"$root/twice.tpl"
-run helper "$root/twice.tpl"
-check "a template with two anchors fails" '[ "$rc" != 0 ] && grep -q "found 2" "$root/err"'
-
-# Simulated self-update: the runner moves bin to bin.<old>, unpacks the new
-# version into bin.<new>, points bin at it and restarts the listener. The
-# helper step must patch the new Worker before the listener starts.
-name=self-update
-rd=$root/runner
-mkdir -p "$rd/bin.2.338.0" "$rd/bin.2.339.0"
+cp "$rd/run-helper.sh.template" "$root/template.stock"
 listener() {
 	cat >"$1/Runner.Listener" <<EOF
 #!/bin/sh
 sh "$pw" count "\$(dirname "\$0")/Runner.Worker.dll" >"$rd/seen"
+echo "\${BASH_ENV-unset}" >"$rd/bash_env"
 EOF
 	chmod 755 "$1/Runner.Listener"
 }
@@ -143,26 +133,56 @@ listener "$rd/bin.2.339.0"
 dll "$rd/bin.2.338.0/Runner.Worker.dll" 1 0
 dll "$rd/bin.2.339.0/Runner.Worker.dll" 1 0
 ln -s bin.2.338.0 "$rd/bin"
-cp "$tpl" "$rd/run-helper.sh"
-start() { rc=0; env LUXGHA_PATCH_WORKER="$pw" "$@" bash "$rd/run-helper.sh" >"$root/out" 2>"$root/err" || rc=$?; }
-start LUXGHA_ACTIONS_RESULTS_URL=https://cache.example.com
-check "first start: the listener sees a patched Worker" '[ "$(cat "$rd/seen")" = "0 1" ]'
+# start [VAR=value...]: one run.sh loop iteration: copy the template to
+# run-helper.sh and run it, with BASH_ENV as the entrypoint sets it.
+start() {
+	cp -f "$rd/run-helper.sh.template" "$rd/run-helper.sh"
+	chmod 755 "$rd/run-helper.sh"
+	rc=0
+	env LUXGHA_PATCH_WORKER="$pw" "$@" "$rd/run-helper.sh" >"$root/out" 2>"$root/err" || rc=$?
+}
+
+if [ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" -lt 4 ]; then
+	echo "skip [pre-listener] bash 3 does not set \$0 while reading BASH_ENV"
+	echo "patch-worker_test: OK (pre-listener cases skipped)"
+	[ "$failures" -eq 0 ] || { echo "patch-worker_test: $failures failed"; exit 1; }
+	exit 0
+fi
+
+name=pre-listener
+start BASH_ENV="$pl"
+check "the listener sees a patched Worker" '[ "$rc" = 0 ] && [ "$(cat "$rd/seen")" = "0 1" ]'
+check "BASH_ENV does not reach the listener (or the job's steps)" '[ "$(cat "$rd/bash_env")" = unset ]'
+check "the template is not modified" 'cmp -s "$rd/run-helper.sh.template" "$root/template.stock"'
+
+# A self-update unpacks the new version into bin.<new>, points bin at it,
+# and copies the new release's top-level files, run-helper.sh.template
+# included, over the old ones; run.sh then starts run-helper.sh again.
+name=self-update
 rm "$rd/bin" && ln -s bin.2.339.0 "$rd/bin"
+cp -f "$root/template.stock" "$rd/run-helper.sh.template"
 check "after the update the new Worker is unpatched" '[ "$(sh "$pw" count "$rd/bin/Runner.Worker.dll")" = "1 0" ]'
-start LUXGHA_ACTIONS_RESULTS_URL=https://cache.example.com
-check "restart after the update: the listener sees the new Worker patched" '[ "$(cat "$rd/seen")" = "0 1" ]'
+start BASH_ENV="$pl"
+check "the restarted listener sees the new Worker patched" '[ "$(cat "$rd/seen")" = "0 1" ]'
 check "the old version stays as it was" '[ "$(sh "$pw" count "$rd/bin.2.338.0/Runner.Worker.dll")" = "0 1" ]'
 
-name=unset
+name=other-scripts
 dll "$rd/bin.2.339.0/Runner.Worker.dll" 1 0
+printf '#!/bin/bash\n"%s"/bin/Runner.Listener\n' "$rd" >"$rd/run.sh"
+chmod 755 "$rd/run.sh"
+rc=0
+env BASH_ENV="$pl" LUXGHA_PATCH_WORKER="$pw" "$rd/run.sh" >"$root/out" 2>"$root/err" || rc=$?
+check "a bash script other than run-helper.sh patches nothing" '[ "$(cat "$rd/seen")" = "1 0" ] && [ ! -s "$root/err" ]'
+
+name=unset
 start
-check "without LUXGHA_ACTIONS_RESULTS_URL the Worker is left as shipped" '[ "$(cat "$rd/seen")" = "1 0" ] && [ ! -s "$root/err" ]'
+check "without BASH_ENV the Worker is left as shipped" '[ "$(cat "$rd/seen")" = "1 0" ] && [ ! -s "$root/err" ]'
 
 name=unpatchable
 dll "$rd/bin.2.339.0/Runner.Worker.dll" 0 0
-start LUXGHA_ACTIONS_RESULTS_URL=https://cache.example.com
-check "an unpatchable Worker warns once and the listener still starts" \
-	'[ "$(cat "$rd/seen")" = "0 0" ] && grep -q "is not patched; jobs use GitHub" "$root/err"'
+start BASH_ENV="$pl"
+check "an unpatchable Worker: one warning, and the listener still starts" \
+	'[ "$(cat "$rd/seen")" = "0 0" ] && [ "$(grep -c "is not patched; jobs use GitHub" "$root/err")" = 1 ]'
 
 if [ "$failures" -ne 0 ]; then
 	echo "patch-worker_test: $failures failed"

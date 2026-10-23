@@ -142,10 +142,11 @@ cache_url_ok() {
 # LUXGHA_ACTIONS_RESULTS_URL; README "Using the cache server"). A hook the
 # image's own environment already names is kept.
 #
-# The run-helper step patches the Worker whenever LUXGHA_ACTIONS_RESULTS_URL
-# reaches run.sh, and a patched Worker no longer sets GitHub's URL: so the
-# variable reaches it only when our hook is installed and will write the
-# URL. Otherwise it is unset and jobs use GitHub's service.
+# With a usable URL and our hook installed, BASH_ENV names pre-listener.sh,
+# which patches the Worker at every run-helper.sh start (self-updates
+# included). A patched Worker no longer sets GitHub's URL, so the patch
+# happens only when the hook will write ours; otherwise neither the URL nor
+# BASH_ENV reaches run.sh and jobs use GitHub's service.
 setup_hook() {
 	url=${LUXGHA_ACTIONS_RESULTS_URL:-}
 	if [ -n "$url" ] && ! cache_url_ok "$url"; then
@@ -164,8 +165,16 @@ setup_hook() {
 			url=
 		fi
 	fi
+	pre=${LUXGHA_PRE_LISTENER:-/usr/local/lib/lux-gha/pre-listener.sh}
+	if [ -n "$url" ] && [ -n "${BASH_ENV:-}" ]; then
+		echo "lux-gha-runner: warning: BASH_ENV is already set; jobs use GitHub's cache service" >&2
+		url=
+	elif [ -n "$url" ] && [ ! -f "$pre" ]; then
+		echo "lux-gha-runner: warning: no $pre; jobs use GitHub's cache service" >&2
+		url=
+	fi
 	if [ -n "$url" ]; then
-		export LUXGHA_ACTIONS_RESULTS_URL="$url"
+		export LUXGHA_ACTIONS_RESULTS_URL="$url" BASH_ENV="$pre"
 	else
 		unset LUXGHA_ACTIONS_RESULTS_URL
 	fi
