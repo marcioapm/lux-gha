@@ -662,19 +662,20 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
   in each 60 s spent waiting on the client, or the connection is closed.
 - **`downloadURLTTL`** (1 m to 7 d): lifetime of a presigned S3 download URL.
 - **`ttl`** (at least 1 h): entries are deleted this long after they were
-  saved. **`maxBytes`** (0: no cap): the total for entries and uploads in
+  saved.
+- **`maxBytes`** (0: no cap): the total for entries and uploads in
   progress, split into two budgets the reaper enforces separately (see
-  Expiry): 10 % for uploads in progress, 90 % for entries. **`maxEntryBytes`**:
-  the largest archive accepted: default 10 GiB, or 90 % of `maxBytes` if
-  that is smaller, and never more than 90 % of `maxBytes` (the entry
-  budget), so the cap never deletes an entry just saved. It may exceed the
-  10 % upload budget: the newest upload is never trimmed, so the newest
-  upload always completes; the upload budget bounds how many others
-  survive alongside it (a 10 % budget of a 100 GiB cap holds one 10 GiB
-  upload, or ten 1 GiB ones). Size the cap so that the upload budget is at
-  least the number of saves you expect at once times a typical archive
-  size; saves beyond it fail when a pass runs during them.
-  **`reapInterval`** (at least 1 m): how often the reaper runs.
+  Expiry): 10 % for uploads in progress, 90 % for entries. Size it so that
+  the upload budget is at least the number of saves you expect at once
+  times a typical archive size; saves beyond it fail when a pass runs
+  during them (a 10 % budget of a 100 GiB cap holds one 10 GiB upload, or
+  ten 1 GiB ones).
+- **`maxEntryBytes`** (1 B to 5 TiB): the largest archive accepted; default
+  10 GiB, or 90 % of `maxBytes` if that is smaller. It may never exceed
+  90 % of `maxBytes` (the entry budget), so the cap never deletes an entry
+  just saved. It may exceed the upload budget: the newest upload is never
+  trimmed, so it always completes.
+- **`reapInterval`** (at least 1 m): how often the reaper runs.
 
 **Authentication.** Every cache call carries the job's runtime token
 (`ACTIONS_RUNTIME_TOKEN`), a JWT the issuer signs. Its signature (RS256,
@@ -703,13 +704,15 @@ server, bound by HMAC to the repository, scope, key, version and runtime
 token, valid for 6 hours. The client uploads to it with the Azure Blob SDK;
 lux-gha implements the three requests that client sends: one `Put Blob` up
 to 128 MiB, or `Put Block` per 64 MiB block followed by `Put Block List`.
-Every block but the last must be at least 5 MiB, S3's multipart minimum.
-An upload holds at most 10,000 blocks (`400 BlockCountExceedsLimit`). A
-job that saves the same key again reuses its upload: a `Put Blob` discards
-blocks an earlier attempt staged, and blocks count a blob an earlier
-attempt staged toward `maxEntryBytes`.
-`@actions/cache` meets that; BuildKit's `type=gha` cache, which uploads 1 MiB
-blocks, is not supported. Blocks are streamed to S3, never held in memory.
+Every block but the last must be at least 5 MiB, S3's multipart minimum;
+`@actions/cache` meets that, but BuildKit's `type=gha` cache, which uploads
+1 MiB blocks, is not supported. A `Put Blob` is at most 5000 MiB and a
+block at most 4000 MiB (Azure's limits, and never above `maxEntryBytes`),
+and an upload holds at most 10,000 blocks (`400 BlockCountExceedsLimit`).
+A job that saves the same key again reuses its upload: a `Put Blob`
+discards blocks an earlier attempt staged, and a blob an earlier attempt
+staged counts with the blocks toward `maxEntryBytes`. Blocks are streamed
+to S3, never held in memory.
 `FinalizeCacheEntryUpload` checks the uploaded size against `size_bytes`
 and only then makes the entry visible, as one server-side multipart copy
 completed with `If-None-Match: *`. A finalize after another job's entry of
