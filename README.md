@@ -871,7 +871,7 @@ runner image therefore ships `images/runner/patch-worker.sh`:
   `BASH_ENV`, the hook or `pre-listener.sh` is missing, or the URL is not one
   the hook can write. If the Worker
   cannot be patched (a runner version the script does not recognise), the
-  helper step warns and the listener starts anyway; the hook then writes
+  `pre-listener.sh` warns and the listener starts anyway; the hook then writes
   nothing and the job log gets a `::warning::` that the job uses GitHub's
   cache service. Caching falls back, jobs do not fail.
 

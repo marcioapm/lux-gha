@@ -710,7 +710,7 @@ run_case cache-hook-preset LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_ST
 check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh" "$d/runner.env"'
 check "one warning naming both features" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "jobs run without LUX_REGISTRY and the cache server" "$d/err"'
 # Without our hook nothing would write the URL, so the Worker must stay as
-# shipped: run.sh (whose helper step patches) must not see the variable.
+# shipped: run.sh (whose run-helper.sh patches through BASH_ENV) must not see it.
 check "run.sh sees neither LUXGHA_ACTIONS_RESULTS_URL nor BASH_ENV" \
 	'! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env" && ! grep -q "^BASH_ENV=" "$d/runner.env"'
 

@@ -251,7 +251,7 @@ run -e PIN="$pin" --entrypoint sh "$TAG" -euc '
 	# Shipped unpatched: pre-listener.sh patches at every run-helper.sh start.
 	"$pw" check "$PIN" "$RUNNER_DIR/bin/Runner.Worker.dll"
 	echo "Runner.Worker.dll unpatched with $PIN literal(s); pre-listener.sh installed"
-	# A copy patches cleanly, as the helper would.
+	# A copy patches cleanly, as pre-listener.sh would.
 	cp "$RUNNER_DIR/bin/Runner.Worker.dll" /tmp/w.dll
 	"$pw" apply /tmp/w.dll
 	[ "$("$pw" count /tmp/w.dll)" = "0 $PIN" ] || { echo "patched copy counts $("$pw" count /tmp/w.dll)" >&2; exit 1; }

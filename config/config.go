@@ -14,6 +14,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -759,6 +760,14 @@ func checkCacheURL(raw string) error {
 	}
 	if u.Path != "" && u.Path != "/" {
 		return fmt.Errorf("%q must be a scheme and host with no path", raw)
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return fmt.Errorf("%q has an empty port", raw)
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("%q has a port outside 1-65535", raw)
+		}
 	}
 	return nil
 }
