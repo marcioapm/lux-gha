@@ -639,10 +639,12 @@ points that route's jobs at it ([Using the cache server](#using-the-cache-server
   exception for the TCP port of `listen`. Lux always blocks loopback for
   Runs, so `listen` binds the host's private address, not `127.0.0.1`.
   `publicURL`, and every route's `cacheURL`, is an `https://` hostname that
-  resolves to that private address. The runner image trusts the system CA
-  store: use a certificate from a public CA (for example an ACME DNS-01
-  certificate for a name that resolves privately) or add your CA to the
-  image.
+  resolves to that private address. Use a certificate from a public CA, for
+  example a free ACME DNS-01 certificate for a name that resolves privately
+  (the host need not be reachable from the internet): `actions/cache` runs in
+  Node, which trusts its own built-in CA list, not the system store. A
+  private CA would have to be added to the image's store and to
+  `NODE_EXTRA_CA_CERTS` for every job.
 - **`repositoryIDs`**, **`repositoryOwnerIDs`**: numeric GitHub IDs (JSON
   numbers) of the repositories served, or of their owners; at least one list
   must be non-empty. The issuer signs runtime tokens for every repository on
