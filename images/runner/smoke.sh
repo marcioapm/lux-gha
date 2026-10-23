@@ -98,6 +98,17 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	socat -V
 	session-manager-plugin --version
 	aws --version
+	# docker-credential-ecr-login for the image architecture, behind the
+	# lux-gha wrapper, its AWS profile and credential_process.
+	m=$(od -An -tx1 -j18 -N1 /usr/local/bin/docker-credential-ecr-login | tr -d " ")
+	[ "$m" = "$WANT_ELF" ] || { echo "docker-credential-ecr-login ELF machine $m, want $WANT_ELF" >&2; exit 1; }
+	docker-credential-ecr-login -v
+	for f in /usr/local/bin/docker-credential-lux-gha /usr/local/bin/lux-gha-aws-credentials /usr/local/lib/lux-gha/job-started.sh; do
+		[ "$(stat -c "%U %a" "$f")" = "root 755" ] || { echo "$f is $(stat -c "%U %a" "$f"), want root 755" >&2; exit 1; }
+	done
+	grep -qx "credential_process = /usr/local/bin/lux-gha-aws-credentials" /etc/lux-gha/aws-config ||
+		{ echo "/etc/lux-gha/aws-config lacks the credential_process" >&2; exit 1; }
+	echo "registry credential helper, profile and hook installed"
 	# The official Node.js linux-arm64 builds (actions/setup-node) link
 	# libatomic; the image installs it on every architecture.
 	ldconfig -p | grep -q "libatomic.so.1 " || { echo "libatomic.so.1 is missing" >&2; exit 1; }

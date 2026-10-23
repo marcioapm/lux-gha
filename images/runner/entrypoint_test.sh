@@ -344,6 +344,221 @@ check "exits 0" '[ "$rc" = 0 ]'
 check "runner reached" "$reached"
 check "load not attempted without an engine" '[ ! -f "$d/load.args" ]'
 
+# In-region registry. The scripts sit next to the entrypoint in the source
+# tree and at their installed paths inside the image.
+src=$(dirname "$ep")
+locate() { if [ -f "$src/$1" ]; then echo "$src/$1"; else echo "$2"; fi; }
+hook=$(locate job-started.sh /usr/local/lib/lux-gha/job-started.sh)
+wrapper=$(locate docker-credential-lux-gha.sh /usr/local/bin/docker-credential-lux-gha)
+creds=$(locate lux-gha-aws-credentials.sh /usr/local/bin/lux-gha-aws-credentials)
+command -v jq >/dev/null || { echo "entrypoint_test: jq is required (the image has it)" >&2; exit 2; }
+command -v curl >/dev/null || { echo "entrypoint_test: curl is required (the image has it)" >&2; exit 2; }
+token=v1.lux-gha-test-1001-7-0.c2VudGluZWwtdG9rZW4tJCQ$$
+reg=123456789012.dkr.ecr.eu-west-1.amazonaws.com
+
+# Fake curl: records argv and the --config it reads on stdin, then answers
+# the next status in FAKE_CURL (space-separated, the last one repeats) with
+# FAKE_BODY. "refused" execs the real curl, which finds nothing listening.
+cat >"$root/bin/curl" <<'EOF2'
+#!/bin/sh
+out=
+prev=
+for a in "$@"; do
+	printf '%s\n' "$a" >>"$FAKE_CASE_DIR/curl.args"
+	if [ "$prev" = --output ]; then out=$a; fi
+	prev=$a
+done
+cat >>"$FAKE_CASE_DIR/curl.stdin"
+n=$(($(cat "$FAKE_CASE_DIR/curl.count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$FAKE_CASE_DIR/curl.count"
+# shellcheck disable=SC2086 # FAKE_CURL is a list of statuses
+set -- ${FAKE_CURL:-200}
+while [ "$n" -gt 1 ] && [ "$#" -gt 1 ]; do shift; n=$((n - 1)); done
+if [ "$1" = refused ]; then
+	exec /usr/bin/curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 2 -X POST http://127.0.0.1:1/
+fi
+if [ -n "$out" ] && [ "$1" = 200 ]; then printf '%s' "${FAKE_BODY:-}" >"$out"; fi
+# With --output the hook reads the status (--write-out); without it the
+# credentials script reads the body, and --fail turns an error into exit 22.
+if [ -n "$out" ]; then printf '%s' "$1"; exit 0; fi
+[ "$1" = 200 ] || exit 22
+printf '%s' "${FAKE_BODY:-}"
+EOF2
+chmod 755 "$root/bin/curl"
+
+check_no_token() {
+	check "the identity token is in no output and no curl argument" \
+		'! grep -qF "$token" "$d/out" "$d/err" $(ls "$d/curl.args" "$d/runner.env" 2>/dev/null)'
+}
+
+# run_hook NAME [VAR=value...]: run the job-started hook as the runner does
+# (bash -e -o pipefail), with a fresh GITHUB_ENV. Sets d, rc and elapsed.
+run_hook() {
+	name=$1
+	shift
+	d=$root/$name
+	mkdir -p "$d"
+	printf '%s' "$token" >"$d/identity"
+	: >"$d/github_env"
+	start=$(date +%s)
+	rc=0
+	env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" FAKE_CASE_DIR="$d" GITHUB_ENV="$d/github_env" \
+		LUXGHA_REGISTRY_HOST="$reg" LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 LUXGHA_IDENTITY_FILE="$d/identity" \
+		LUXGHA_REGISTRY_WAIT=2 "$@" \
+		timeout -k 2 30 bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
+	elapsed=$(($(date +%s) - start))
+}
+nothing_written='[ ! -s "$d/github_env" ]'
+one_line='[ "$(wc -l <"$d/out")" = 1 ] && [ ! -s "$d/err" ]'
+
+run_hook hook-200-untrusted FAKE_CURL=200 \
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"$reg/gha/1001/pr\",\"trust\":\"untrusted\",\"expiresAt\":\"2026-10-23T13:00:00Z\"}"
+check "exits 0" '[ "$rc" = 0 ]'
+check "GITHUB_ENV gets LUX_REGISTRY and LUX_REGISTRY_PUSH" \
+	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/gha/1001" "$reg/gha/1001/pr")" ]'
+check "one line naming the trust level" '[ "$(cat "$d/out")" = "lux-gha registry: trust=untrusted" ] && [ ! -s "$d/err" ]'
+check "POST to the registry route with the token in a curl config on stdin" \
+	'grep -qx -- "-X" "$d/curl.args" && grep -qx "POST" "$d/curl.args" && grep -qx "http://10.0.0.5:8081/runner/v1/registry" "$d/curl.args" &&
+	 [ "$(cat "$d/curl.stdin")" = "header = \"Authorization: Bearer $token\"" ]'
+check_no_token
+
+run_hook hook-200-read-only FAKE_CURL=200 \
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
+check "exits 0" '[ "$rc" = 0 ]'
+check "GITHUB_ENV gets LUX_REGISTRY only" '[ "$(cat "$d/github_env")" = "LUX_REGISTRY=$reg/gha/1001" ]'
+check "one line naming the trust level" '[ "$(cat "$d/out")" = "lux-gha registry: trust=read-only" ]'
+
+# A body that would inject a second variable, or point at another host.
+for bad in "{\"read\":\"$reg/gha/1001\\nLD_PRELOAD=/tmp/x\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"evil.example.com/gha/1001\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"admin\"}" "not json"; do
+	run_hook hook-200-bad FAKE_CURL=200 FAKE_BODY="$bad"
+	check "exits 0 on a malformed answer" '[ "$rc" = 0 ]'
+	check "writes nothing" "$nothing_written"
+	check "one line" "$one_line"
+done
+
+for status in 204 401 503 500; do
+	run_hook "hook-$status" FAKE_CURL="$status"
+	check "exits 0" '[ "$rc" = 0 ]'
+	check "writes nothing" "$nothing_written"
+	check "asks once" '[ "$(cat "$d/curl.count")" = 1 ]'
+	check "one line with the status" 'grep -qx "lux-gha registry: unavailable (HTTP $status); continuing without it" "$d/out" && [ ! -s "$d/err" ]'
+	check_no_token
+done
+
+run_hook hook-409-always FAKE_CURL=409
+check "exits 0" '[ "$rc" = 0 ]'
+check "writes nothing" "$nothing_written"
+check "retries 409 until LUXGHA_REGISTRY_WAIT (2s) runs out" '[ "$(cat "$d/curl.count")" -ge 2 ] && [ "$elapsed" -ge 2 ] && [ "$elapsed" -le 5 ]'
+check "one line" "$one_line"
+
+run_hook hook-409-then-200 FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT=10 \
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"$reg/gha/1001\",\"trust\":\"trusted\",\"expiresAt\":\"x\"}"
+check "exits 0" '[ "$rc" = 0 ]'
+check "a 409 then a 200 writes both paths" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(wc -l <"$d/github_env")" = 2 ] && grep -qx "LUX_REGISTRY_PUSH=$reg/gha/1001" "$d/github_env"'
+
+run_hook hook-refused FAKE_CURL=refused
+check "exits 0 when nothing listens" '[ "$rc" = 0 ]'
+check "writes nothing" "$nothing_written"
+check "one line with HTTP 000" 'grep -qx "lux-gha registry: unavailable (HTTP 000); continuing without it" "$d/out" && [ ! -s "$d/err" ]'
+
+run_hook hook-no-host LUXGHA_REGISTRY_HOST=
+check "exits 0 without LUXGHA_REGISTRY_HOST" '[ "$rc" = 0 ]'
+check "asks nothing, writes nothing, prints nothing" '[ ! -f "$d/curl.count" ] && [ ! -s "$d/github_env" ] && [ ! -s "$d/out" ] && [ ! -s "$d/err" ]'
+
+run_hook hook-no-identity LUXGHA_IDENTITY_FILE="$root/does-not-exist"
+check "exits 0 without the identity file" '[ "$rc" = 0 ]'
+check "asks nothing, writes nothing" '[ ! -f "$d/curl.count" ] && [ ! -s "$d/github_env" ]'
+
+run_hook hook-github-env-unwritable FAKE_CURL=200 GITHUB_ENV=/proc/version \
+	FAKE_BODY="{\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"trusted\"}"
+check "exits 0 when GITHUB_ENV cannot be written" '[ "$rc" = 0 ]'
+
+# The credential helper wrapper strips the job's AWS environment and hands
+# docker-credential-ecr-login the registry profile only.
+cat >"$root/bin/docker-credential-ecr-login" <<'EOF2'
+#!/bin/sh
+env | grep '^AWS_' | sort >"$FAKE_CASE_DIR/helper.env"
+printf '%s\n' "$@" >"$FAKE_CASE_DIR/helper.args"
+cat >"$FAKE_CASE_DIR/helper.stdin"
+echo '{"Username":"AWS","Secret":"x"}'
+EOF2
+chmod 755 "$root/bin/docker-credential-ecr-login"
+name=wrapper
+d=$root/$name
+mkdir -p "$d"
+rc=0
+echo "$reg" | env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" LUXGHA_REGISTRY_REGION=eu-west-1 \
+	AWS_ACCESS_KEY_ID=job-key AWS_SECRET_ACCESS_KEY=job-secret AWS_SESSION_TOKEN=job-token AWS_PROFILE=job \
+	AWS_ROLE_ARN=arn:aws:iam::123456789012:role/job AWS_WEB_IDENTITY_TOKEN_FILE=/job/token AWS_CONFIG_FILE=/job/config \
+	AWS_SHARED_CREDENTIALS_FILE=/job/credentials AWS_DEFAULT_PROFILE=job AWS_REGION=us-east-1 \
+	sh "$wrapper" get >"$d/out" 2>"$d/err" || rc=$?
+check "exits with the helper's status" '[ "$rc" = 0 ]'
+check "the helper sees exactly the registry profile's AWS env" '[ "$(cat "$d/helper.env")" = "$(printf "%s\n" AWS_CONFIG_FILE=/etc/lux-gha/aws-config AWS_ECR_DISABLE_CACHE=true AWS_PROFILE=lux-gha-registry AWS_REGION=eu-west-1)" ]'
+check "arguments and stdin pass through" '[ "$(cat "$d/helper.args")" = get ] && [ "$(cat "$d/helper.stdin")" = "$reg" ] && grep -q Username "$d/out"'
+
+name="wrapper-no-region"
+d=$root/$name
+mkdir -p "$d"
+rc=0
+env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" sh "$wrapper" get </dev/null >"$d/out" 2>"$d/err" || rc=$?
+check "fails without LUXGHA_REGISTRY_REGION, before the helper" '[ "$rc" = 1 ] && [ ! -f "$d/helper.env" ]'
+
+# credential_process: POSTs the token from the identity file to the
+# credentials route, failing on any HTTP error.
+name=aws-credentials
+d=$root/$name
+mkdir -p "$d"
+printf '%s' "$token" >"$d/identity"
+rc=0
+env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=200 FAKE_BODY='{"Version":1}' LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 \
+	LUXGHA_IDENTITY_FILE="$d/identity" sh "$creds" >"$d/out" 2>"$d/err" || rc=$?
+check "exits 0" '[ "$rc" = 0 ]'
+check "POST to the credentials route with --fail and a timeout" \
+	'grep -qx "http://10.0.0.5:8081/runner/v1/aws-credentials" "$d/curl.args" && grep -qx -- "--fail" "$d/curl.args" && grep -qx -- "--max-time" "$d/curl.args" && grep -qx POST "$d/curl.args"'
+check "token only in the curl config on stdin" '[ "$(cat "$d/curl.stdin")" = "header = \"Authorization: Bearer $token\"" ]'
+check "prints the body for credential_process" '[ "$(cat "$d/out")" = "{\"Version\":1}" ]'
+check_no_token
+
+name=aws-credentials-503
+d=$root/$name
+mkdir -p "$d"
+printf '%s' "$token" >"$d/identity"
+rc=0
+env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=503 LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 \
+	LUXGHA_IDENTITY_FILE="$d/identity" sh "$creds" >"$d/out" 2>"$d/err" || rc=$?
+check "fails on an HTTP error, printing no credentials" '[ "$rc" != 0 ] && [ ! -s "$d/out" ]'
+
+# The entrypoint merges credHelpers into the runner user's Docker config,
+# keeps every other key, and points the runner at the hook.
+existing='{"auths":{"ghcr.io":{"auth":"eDp5"}},"credHelpers":{"other.example.com":"pass"},"currentContext":"default"}'
+mkdir -p "$root/registry-merge/.docker"
+printf '%s\n' "$existing" >"$root/registry-merge/.docker/config.json"
+run_case registry-merge LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$hook"
+check "exits 0" '[ "$rc" = 0 ]'
+check "credHelpers gains the registry host; existing keys are kept" \
+	'[ "$(jq -cS . "$d/.docker/config.json")" = "$(echo "$existing" | jq -cS --arg h "$reg" ".credHelpers[\$h] = \"lux-gha\"")" ]'
+check "ACTIONS_RUNNER_HOOK_JOB_STARTED names the hook" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" "$d/runner.env"'
+check "nothing on stderr" '[ ! -s "$d/err" ]'
+check_no_leak
+
+run_case registry-fresh LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$hook"
+check "exits 0" '[ "$rc" = 0 ]'
+check "a new config holds only credHelpers" '[ "$(jq -c . "$d/.docker/config.json")" = "{\"credHelpers\":{\"$reg\":\"lux-gha\"}}" ]'
+
+mkdir -p "$root/registry-bad-config/.docker"
+printf 'not json\n' >"$root/registry-bad-config/.docker/config.json"
+run_case registry-bad-config LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$hook"
+check "exits 0 and reaches the runner" '[ "$rc" = 0 ] && [ -f "$d/runner.args" ]'
+check "an unparsable config is left as it was" '[ "$(cat "$d/.docker/config.json")" = "not json" ]'
+check "one warning line" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "^lux-gha-runner: warning: " "$d/err"'
+check "no hook without the helper" '! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env"'
+
+run_case registry-unset
+check "exits 0" '[ "$rc" = 0 ]'
+check "without LUXGHA_REGISTRY_HOST: no Docker config and no hook" '[ ! -e "$d/.docker" ] && ! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env"'
+
 if [ "$failures" -ne 0 ]; then
 	echo "entrypoint_test: $failures failed"
 	exit 1
