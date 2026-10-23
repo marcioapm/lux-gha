@@ -156,6 +156,9 @@ type Reconciler struct {
 	wake  chan struct{}
 	// passHook, set only by tests, observes Run entering and leaving a pass.
 	passHook func(enter bool)
+	// searchJoined, set only by tests, observes a caller joining a
+	// repository's search in flight.
+	searchJoined func(repoID int64)
 	// ticker starts Run's interval timer; tests replace it.
 	ticker func(time.Duration) (<-chan time.Time, func())
 

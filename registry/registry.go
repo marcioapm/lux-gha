@@ -442,19 +442,23 @@ func onRunner(j githubapp.WorkflowJob, runner string) bool {
 // findJob confirms the runner's candidate job against GitHub. Without one,
 // or when GitHub contradicts it, it runs the repository's shared fallback
 // search, which publishes candidates for every runner it sees, and confirms
-// the runner's new candidate.
+// the runner's new candidate. A search cut short by its own bound or by
+// this request's end is no GitHub failure: whatever it published is still
+// tried, and otherwise the answer is 409, which the hook retries.
 func (rq *request) findJob(ctx context.Context, repo githubapp.Repository, repoID int64, full string) (githubapp.WorkflowJob, error) {
 	j, tried, ok, err := rq.confirmCandidate(ctx, repo, full)
 	if ok || err != nil {
 		return j, err
 	}
-	if err := rq.s.o.Runners.SearchRunnerJobs(ctx, repo, repoID, rq.github); err != nil {
-		if errors.Is(err, errLimited) || errors.Is(err, errUpstream) {
-			return githubapp.WorkflowJob{}, err
-		}
+	err = rq.s.o.Runners.SearchRunnerJobs(ctx, repo, repoID, rq.github)
+	switch {
+	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, errLimited) || errors.Is(err, errUpstream):
+		return githubapp.WorkflowJob{}, err
+	default:
 		return githubapp.WorkflowJob{}, rq.githubFailed("registry: searching for the runner's job failed", err)
 	}
-	if _, jobID, ok := rq.s.o.Runners.CandidateJob(rq.runner); !ok || jobID == tried {
+	if _, jobID, ok := rq.s.o.Runners.CandidateJob(rq.runner); !ok || jobID == tried || ctx.Err() != nil {
 		return githubapp.WorkflowJob{}, errUnresolved
 	}
 	j, _, ok, err = rq.confirmCandidate(ctx, repo, full)

@@ -117,6 +117,9 @@ type fakeGitHub struct {
 	// fail, when set, may fail an operation on a repository and page (0 for
 	// unpaged operations) after the rate-limit gate.
 	fail func(op, repo string, page int) error
+	// holdRuns, when set, runs before every runs listing, outside the lock,
+	// with the caller's context; its error is the listing's.
+	holdRuns func(ctx context.Context) error
 	// perPage bounds page sizes to exercise paging.
 	perPage int
 	// endlessListing makes installation repository pages claim a next one
@@ -287,7 +290,12 @@ func page[T any](items []T, opts githubapp.PageOptions, perPage int) ([]T, bool)
 	return items[lo:hi], hi < len(items)
 }
 
-func (f *fakeGitHub) ListWorkflowRuns(_ context.Context, repo githubapp.Repository, opts githubapp.WorkflowRunListOptions) (githubapp.WorkflowRunPage, error) {
+func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Repository, opts githubapp.WorkflowRunListOptions) (githubapp.WorkflowRunPage, error) {
+	if f.holdRuns != nil {
+		if err := f.holdRuns(ctx); err != nil {
+			return githubapp.WorkflowRunPage{}, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, err := f.gate(opRuns, repo, opts.Page)

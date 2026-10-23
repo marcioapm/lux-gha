@@ -817,6 +817,93 @@ func TestRegistrySearchIsPerRepositoryAndPublishesEveryRunner(t *testing.T) {
 	}
 }
 
+// The shared search does not run on the context of the request that
+// started it: that request ending (its hook gave up) leaves the search
+// running for the runners waiting on it, which get 200 once it publishes
+// their jobs, and the starter itself gets 409, which its hook retries,
+// never 503.
+func TestRegistrySearchOutlivesTheRequestThatStartedIt(t *testing.T) {
+	l := newListener(t)
+	for _, id := range []int64{7, 8} {
+		l.gh.queue(id, "queued", "self-hosted", "lux")
+		l.gh.describeRun(githubapp.WorkflowRun{ID: id * 10, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	}
+	l.pass()
+	a, b := "lux-gha-t1-1001-7-0", "lux-gha-t1-1001-8-0"
+	for _, p := range [][2]any{{a, int64(7)}, {b, int64(8)}} {
+		if err := l.gh.pick(p[0].(string), p[1].(int64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered, release := make(chan struct{}, 8), make(chan struct{})
+	searchCtx := make(chan error, 8)
+	l.gh.holdRuns = func(ctx context.Context) error {
+		entered <- struct{}{}
+		<-release
+		searchCtx <- ctx.Err()
+		return nil
+	}
+	joined := make(chan int64, 1)
+	l.rec.searchJoined = func(id int64) { joined <- id }
+	ctx, cancel := context.WithCancel(context.Background())
+	post := func(ctx context.Context, runner string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, registry.RegistryPath, nil)
+		req.Header.Set("Authorization", "Bearer "+identity.Token(testIdentityKey, runner))
+		rec := httptest.NewRecorder()
+		l.srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	leader, waiter := make(chan int, 1), make(chan int, 1)
+	go func() { leader <- post(ctx, a).Code }()
+	<-entered // a's request started the search and is inside the first page
+	go func() { waiter <- post(context.Background(), b).Code }()
+	if id := <-joined; id != 1001 {
+		t.Fatalf("b joined the search of repository %d", id)
+	}
+	cancel()
+	if code := <-leader; code != http.StatusConflict {
+		t.Fatalf("cancelled starter: %d, want 409", code)
+	}
+	close(release)
+	if err := <-searchCtx; err != nil {
+		t.Fatalf("the search saw the starter's cancellation: %v", err)
+	}
+	if code := <-waiter; code != http.StatusOK {
+		t.Fatalf("waiter: %d, want 200", code)
+	}
+	if strings.Contains(l.logs.String(), "searching for the runner's job failed") {
+		t.Fatalf("a cancellation logged as a GitHub failure: %s", l.logs)
+	}
+	l.gh.holdRuns = nil
+	if code, _ := l.registry(a); code != http.StatusOK {
+		t.Fatalf("starter's retry: %d", code)
+	}
+}
+
+// A search that runs past searchTime ends with what it published so far:
+// its callers get 409, not 503.
+func TestRegistrySearchTimeoutIs409(t *testing.T) {
+	l := newListener(t)
+	l.gh.queue(7, "queued", "self-hosted", "lux")
+	l.pass()
+	a := "lux-gha-t1-1001-7-0"
+	if err := l.gh.pick(a, 7); err != nil {
+		t.Fatal(err)
+	}
+	l.gh.holdRuns = func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			return errors.New("search without a deadline")
+		}
+		return context.DeadlineExceeded
+	}
+	if code, _ := l.registry(a); code != http.StatusConflict {
+		t.Fatalf("timed-out search: %d, want 409", code)
+	}
+	if strings.Contains(l.logs.String(), "searching for the runner's job failed") {
+		t.Fatalf("a timeout logged as a GitHub failure: %s", l.logs)
+	}
+}
+
 // A search reads at most searchPageBudget pages of runs and jobs together.
 func TestRegistrySearchIsBounded(t *testing.T) {
 	l := newListener(t)

@@ -34,6 +34,10 @@ const (
 	completedTTL = 2 * time.Hour
 	// searchGap spaces a repository's fallback searches.
 	searchGap = 5 * time.Second
+	// searchTime bounds one search. It is detached from the request that
+	// started it, which may be cancelled while others wait on it, and stays
+	// below the job-started hook's 10 s curl budget.
+	searchTime = 8 * time.Second
 	// searchPageBudget bounds the GitHub pages one search reads, runs and
 	// jobs listings together; the runs listing is newest first.
 	searchPageBudget = 2 * maxRunPages
@@ -254,8 +258,10 @@ func (r *Reconciler) NoteRateLimit(err error) {
 // searchPageBudget pages, and publishes every in_progress job on one of
 // this instance's runners as a candidate. A repository is searched at most
 // once per searchGap; concurrent callers share one search and its error.
-// before runs ahead of the first GitHub call, and its error is returned
-// without a search.
+// The search runs for at most searchTime whatever happens to the caller's
+// ctx; every caller, the starter included, stops waiting when its own ctx
+// ends. before runs ahead of the first GitHub call, and its error is
+// returned without a search.
 func (r *Reconciler) SearchRunnerJobs(ctx context.Context, repo githubapp.Repository, repoID int64, before func() error) error {
 	a := r.att
 	if a == nil {
@@ -265,12 +271,10 @@ func (r *Reconciler) SearchRunnerJobs(ctx context.Context, repo githubapp.Reposi
 	a.mu.Lock()
 	if f, ok := a.searching[repoID]; ok {
 		a.mu.Unlock()
-		select {
-		case <-f.done:
-			return f.err
-		case <-ctx.Done():
-			return ctx.Err()
+		if r.searchJoined != nil {
+			r.searchJoined(repoID)
 		}
+		return f.wait(ctx)
 	}
 	if now.Sub(a.searchedAt[repoID]) < searchGap {
 		a.mu.Unlock()
@@ -284,17 +288,30 @@ func (r *Reconciler) SearchRunnerJobs(ctx context.Context, repo githubapp.Reposi
 	a.searching[repoID], a.searchedAt[repoID] = f, now
 	a.mu.Unlock()
 
-	jobs, err := r.searchInProgress(ctx, repo, repoID)
-	r.NoteRateLimit(err)
-	a.mu.Lock()
-	for _, j := range jobs {
-		a.byRunner[*j.RunnerName] = assignment{repository: repo.Owner + "/" + repo.Name, jobID: j.ID, at: now}
+	go func() {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), searchTime)
+		defer cancel()
+		jobs, err := r.searchInProgress(sctx, repo, repoID)
+		r.NoteRateLimit(err)
+		a.mu.Lock()
+		for _, j := range jobs {
+			a.byRunner[*j.RunnerName] = assignment{repository: repo.Owner + "/" + repo.Name, jobID: j.ID, at: now}
+		}
+		f.err = err
+		delete(a.searching, repoID)
+		a.mu.Unlock()
+		close(f.done)
+	}()
+	return f.wait(ctx)
+}
+
+func (f *searchFlight) wait(ctx context.Context) error {
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	f.err = err
-	delete(a.searching, repoID)
-	a.mu.Unlock()
-	close(f.done)
-	return err
 }
 
 // searchInProgress returns the in_progress jobs on this instance's runners
