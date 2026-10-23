@@ -358,6 +358,7 @@ check "load not attempted without an engine" '[ ! -f "$d/load.args" ]'
 src=$(dirname "$ep")
 locate() { if [ -f "$src/$1" ]; then echo "$src/$1"; else echo "$2"; fi; }
 hook=$(locate job-started.sh /usr/local/lib/lux-gha/job-started.sh)
+patcher=$(locate patch-worker.sh /usr/local/lib/lux-gha/patch-worker.sh)
 wrapper=$(locate docker-credential-lux-gha.sh /usr/local/bin/docker-credential-lux-gha)
 creds=$(locate lux-gha-aws-credentials.sh /usr/local/bin/lux-gha-aws-credentials)
 command -v jq >/dev/null || { echo "entrypoint_test: jq is required (the image has it)" >&2; exit 2; }
@@ -596,7 +597,7 @@ check "no hook without the helper" '! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=
 run_case registry-hook-preset LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
 check "exits 0" '[ "$rc" = 0 ]'
 check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh" "$d/runner.env"'
-check "one warning line naming it" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "ACTIONS_RUNNER_HOOK_JOB_STARTED is already set" "$d/err"'
+check "one warning line naming it" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; jobs run without LUX_REGISTRY and the cache server" "$d/err"'
 check "the credential helper is still configured" '[ "$(jq -r --arg h "$reg" ".credHelpers[\$h]" "$d/.docker/config.json")" = lux-gha ]'
 
 run_case registry-no-hook-file LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$root/does-not-exist"
@@ -606,6 +607,91 @@ check "no hook exported when the hook file is absent" '! grep -q "^ACTIONS_RUNNE
 run_case registry-unset
 check "exits 0" '[ "$rc" = 0 ]'
 check "without LUXGHA_REGISTRY_HOST: no Docker config and no hook" '[ ! -e "$d/.docker" ] && ! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env"'
+
+# Cache server (README "Using the cache server"). The hook's cache step needs
+# no registry: run it without the registry variables, against a fake runner
+# directory whose Worker is patched or not.
+command -v perl >/dev/null || { echo "entrypoint_test: perl is required (the image has it)" >&2; exit 2; }
+# worker DIR N M: DIR/bin/Runner.Worker.dll with N original and M patched
+# UTF-16LE ACTIONS_RESULTS_URL literals.
+worker() {
+	mkdir -p "$1/bin"
+	perl -e '
+		my ($f, $n, $m) = @ARGV;
+		my $u = sub { join "", map { $_ . "\0" } split //, shift };
+		my $d = "MZ" . ($u->("ACTIONS_RESULTS_URL") x $n) . ($u->("ACTIONS_RESULTS_ORL") x $m);
+		open(my $fh, ">:raw", $f) or die; print $fh $d; close $fh;
+	' "$1/bin/Runner.Worker.dll" "$2" "$3"
+}
+cache_url=https://cache.example.com
+# run_cache_hook NAME N M [VAR=value...]: the hook as the runner runs it.
+run_cache_hook() {
+	name=$1
+	d=$root/$name
+	mkdir -p "$d"
+	worker "$d/runner" "$2" "$3"
+	shift 3
+	printf '%s' "$token" >"$d/identity"
+	: >"$d/github_env"
+	rc=0
+	env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" FAKE_CASE_DIR="$d" GITHUB_ENV="$d/github_env" \
+		RUNNER_DIR="$d/runner" LUXGHA_PATCH_WORKER="$patcher" "$@" \
+		timeout -k 2 30 bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
+}
+
+run_cache_hook cache-patched 0 1 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
+check "exits 0" '[ "$rc" = 0 ]'
+check "GITHUB_ENV gets ACTIONS_RESULTS_URL" '[ "$(cat "$d/github_env")" = "ACTIONS_RESULTS_URL=$cache_url" ]'
+check "one line naming the server, nothing on stderr" '[ "$(cat "$d/out")" = "lux-gha cache: $cache_url" ] && [ ! -s "$d/err" ]'
+check "no registry request" '[ ! -f "$d/curl.args" ]'
+
+run_cache_hook cache-unpatched 1 0 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
+check "exits 0" '[ "$rc" = 0 ]'
+check "an unpatched Worker: nothing written" "$nothing_written"
+check "a workflow warning saying the job uses GitHub's cache service" \
+	'[ "$(cat "$d/out")" = "::warning::lux-gha: this runner'"'"'s Runner.Worker.dll is not patched; this job uses GitHub'"'"'s cache service" ]'
+
+run_cache_hook cache-no-literal 0 0 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
+check "a Worker without the literal: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
+name=cache-no-worker
+rm -f "$d/runner/bin/Runner.Worker.dll"
+rc=0
+env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" GITHUB_ENV="$d/github_env" RUNNER_DIR="$d/runner" \
+	LUXGHA_PATCH_WORKER="$patcher" LUXGHA_ACTIONS_RESULTS_URL="$cache_url" \
+	bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
+check "a missing Worker: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
+
+for bad in 'https://cache.example.com
+LD_PRELOAD=/tmp/x' 'https://cache.example.com/a b' 'ftp://cache.example.com' 'cache.example.com'; do
+	run_cache_hook cache-bad-url 0 1 LUXGHA_ACTIONS_RESULTS_URL="$bad"
+	check "exits 0 on a malformed URL" '[ "$rc" = 0 ]'
+	check "writes nothing" "$nothing_written"
+	check "one line saying the job uses GitHub's cache service" \
+		'[ "$(wc -l <"$d/out")" = 1 ] && grep -q "uses GitHub'"'"'s cache service" "$d/out"'
+done
+
+run_cache_hook cache-unset 0 1
+check "without LUXGHA_ACTIONS_RESULTS_URL: exits 0, silent, nothing written" \
+	'[ "$rc" = 0 ] && [ ! -s "$d/out" ] && [ ! -s "$d/err" ] && '"$nothing_written"
+
+run_cache_hook cache-and-registry 0 1 LUXGHA_ACTIONS_RESULTS_URL="$cache_url" \
+	LUXGHA_REGISTRY_HOST="$reg" LUXGHA_RUNNER_ENDPOINT=https://gha.example.com LUXGHA_IDENTITY_FILE="$d/identity" \
+	LUXGHA_REGISTRY_WAIT=2 FAKE_CURL=200 \
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
+check "both: GITHUB_ENV gets the cache URL, then the registry" \
+	'[ "$(cat "$d/github_env")" = "$(printf "ACTIONS_RESULTS_URL=%s\nLUX_REGISTRY=%s" "$cache_url" "$reg/acme/widgets")" ]'
+
+# The entrypoint exports the hook for the cache server alone, too.
+run_case cache-hook LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook"
+check "exits 0" '[ "$rc" = 0 ]'
+check "ACTIONS_RUNNER_HOOK_JOB_STARTED names the hook without a registry" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" "$d/runner.env"'
+check "LUXGHA_ACTIONS_RESULTS_URL reaches the runner" 'grep -qx "LUXGHA_ACTIONS_RESULTS_URL=$cache_url" "$d/runner.env"'
+check "no Docker config without a registry" '[ ! -e "$d/.docker" ]'
+check "nothing on stderr" '[ ! -s "$d/err" ]'
+
+run_case cache-hook-preset LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
+check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh" "$d/runner.env"'
+check "one warning naming both features" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "jobs run without LUX_REGISTRY and the cache server" "$d/err"'
 
 if [ "$failures" -ne 0 ]; then
 	echo "entrypoint_test: $failures failed"

@@ -18,7 +18,7 @@
 #
 # With LUXGHA_REGISTRY_HOST set, it then merges a credHelpers entry for that
 # host into the runner user's Docker config and points the runner's
-# job-started hook at job-started.sh: see setup_registry.
+# job-started hook at job-started.sh: see setup_registry and setup_hook.
 set -eu
 
 RUNNER_DIR=${RUNNER_DIR:-/home/runner/actions-runner}
@@ -126,15 +126,26 @@ setup_registry() {
 		return 0
 	fi
 	if [ "$(id -u)" -eq 0 ]; then chown -R "$RUNNER_USER:" "$dir"; fi
+	registry_ready=true
+}
+
+# The job-started hook exports LUX_REGISTRY (when the registry is set up)
+# and points the job at the Actions cache server (when the bridge set
+# LUXGHA_ACTIONS_RESULTS_URL; README "Using the cache server"). A hook the
+# image's own environment already names is kept.
+setup_hook() {
+	[ "$registry_ready" = true ] || [ -n "${LUXGHA_ACTIONS_RESULTS_URL:-}" ] || return 0
 	hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
 	if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
-		echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; LUX_REGISTRY is not exported" >&2
+		echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; jobs run without LUX_REGISTRY and the cache server" >&2
 	elif [ -f "$hook" ]; then
 		export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
 	fi
 }
 
+registry_ready=false
 setup_registry || echo "lux-gha-runner: warning: registry setup failed; jobs run without LUX_REGISTRY" >&2
+setup_hook
 cd "$RUNNER_DIR"
 # run.sh forwards SIGTERM to the listener as SIGINT only with this set; the
 # listener then cancels the running job and uploads its logs before exiting.
