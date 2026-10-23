@@ -137,6 +137,13 @@ cache_url_ok() {
 	case $1 in *[!]A-Za-z0-9:/._~%[-]*) return 1 ;; esac
 }
 
+# no_cache REASON: warn that jobs fall back to GitHub's cache service, and
+# drop the URL so setup_hook neither passes it on nor sets BASH_ENV.
+no_cache() {
+	echo "lux-gha-runner: warning: $1; jobs use GitHub's cache service" >&2
+	url=
+}
+
 # The job-started hook exports LUX_REGISTRY (when the registry is set up)
 # and points the job at the Actions cache server (when the bridge set
 # LUXGHA_ACTIONS_RESULTS_URL; README "Using the cache server"). A hook the
@@ -150,8 +157,7 @@ cache_url_ok() {
 setup_hook() {
 	url=${LUXGHA_ACTIONS_RESULTS_URL:-}
 	if [ -n "$url" ] && ! cache_url_ok "$url"; then
-		echo "lux-gha-runner: warning: LUXGHA_ACTIONS_RESULTS_URL is not a URL the hook can write; jobs use GitHub's cache service" >&2
-		url=
+		no_cache "LUXGHA_ACTIONS_RESULTS_URL is not a URL the hook can write"
 	fi
 	if [ "$registry_ready" = true ] || [ -n "$url" ]; then
 		hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
@@ -161,17 +167,16 @@ setup_hook() {
 		elif [ -f "$hook" ]; then
 			export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
 		elif [ -n "$url" ]; then
-			echo "lux-gha-runner: warning: no job-started hook at $hook; jobs use GitHub's cache service" >&2
-			url=
+			no_cache "no job-started hook at $hook"
 		fi
 	fi
-	pre=${LUXGHA_PRE_LISTENER:-/usr/local/lib/lux-gha/pre-listener.sh}
-	if [ -n "$url" ] && [ -n "${BASH_ENV:-}" ]; then
-		echo "lux-gha-runner: warning: BASH_ENV is already set; jobs use GitHub's cache service" >&2
-		url=
-	elif [ -n "$url" ] && [ ! -f "$pre" ]; then
-		echo "lux-gha-runner: warning: no $pre; jobs use GitHub's cache service" >&2
-		url=
+	if [ -n "$url" ]; then
+		pre=${LUXGHA_PRE_LISTENER:-/usr/local/lib/lux-gha/pre-listener.sh}
+		if [ -n "${BASH_ENV:-}" ]; then
+			no_cache "BASH_ENV is already set"
+		elif [ ! -f "$pre" ]; then
+			no_cache "no $pre"
+		fi
 	fi
 	if [ -n "$url" ]; then
 		export LUXGHA_ACTIONS_RESULTS_URL="$url" BASH_ENV="$pre"
