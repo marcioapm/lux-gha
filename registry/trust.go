@@ -3,13 +3,17 @@ package registry
 import (
 	"context"
 	"errors"
+	"net/http"
 	"path"
 	"time"
 
 	"github.com/marcioapm/lux-gha/githubapp"
 )
 
-var errRepository = errors.New("registry: repository id changed, or its name or default branch is missing")
+var (
+	errRepository = errors.New("registry: repository id changed, or its name or default branch is missing")
+	errNoContents = errors.New("registry: the App lacks Contents read")
+)
 
 // trustedEvents may be trusted when their ref is trusted. Each can run on a
 // tag, so its ref is resolved against both tags and branches. A reusable
@@ -81,12 +85,12 @@ func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, repoID i
 	}
 	tagSHA, isTag, err := s.o.GitHub.TagCommit(ctx, repo, name)
 	if err != nil {
-		return "", false, err
+		return "", false, s.refLookupFailed(repo, repoID, err)
 	}
 	isTag = isTag && tagSHA == sha
 	onBranch, err := s.o.GitHub.BranchContains(ctx, repo, name, sha)
 	if err != nil {
-		return "", false, err
+		return "", false, s.refLookupFailed(repo, repoID, err)
 	}
 	ref := ""
 	switch {
@@ -99,6 +103,25 @@ func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, repoID i
 	s.refs[key] = cachedRef{ref: ref, at: now}
 	s.mu.Unlock()
 	return ref, ref != "", nil
+}
+
+// refLookupFailed turns GitHub's permission refusal of a ref lookup (the
+// App lacks Contents read, or an installation has not accepted it) into
+// errNoContents, logged once per repository as github_permission.
+func (s *Server) refLookupFailed(repo githubapp.Repository, repoID int64, err error) error {
+	var apiErr *githubapp.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden || !apiErr.NotAccessible {
+		return err
+	}
+	s.mu.Lock()
+	logged := s.noContents[repoID]
+	s.noContents[repoID] = true
+	s.mu.Unlock()
+	if !logged {
+		s.o.Log.Warn("registry: GitHub refused a ref lookup: grant the App this read permission", "permission", "Contents",
+			"category", "github_permission", "repository", repo.Owner+"/"+repo.Name)
+	}
+	return errNoContents
 }
 
 func (s *Server) defaultBranch(ctx context.Context, repo githubapp.Repository, repoID int64) (string, error) {

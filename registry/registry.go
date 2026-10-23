@@ -123,7 +123,9 @@ type Server struct {
 	runners map[string]*runnerState
 	repos   map[int64]cachedRepository
 	refs    map[refKey]cachedRef
-	pruned  time.Time
+	// noContents: repository ids whose missing Contents read was logged.
+	noContents map[int64]bool
+	pruned     time.Time
 }
 
 type cachedRepository struct {
@@ -166,7 +168,8 @@ func New(o Options) (*Server, error) {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]cachedRepository{}, refs: map[refKey]cachedRef{}}, nil
+	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]cachedRepository{}, refs: map[refKey]cachedRef{},
+		noContents: map[int64]bool{}}, nil
 }
 
 // Handler serves only the two runner routes.
@@ -426,7 +429,10 @@ func (rq *request) resolve(ctx context.Context, repoID int64) (grant, error) {
 		return grant{}, rq.githubFailed("registry: reading the job's workflow run failed", err, "job", j.ID)
 	}
 	trust, err := s.trust(ctx, repo, repoID, run)
-	if err != nil {
+	switch {
+	case errors.Is(err, errNoContents):
+		return grant{}, errUpstream
+	case err != nil:
 		return grant{}, rq.githubFailed("registry: resolving the trust level failed", err, "job", j.ID)
 	}
 	st.job, st.jobAt = &j, now

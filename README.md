@@ -1067,6 +1067,8 @@ Repository permissions, and nothing else:
 | Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch |
 | Contents | Read-only | With a registry only: resolving a run's ref (`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` and `GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}`, see [Trust levels](#trust-levels)). Without it every trust decision is `503`. |
 
+Upgrading an existing App to use the registry: add **Contents: Read** and accept it on each installation before deploying; until then the runner listener answers `503`, and logs the refusal once per repository as `github_permission`.
+
 Subscribe to the **Workflow job** webhook event. With a registry, its `in_progress` deliveries let the runner listener find a runner's job before the next pass lists it.
 
 Actions and Checks write serve only [When Lux stops a job](#when-lux-stops-a-job).

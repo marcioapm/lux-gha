@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -332,6 +333,38 @@ func TestRegistryRefResolutionIsCachedAndFailsClosed(t *testing.T) {
 	l.gh.fail = nil
 	if code, got := l.registry(c); code != http.StatusOK || got.Trust != "trusted" {
 		t.Fatalf("after recovery: %d %+v", code, got)
+	}
+}
+
+// GitHub refusing a ref lookup for want of Contents read (an App upgraded
+// without accepting it) is 503, logged once per repository as
+// github_permission and not as a generic GitHub failure.
+func TestRegistryRefLookupWithoutContentsReadIs503(t *testing.T) {
+	for _, op := range []string{opTags, opBranch} {
+		t.Run(op, func(t *testing.T) {
+			l := newListener(t)
+			runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+			l.gh.fail = func(o, _ string, _ int) error {
+				return map[bool]error{true: &githubapp.APIError{StatusCode: http.StatusForbidden, NotAccessible: true}}[o == op]
+			}
+			for range 3 {
+				if code, _ := l.registry(runner); code != http.StatusServiceUnavailable {
+					t.Fatalf("status %d", code)
+				}
+			}
+			logs := l.logs.String()
+			if n := strings.Count(logs, "github_permission"); n != 1 || !strings.Contains(logs, "permission=Contents") ||
+				strings.Contains(logs, "resolving the trust level failed") {
+				t.Fatalf("github_permission logged %d times: %s", n, logs)
+			}
+			if n := len(l.sts.requests()); n != 0 {
+				t.Fatalf("sts calls %d", n)
+			}
+			l.gh.fail = nil
+			if code, got := l.registry(runner); code != http.StatusOK || got.Trust != "trusted" {
+				t.Fatalf("after the grant: %d %+v", code, got)
+			}
+		})
 	}
 }
 
@@ -952,8 +985,8 @@ func TestRegistrySearchTimeoutIs409(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.gh.holdRuns = func(ctx context.Context) error {
-		if _, ok := ctx.Deadline(); !ok {
-			return errors.New("search without a deadline")
+		if d, ok := ctx.Deadline(); !ok || time.Until(d) > 8*time.Second {
+			return fmt.Errorf("search deadline %v, want at most 8 s", d)
 		}
 		return context.DeadlineExceeded
 	}
@@ -962,6 +995,54 @@ func TestRegistrySearchTimeoutIs409(t *testing.T) {
 	}
 	if strings.Contains(l.logs.String(), "searching for the runner's job failed") {
 		t.Fatalf("a timeout logged as a GitHub failure: %s", l.logs)
+	}
+}
+
+// A request whose ctx ends while its search runs is answered 409 without
+// reading the candidate the search window published: GitHub is not called
+// on its behalf once its hook has gone.
+func TestRegistryRequestEndedDuringTheSearchIs409(t *testing.T) {
+	l := newListener(t)
+	l.gh.queue(7, "queued", "self-hosted", "lux")
+	l.gh.describeRun(githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	l.pass()
+	a := "lux-gha-t1-1001-7-0"
+	if err := l.gh.pick(a, 7); err != nil {
+		t.Fatal(err)
+	}
+	hook, err := l.rec.Webhook([]byte("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	// Inside the search: a delivery publishes a's candidate, then a's request ends.
+	l.gh.holdRuns = func(context.Context) error {
+		once.Do(func() {
+			if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", a, 7)); err != nil {
+				t.Error(err)
+			}
+			cancel()
+		})
+		return nil
+	}
+	l.ghCalls()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, registry.RegistryPath, nil)
+	req.Header.Set("Authorization", "Bearer "+identity.Token(testIdentityKey, a))
+	rec := httptest.NewRecorder()
+	l.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("request ended during the search: %d, want 409", rec.Code)
+	}
+	if n := l.ghCalls()[opGetJob]; n != 0 {
+		t.Fatalf("candidate read %d times for an ended request", n)
+	}
+	if strings.Contains(l.logs.String(), "candidate job failed") {
+		t.Fatalf("an ended request logged as a GitHub failure: %s", l.logs)
+	}
+	l.gh.holdRuns = nil
+	if code, _ := l.registry(a); code != http.StatusOK {
+		t.Fatalf("hook's retry: %d", code)
 	}
 }
 
