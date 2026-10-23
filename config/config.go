@@ -761,6 +761,9 @@ func checkCacheURL(raw string) error {
 	if u.Path != "" && u.Path != "/" {
 		return fmt.Errorf("%q must be a scheme and host with no path", raw)
 	}
+	if h := u.Hostname(); strings.ContainsAny(h, "[]") || (strings.Contains(u.Host, "[") && net.ParseIP(h) == nil) {
+		return fmt.Errorf("%q: brackets only around an IP address", raw)
+	}
 	if strings.HasSuffix(u.Host, ":") {
 		return fmt.Errorf("%q has an empty port", raw)
 	}

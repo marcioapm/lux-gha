@@ -43,7 +43,7 @@ worker() {
 		(my $p = $d) =~ s/\Q$from\E/$to/g;
 		my $n2 = () = $p =~ /\Q$from\E/g;
 		my $m2 = () = $p =~ /\Q$to\E/g;
-		die "patch did not verify\n" unless $n2 == 0 && $m2 == $n;
+		die "patch did not verify\n" unless length($p) == length($d) && $n2 == 0 && $m2 == $n;
 		seek($fh, 0, 0) or die "seek: $!\n";
 		print $fh $p or die "write: $!\n";
 		close($fh) or die "close: $!\n";
