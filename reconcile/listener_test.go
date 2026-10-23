@@ -916,8 +916,14 @@ func TestRegistrySearchOutlivesTheRequestThatStartedIt(t *testing.T) {
 		t.Fatalf("b joined the search of repository %d", id)
 	}
 	cancel()
-	if code := <-leader; code != http.StatusConflict {
-		t.Fatalf("cancelled starter: %d, want 409", code)
+	// The starter is answered at its cancellation, not when the search ends.
+	select {
+	case code := <-leader:
+		if code != http.StatusConflict {
+			t.Fatalf("cancelled starter: %d, want 409", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled starter still waiting on the search")
 	}
 	close(release)
 	if err := <-searchCtx; err != nil {
