@@ -309,6 +309,13 @@ func TestRouteCacheURLSetsEnvAndEgress(t *testing.T) {
 		t.Fatalf("listed host in another case: egress %v", s.Egress)
 	}
 
+	// The same host as the registry's runner endpoint: one rule.
+	specs = specsByRoute(t, replace(`"repositories"`, registryBlock),
+		replace(`"timeout": "90m", `, `"timeout": "90m", "cacheURL": "https://gha.example.com", `))
+	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {Host: "gha.example.com"}}) {
+		t.Fatalf("cacheURL on the runner endpoint's host: egress %v", s.Egress)
+	}
+
 	// A loopback IP: the env, and no rule (no rule is ever added for an IP).
 	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
 		`"cacheURL": "http://127.0.0.1:8090", "egressHosts": ["github.com"]`))

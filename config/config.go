@@ -742,17 +742,14 @@ const cacheURLChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234
 // checkCacheURL accepts a route's cacheURL: what checkURL accepts, as a
 // scheme and host with an optional trailing "/" (the form of the cache
 // block's publicURL), with a lowercase scheme and only cacheURLChars.
-// checkURL alone passes an empty query or fragment ("?" or "#"), which
-// would survive normalisation.
 func checkCacheURL(raw string) error {
 	if err := checkURL(raw); err != nil {
 		return err
 	}
-	if strings.ContainsAny(raw, "?#") {
-		return fmt.Errorf("%q must not have a query or fragment", raw)
-	}
+	// Also rejects an empty query or fragment ("?" or "#"), which checkURL
+	// passes and normalisation would keep.
 	if strings.Trim(raw, cacheURLChars) != "" {
-		return fmt.Errorf("%q must be ASCII, with no characters outside a URL's", raw)
+		return fmt.Errorf("%q must be ASCII URL characters, with no query or fragment", raw)
 	}
 	u, _ := url.Parse(raw) // checked by checkURL
 	if !strings.HasPrefix(raw, u.Scheme+"://") {

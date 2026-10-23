@@ -144,7 +144,7 @@ start() {
 
 if [ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" -lt 4 ]; then
 	echo "skip [pre-listener] bash 3 does not set \$0 while reading BASH_ENV"
-	echo "patch-worker_test: OK (pre-listener cases skipped)"
+	echo "patch-worker_test: INCOMPLETE: pre-listener and self-update cases need bash 4 or later (make entrypoint-test runs them)"
 	[ "$failures" -eq 0 ] || { echo "patch-worker_test: $failures failed"; exit 1; }
 	exit 0
 fi
