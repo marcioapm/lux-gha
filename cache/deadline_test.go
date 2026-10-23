@@ -242,10 +242,16 @@ func serveAs(h *harness, authz, path string) <-chan *httptest.ResponseRecorder {
 
 // serveFrom is serveAs from the peer host addr.
 func serveFrom(h *harness, addr, authz, path string) <-chan *httptest.ResponseRecorder {
+	return serveFromPort(h, addr, "1000", authz, path)
+}
+
+// serveFromPort is serveFrom from a given source port, so a test can tell
+// the per-address key from a per-connection one.
+func serveFromPort(h *harness, addr, port, authz, path string) <-chan *httptest.ResponseRecorder {
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
-		r.RemoteAddr = net.JoinHostPort(addr, "1000")
+		r.RemoteAddr = net.JoinHostPort(addr, port)
 		if authz != "" {
 			r.Header.Set("Authorization", authz)
 		}
@@ -370,6 +376,10 @@ func TestProxyConcurrencyLimits(t *testing.T) {
 	waitHeld(t, held, 3)
 	if w := recv(t, serveFrom(h, x, "", "/other")); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("tokenless request over its address's limit: %d", w.Code)
+	}
+	// The key is the host, not host:port: a new connection from X is still X.
+	if w := recv(t, serveFromPort(h, x, "2000", "", "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("tokenless request from another port of the same address: %d", w.Code)
 	}
 	if w := recv(t, serveFrom(h, y, "", "/other")); w.Code != http.StatusOK {
 		t.Fatalf("another address during a tokenless flood: %d", w.Code)
