@@ -11,10 +11,14 @@ import (
 // for reuse across concurrent runners (net/http's default keeps 2).
 const maxIdleConnsPerHost = 64
 
-func newTransport() *http.Transport {
-	t := http.DefaultTransport.(*http.Transport).Clone()
+func poolConnections(t *http.Transport) {
 	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
 	t.MaxIdleConns = 4 * maxIdleConnsPerHost
+}
+
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	poolConnections(t)
 	return t
 }
 

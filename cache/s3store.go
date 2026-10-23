@@ -53,10 +53,7 @@ const (
 
 func newS3Store(ctx context.Context, o S3Options) (*s3Store, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(o.Region),
-		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-			t.MaxIdleConnsPerHost = maxIdleConnsPerHost
-			t.MaxIdleConns = 4 * maxIdleConnsPerHost
-		})))
+		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(poolConnections)))
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
