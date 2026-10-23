@@ -599,8 +599,10 @@ image's BuildKit archive into it (a failed load only warns).
 
 ```json
 "cache": {
-  "listen": "0.0.0.0:8090",
-  "publicURL": "https://gha-cache.example.com",
+  "listen": "10.0.1.20:8090",
+  "publicURL": "https://gha-cache.internal.example.com",
+  "tlsCertFile": "/etc/lux-gha/cache-tls/fullchain.pem",
+  "tlsKeyFile": "/etc/lux-gha/cache-tls/privkey.pem",
   "s3": {"bucket": "cache-bucket", "region": "eu-west-1", "prefix": "gha-cache"},
   "signingKeyFile": "/etc/lux-gha/cache-signing-keys",
   "repositoryIDs": [123456789], "repositoryOwnerIDs": [],
@@ -621,6 +623,26 @@ points that route's jobs at it ([Using the cache server](#using-the-cache-server
   **`signingKeyFile`** are required. `publicURL` is a scheme and host with no
   path, HTTPS except on loopback; signed upload URLs are built from it.
   `listen` must differ from the top-level `listen`.
+- **`tlsCertFile`**, **`tlsKeyFile`**: PEM certificate (chain) and private
+  key, both or neither. With them the cache listener serves TLS only
+  (TLS 1.2 or later) and `publicURL` must be `https://`; without them it is
+  plain HTTP. lux-gha refuses to start if the pair does not load. The files
+  are stat'ed at most every 30 s, on a new connection; when either one's
+  modification time or size changes, the pair is reloaded without a
+  restart, so a renewal only has to rewrite the files. A pair that fails to
+  load (for example a certificate written before its key) is logged once and
+  the previous certificate stays in service until the files change again.
+  A `listen` that is not a loopback address without TLS is logged as a
+  warning at startup: every request carries a job's runtime token.
+- **Reaching the listener from Runs.** Runs reach the cache listener over
+  the private network, through Lux's `runners.control_plane_ports`
+  exception for the TCP port of `listen`. Lux always blocks loopback for
+  Runs, so `listen` binds the host's private address, not `127.0.0.1`.
+  `publicURL`, and every route's `cacheURL`, is an `https://` hostname that
+  resolves to that private address. The runner image trusts the system CA
+  store: use a certificate from a public CA (for example an ACME DNS-01
+  certificate for a name that resolves privately) or add your CA to the
+  image.
 - **`repositoryIDs`**, **`repositoryOwnerIDs`**: numeric GitHub IDs (JSON
   numbers) of the repositories served, or of their owners; at least one list
   must be non-empty. The issuer signs runtime tokens for every repository on
@@ -878,8 +900,9 @@ runner image therefore ships `images/runner/patch-worker.sh`:
 Artifacts go through the same variable, so they reach GitHub through the
 cache server's pass-through ([Actions cache](#actions-cache)). The Run must be
 able to reach `cacheURL`: lux-gha adds the egress rule, and the operator
-provides the network path. Lux blocks a Run from reaching the Lux control
-host, so the cache listener must run elsewhere.
+provides the network path: Lux's `runners.control_plane_ports` exception
+for the cache listener's port on the control host's private address, with
+TLS on the listener ([Actions cache](#actions-cache)).
 
 ## In-region image registry
 
