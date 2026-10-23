@@ -128,6 +128,11 @@ func TestProxyProgressDeadline(t *testing.T) {
 	if code == http.StatusOK || took > 1500*time.Millisecond {
 		t.Fatalf("trickle: %d after %v", code, took)
 	}
+	// The upstream's read fails once the proxy aborts the forwarded body.
+	deadline := time.Now().Add(5 * time.Second)
+	for !upstreamErr.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !upstreamErr.Load() {
 		t.Fatal("the upstream read the cut body without an error")
 	}
