@@ -892,8 +892,11 @@ already lists, a signed `in_progress` delivery naming the runner, or a search of
 `in_progress` runs, each confirmed with `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) → its workflow
 run → the trust level below. The search runs at most every 5 s per repository, shared by every runner
 waiting on it, reads at most 20 pages of runs and jobs, and publishes every `in_progress` job it sees on
-this instance's runners, so a sibling runner then needs one job read. A delivery's candidate is kept until a
-pass lists its job completed or on another runner, the runner's Run ends, or 10 minutes pass. While GitHub
+this instance's runners, so a sibling runner then needs one job read. It runs for at most 8 s, within the
+hook's 10 s, and does not stop when the request that started it does; a search cut short answers `409`,
+which the hook retries. A delivery's candidate is kept until a
+pass lists its job completed or on another runner, the runner's Run ends, or 10 minutes pass. A signed
+`completed` delivery ends the runner only when it comes from the runner's own repository. While GitHub
 rate-limits the installation, the listener answers `503` without calling it; a rate limit it meets also
 pauses the reconciler's passes, and the other way round.
 
