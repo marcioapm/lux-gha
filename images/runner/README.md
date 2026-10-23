@@ -125,8 +125,8 @@ Only with `LUXGHA_REGISTRY_HOST` in the Run's env, which the bridge sets when it
   already sets that variable (one warning line). The runner runs the hook before the job's first step. The
   hook POSTs the identity token to `$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry` (curl, 3 s to connect, 10 s
   in all), retries `409` for `LUXGHA_REGISTRY_WAIT` seconds (default 20), and on `200` appends
-  `LUX_REGISTRY` and, when non-empty, `LUX_REGISTRY_PUSH` to `$GITHUB_ENV`, after checking that both are
-  paths under the host. It prints one line, `trust=<level>` or why it continued without, and **always exits 0**.
+  `LUX_REGISTRY` (`<host>/<owner>/<repo>`) and, when non-empty, `LUX_REGISTRY_PUSH` (the same, or
+  `…/pr` for an untrusted job) to `$GITHUB_ENV`, after checking that both are lower-case paths under the host. It prints one line, `trust=<level>` or why it continued without, and **always exits 0**.
 - `docker-credential-lux-gha` unsets the job's `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   `AWS_SESSION_TOKEN`, `AWS_PROFILE`, `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_CONFIG_FILE`,
   `AWS_SHARED_CREDENTIALS_FILE` and `AWS_DEFAULT_PROFILE`, sets `AWS_CONFIG_FILE=/etc/lux-gha/aws-config`,
@@ -140,7 +140,8 @@ The identity token lets any step of the job obtain the job's own registry creden
 access the job already has: the bridge decides it from GitHub's record of the job, not from the token.
 
 `entrypoint_test.sh` covers the merge (existing keys kept, a fresh file, an unparsable file), the hook on
-`200` (both variables, or `LUX_REGISTRY` alone for `read-only`), on malformed answers, on `204`, `401`,
+`200` (both variables, or `LUX_REGISTRY` alone for `read-only`, names with `.`, `_` and `-`), on malformed
+answers (an injected line, another host, an upper-case path, an unknown trust level), on `204`, `401`,
 `500`, `503`, on `409` until the wait runs out and `409` then `200`, on a refused connection, and without
 host or token, each exiting 0 and writing nothing; the wrapper's environment; and the credentials script on
 `200` and `503`. A fake `curl` stands in for the bridge; the token must appear in no output and no argument.

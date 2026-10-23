@@ -835,33 +835,35 @@ write, the check run or the force-cancel is skipped, as for stopped jobs.
 
 With a `registry` block, jobs on lux-gha runners can pull and push container images (an image cache, a
 buildx layer cache) in an ECR registry in the Lux workers' own region, with no credentials in the workflow.
-The bridge decides, for the job a runner is **executing**, what that job may do, and mints short-lived AWS
-credentials scoped to it. Off Lux, or without the block, nothing changes: the variables below are unset.
+The registry is shared: its paths are named like GHCR's, `<owner>/<repo>/…`, and lux-gha is one credential
+broker for it. The bridge decides, for the job a runner is **executing**, what that job may do, and mints
+short-lived AWS credentials scoped to it. Off Lux, or without the block, nothing changes: the variables below
+are unset.
 
 ```json
 "registry": {
   "roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry",
   "region": "eu-west-1",
   "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
-  "repositoryPrefix": "gha",
   "trustedRefs": ["<default branch>", "refs/heads/release/*", "refs/tags/v*"],
-  "runnerListen": "10.0.0.5:8081",
-  "runnerEndpoint": "http://10.0.0.5:8081",
+  "runnerListen": "127.0.0.1:8081",
+  "runnerEndpoint": "https://gha.example.com",
   "identityKeyFile": "/etc/lux-gha/registry-identity-key"
 }
 ```
 
 - **`roleArn`**, **`region`**, **`host`**: the registry role the bridge assumes, and the registry
   (`<account>.dkr.ecr.<region>.amazonaws.com`, in `region`).
-- **`repositoryPrefix`** (default `gha`) and **`trustedRefs`** (default as shown): `<default branch>` is the
-  repository's default branch, read from GitHub; the other entries are `refs/heads/` or `refs/tags/` globs
-  (`path.Match`; `*` does not cross `/`).
-- **`runnerListen`**: the address of the **runner listener**, a server separate from `listen` that serves
-  only the two runner routes below. **`runnerEndpoint`**: the URL Runs use to reach it (scheme, host and
-  port only). It is plain HTTP on a private address in the example: the identity token and the credentials
-  cross that network, so put it on a network only the Runs and the bridge share, or terminate TLS in front of it.
+- **`trustedRefs`** (default as shown): `<default branch>` is the repository's default branch, read from
+  GitHub; the other entries are `refs/heads/` or `refs/tags/` globs (`path.Match`; `*` does not cross `/`).
+- **`runnerListen`**: the address of the **runner listener**, a plain-HTTP server separate from `listen` that
+  serves only the two runner routes below. Keep it on loopback: the bridge logs a warning at startup when it is
+  not, because the listener carries bearer tokens and AWS credentials in clear text.
+- **`runnerEndpoint`**: the URL Runs use to reach the listener (scheme, host and port only). Normally an
+  `https://` public hostname served by a tunnel to `runnerListen` ([Network](#network)).
 - **`identityKeyFile`**: at least 32 random bytes (`head -c 32 /dev/urandom | base64 > …`), read like the
-  other secrets. Changing it invalidates the tokens of Runs already submitted.
+  other secret files; a trailing newline is stripped. There is no environment variable for it. Changing it
+  invalidates the tokens of Runs already submitted.
 - AWS credentials come from the bridge's default chain (on EC2, its instance role).
 
 ### What a Run gets
@@ -870,9 +872,9 @@ Each Run gets a second Lux file secret, `/run/lux-gha/identity`, holding
 `v1.<runner name>.<base64url(HMAC-SHA256(identity key, "v1." + runner name))>`, and the env
 `LUXGHA_IDENTITY_FILE`, `LUXGHA_RUNNER_ENDPOINT`, `LUXGHA_REGISTRY_HOST` and `LUXGHA_REGISTRY_REGION`. The
 token is a function of the runner name, so the `Idempotency-Key` and its replay are unchanged. It is never in
-labels, the command, env or logs. On a route with `egressHosts` (default-deny), the bridge adds one egress
-rule for `runnerEndpoint`'s host: a `/32` (or `/128`) CIDR rule for an IP address, a host rule for a name. An
-`unrestrictedEgress` route gets none.
+labels, the command, env or logs. On a route with `egressHosts` (default-deny), the bridge adds one host
+egress rule for `runnerEndpoint`'s hostname, so the Run can reach the tunnel. An `unrestrictedEgress` route
+gets none, and neither does an endpoint given as an IP address.
 
 The runner image's entrypoint then names `docker-credential-lux-gha` in the runner user's
 `~/.docker/config.json` `credHelpers` for `host` (other keys are kept), which also covers the runner's own
@@ -889,34 +891,38 @@ already lists, a signed `in_progress` delivery naming the runner, or a search of
 `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) → its workflow run → the trust level below.
 
 - `POST /runner/v1/registry` → `200 {"registry", "read", "push", "trust", "expiresAt"}`: `read` is
-  `<host>/<prefix>/<repo id>`; `push` is the same for `trusted`, `…/pr` for `untrusted` and `""` for
-  `read-only`.
+  `<host>/<owner>/<repo>`; `push` is the same for `trusted`, `<host>/<owner>/<repo>/pr` for `untrusted` and
+  `""` for `read-only`. `<owner>` and `<repo>` are the GitHub names of the executing job's repository,
+  lower-cased, as `GET /repos` reports them now (cached 10 minutes), so a renamed repository gets its new
+  path. A name that is not an ECR path component after lower-casing (runs of `a-z`, `0-9` joined by single
+  `.`, `_` or `-`; for example `.github`) gets `401` on both routes and one warning in the log.
 - `POST /runner/v1/aws-credentials` → `200` with AWS `credential_process` JSON
   (`Version`, `AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration`).
 
 | Status | When |
 |---|---|
-| `401` | Missing or bad token, a runner name of another instance, no live Run, or the job has completed |
+| `401` | Missing or bad token, a runner name of another instance, no live Run, the job has completed, or the repository's name is not a registry path |
 | `409` | The Run is live but GitHub does not show a job `in_progress` on the runner yet |
 | `503` | Lux, GitHub or STS failed, or the token exceeded its rate limit (a bucket of 30, refilled at one request per 2 s) |
 | `204` | Reserved for a registry that is not configured; the listener does not run then |
 
 The resolved job is kept per runner (a JIT runner runs one job) and re-read at most once a minute, so a
 completed job is refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with
-`DurationSeconds` 3600, session tags `lux-repo=<repo id>` and `lux-trust=<level>` and session name
-`lux-gha-<repo id>-<job id>-<attempt>`, cached per runner until 5 minutes before they expire. They are never
-logged; each resolution and mint logs one line with the runner, job, event and trust level.
+`DurationSeconds` 3600, session tags `lux-owner=<owner>`, `lux-repo=<repo>` and `lux-trust=<level>`, the
+[session policy](#session-policy) below and session name `lux-gha-<repo id>-<job id>-<attempt>` (at most 64
+characters of `[\w+=,.@-]`), cached per runner until 5 minutes before they expire. They are never logged;
+each resolution and mint logs one line with the runner, job, event and trust level.
 
 ### Trust levels
 
 Decided for the job the runner is executing, from its workflow run's `event`, `head_branch`,
 `head_sha` and `head_repository`; the first row that matches wins.
 
-| Level | Workflow run | Pull `<prefix>/<id>/*` | Push |
+| Level | Workflow run | Pull `<owner>/<repo>/*` | Push |
 |---|---|---|---|
 | `read-only` | `pull_request`, `pull_request_review`, `pull_request_review_comment` from a fork (`head_repository.id` ≠ the repository's) | yes | nothing |
-| `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<prefix>/<id>/*` |
-| `untrusted` | anything else: a same-repository pull request, `pull_request_target`, `merge_group`, a push or dispatch on another branch | yes | `<prefix>/<id>/pr/*` |
+| `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<owner>/<repo>/*` |
+| `untrusted` | anything else: a same-repository pull request, `pull_request_target`, `merge_group`, a push or dispatch on another branch | yes | `<owner>/<repo>/pr/*` |
 | none (`401`/`409`/`503`) | the job cannot be resolved, the Run is not live, the job is not `in_progress` on this runner, or an upstream is down | | |
 
 The API reports a tag push by the tag's name in `head_branch`. A name a trusted `refs/tags/` pattern could
@@ -927,31 +933,68 @@ caller's event. "Trusted" relies on branch and tag protection for the trusted re
 
 ### IAM the operator provides
 
+Only repositories of the GitHub App installation get runners, so only they get credentials.
+
 - **Bridge principal** (the instance role): `sts:AssumeRole` and `sts:TagSession` on the registry role.
 - **Registry role trust policy**: allow the bridge principal `sts:AssumeRole` and `sts:TagSession`, requiring
-  `aws:RequestTag/lux-repo`, `aws:RequestTag/lux-trust` in `trusted`, `untrusted`, `read-only`, and
-  `sts:RoleSessionName` like `lux-gha-*`. Session chaining caps the session at 1 hour.
-- **Registry role permissions**, keyed on `aws:PrincipalTag/lux-repo` and `lux-trust`:
+  `aws:RequestTag/lux-owner`, `aws:RequestTag/lux-repo`, `aws:RequestTag/lux-trust` in `trusted`,
+  `untrusted`, `read-only`, and `sts:RoleSessionName` like `lux-gha-*`. Session chaining caps the session at
+  1 hour.
+- **Registry role permissions**, on `repository/${aws:PrincipalTag/lux-owner}/${aws:PrincipalTag/lux-repo}/*`
+  and keyed on `aws:PrincipalTag/lux-trust`:
   - `ecr:GetAuthorizationToken` on `*`;
-  - pull (`BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability`) on
-    `repository/<prefix>/${aws:PrincipalTag/lux-repo}/*` for every level;
-  - push (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`, and
-    `CreateRepository` if create-on-push needs it) on `…/pr/*` for `untrusted` and `trusted`, and on
-    `…/<repo id>/*` for `trusted` only;
-  - an explicit **Deny** of `BatchGetImage` and `GetDownloadUrlForLayer` on `…/<repo id>/pr/*` when
-    `lux-trust` is `trusted`, so a pull request cannot poison a trusted build's layer cache;
-  - nothing on other repository ids, no deletes, no lifecycle or policy changes.
-- **Repository creation template** for the prefix (create on push), with a lifecycle: untagged images expire
-  after 1 day, images under `<prefix>/*/pr/` after 7 days.
+  - pull (`BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability`) on `…/*` for every level;
+  - push (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`) on `…/pr/*` for
+    `untrusted` and `trusted`, and on `…/*` for `trusted` only;
+  - an explicit **Deny** of `BatchGetImage` and `GetDownloadUrlForLayer` on `…/pr/*` when `lux-trust` is
+    `trusted`, so a pull request cannot poison a trusted build's layer cache;
+  - no `ecr:CreateRepository`, nothing on other owners or repositories, no deletes, no lifecycle or policy
+    changes.
+- **Repositories are created on push by ECR repository creation templates**, one per owner prefix (a
+  template's prefix `acme` covers `acme/…`), applied for `CREATE_ON_PUSH`. Without a template for its owner,
+  a push to a repository that does not exist fails. The template carries the lifecycle policy, by tag:
+  untagged images expire after 1 day; every tag except `v*`, `release-*` and `latest` (pull-request, cache
+  and content-hash tags) after 14 days; `v*` and `release-*` are kept. Templates apply only when ECR
+  creates a repository, so existing repositories keep their own settings.
+
+### Session policy
+
+The bridge also sends an inline session policy with every `AssumeRole`. A session can do only what both the
+role policy and the session policy allow, so the role policy stays the real limit, and the session policy
+keeps a session to its own job's paths even if the role policy is ever broader than above. It names the
+paths literally (partition from `roleArn`, account from `host`). For `acme/widgets`, `trusted`:
+
+```json
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},
+ {"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],
+  "Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/*"},
+ {"Effect":"Allow","Action":["ecr:CompleteLayerUpload","ecr:InitiateLayerUpload","ecr:PutImage","ecr:UploadLayerPart"],
+  "Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/*"},
+ {"Effect":"Deny","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],
+  "Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/pr/*"}]}
+```
+
+`untrusted` has the first two statements and the push statement on `…/acme/widgets/pr/*`, with no Deny;
+`read-only` has the first two only. The bridge sends it without whitespace: about 1 KB for the longest
+GitHub names, under STS's 2048-character limit, which the bridge checks before calling STS.
 
 ### Network
 
-Runs must reach `runnerListen` on the bridge host: the runner security group (or equivalent) must allow the
-Runs' source addresses to that port. The bridge adds the egress rule for default-deny routes (above). Lux
-documents hard blocks that apply even to unrestricted Runs, among them cloud metadata and the control plane
-([Configuration](#configuration)); a bridge on the Lux control host may fall under them. Check from a Run
-(`curl -sS -o /dev/null -w '%{http_code}' -X POST "$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry"` should print
-`401`) before relying on it.
+Runs cannot reach the Lux control host: Lux hard-blocks the control plane for every Run, unrestricted
+egress included ([Configuration](#configuration)), whatever the security groups allow. A bridge on the
+control host is therefore reached through a tunnel, never by a private address:
+
+- `runnerListen` is on loopback, for example `127.0.0.1:8081`;
+- a tunnel (for example `cloudflared`, which may already carry the webhook's public hostname) forwards
+  requests whose path starts with `/runner/v1/` on a public `https://` hostname to `runnerListen`;
+- `runnerEndpoint` is that hostname, for example `https://gha.example.com`. The Run speaks TLS to the
+  tunnel's edge; only the hop from the tunnel's local connector to `runnerListen` is plain HTTP, on loopback.
+
+No security group rule is needed. A default-deny route gets the host egress rule for the hostname (above).
+Check from a Run before relying on it:
+`curl -sS -o /dev/null -w '%{http_code}' -X POST "$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry"` should print
+`401`.
 
 ### Fail-open
 
