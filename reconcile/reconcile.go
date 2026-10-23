@@ -49,6 +49,8 @@ const (
 	JITConfigPath = "/run/lux-gha/jitconfig"
 	JITConfigEnv  = "LUXGHA_JITCONFIG_FILE"
 	jitSecretName = "jitconfig"
+	// CacheURLEnv carries a route's cacheURL to the runner image.
+	CacheURLEnv = "LUXGHA_ACTIONS_RESULTS_URL"
 )
 
 // With a registry configured, each Run also gets its identity token as a
@@ -961,7 +963,14 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		spec.Secrets = append(spec.Secrets, luxclient.FileSecret{Name: identitySecretName, Value: identity.Token(r.identityKey, name), Path: IdentityPath})
 		maps.Copy(spec.Env, map[string]string{IdentityEnv: IdentityPath, RunnerEndpointEnv: g.RunnerEndpoint,
 			RegistryHostEnv: g.Host, RegistryRegionEnv: g.Region})
-		if rule, ok := runnerEndpointRule(g.RunnerEndpoint); ok && !route.UnrestrictedEgress {
+		if rule, ok := egressHostRule(g.RunnerEndpoint); ok && !route.UnrestrictedEgress {
+			spec.Egress = append(spec.Egress, rule)
+		}
+	}
+	if route.CacheURL != "" {
+		spec.Env[CacheURLEnv] = route.CacheURL
+		if rule, ok := egressHostRule(route.CacheURL); ok && !route.UnrestrictedEgress &&
+			!slices.ContainsFunc(spec.Egress, func(e luxclient.EgressRule) bool { return strings.EqualFold(e.Host, rule.Host) }) {
 			spec.Egress = append(spec.Egress, rule)
 		}
 	}
@@ -1000,12 +1009,12 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	return run, nil
 }
 
-// runnerEndpointRule is the host rule that lets a default-deny Run reach the
-// runner endpoint's tunnel hostname. An IP endpoint gets no rule: the
-// documented deployment is a public hostname, and the bridge does not open
-// a Run's egress to an address.
-func runnerEndpointRule(endpoint string) (luxclient.EgressRule, bool) {
-	u, _ := url.Parse(endpoint) // validated by config
+// egressHostRule is the host rule that lets a default-deny Run reach a
+// configured URL: the runner endpoint's tunnel or the route's cache server.
+// An IP host gets no rule: the documented deployment is a public hostname,
+// and the bridge does not open a Run's egress to an address.
+func egressHostRule(rawURL string) (luxclient.EgressRule, bool) {
+	u, _ := url.Parse(rawURL) // validated by config
 	if _, err := netip.ParseAddr(u.Hostname()); err == nil {
 		return luxclient.EgressRule{}, false
 	}

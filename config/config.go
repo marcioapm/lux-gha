@@ -200,6 +200,9 @@ type Route struct {
 	// UnrestrictedEgress turns Lux's egress filtering off for the route's
 	// Runs. Without it, a Run reaches only EgressHosts, and nothing if empty.
 	UnrestrictedEgress bool `json:"unrestrictedEgress"`
+	// CacheURL is the Actions cache server the route's runners use; empty
+	// keeps GitHub's. Stored without a trailing slash.
+	CacheURL string `json:"cacheURL,omitempty"`
 }
 
 var DefaultCommand = []string{"/usr/local/bin/lux-gha-runner"}
@@ -428,6 +431,17 @@ func (c *Config) validate() error {
 		}
 		if r.UnrestrictedEgress && len(r.EgressHosts) > 0 {
 			add("route %q: unrestrictedEgress and egressHosts are mutually exclusive", r.Name)
+		}
+		if r.CacheURL != "" {
+			// checkURL passes an empty query or fragment ("?" or "#"), which
+			// would survive normalisation.
+			if err := checkURL(r.CacheURL); err != nil {
+				add("route %q: cacheURL: %v", r.Name, err)
+			} else if strings.ContainsAny(r.CacheURL, "?#") {
+				add("route %q: cacheURL %q must not have a query or fragment", r.Name, r.CacheURL)
+			} else {
+				r.CacheURL = strings.TrimSuffix(r.CacheURL, "/")
+			}
 		}
 	}
 	// A job requesting the smaller set would satisfy both routes.
