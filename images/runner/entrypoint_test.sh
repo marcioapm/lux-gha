@@ -412,10 +412,10 @@ nothing_written='[ ! -s "$d/github_env" ]'
 one_line='[ "$(wc -l <"$d/out")" = 1 ] && [ ! -s "$d/err" ]'
 
 run_hook hook-200-untrusted FAKE_CURL=200 \
-	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"$reg/gha/1001/pr\",\"trust\":\"untrusted\",\"expiresAt\":\"2026-10-23T13:00:00Z\"}"
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"$reg/acme/widgets/pr\",\"trust\":\"untrusted\",\"expiresAt\":\"2026-10-23T13:00:00Z\"}"
 check "exits 0" '[ "$rc" = 0 ]'
 check "GITHUB_ENV gets LUX_REGISTRY and LUX_REGISTRY_PUSH" \
-	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/gha/1001" "$reg/gha/1001/pr")" ]'
+	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/acme/widgets" "$reg/acme/widgets/pr")" ]'
 check "one line naming the trust level" '[ "$(cat "$d/out")" = "lux-gha registry: trust=untrusted" ] && [ ! -s "$d/err" ]'
 check "POST to the registry route with the token in a curl config on stdin" \
 	'grep -qx -- "-X" "$d/curl.args" && grep -qx "POST" "$d/curl.args" && grep -qx "http://10.0.0.5:8081/runner/v1/registry" "$d/curl.args" &&
@@ -423,15 +423,22 @@ check "POST to the registry route with the token in a curl config on stdin" \
 check_no_token
 
 run_hook hook-200-read-only FAKE_CURL=200 \
-	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
 check "exits 0" '[ "$rc" = 0 ]'
-check "GITHUB_ENV gets LUX_REGISTRY only" '[ "$(cat "$d/github_env")" = "LUX_REGISTRY=$reg/gha/1001" ]'
+check "GITHUB_ENV gets LUX_REGISTRY only" '[ "$(cat "$d/github_env")" = "LUX_REGISTRY=$reg/acme/widgets" ]'
 check "one line naming the trust level" '[ "$(cat "$d/out")" = "lux-gha registry: trust=read-only" ]'
 
-# A body that would inject a second variable, or point at another host.
-for bad in "{\"read\":\"$reg/gha/1001\\nLD_PRELOAD=/tmp/x\",\"push\":\"\",\"trust\":\"trusted\"}" \
-	"{\"read\":\"evil.example.com/gha/1001\",\"push\":\"\",\"trust\":\"trusted\"}" \
-	"{\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"admin\"}" "not json"; do
+run_hook hook-200-dotted-names FAKE_CURL=200 \
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme-corp/my_widgets.go\",\"push\":\"$reg/acme-corp/my_widgets.go\",\"trust\":\"trusted\",\"expiresAt\":\"x\"}"
+check "owner and repo names with . _ - pass through" \
+	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/acme-corp/my_widgets.go" "$reg/acme-corp/my_widgets.go")" ]'
+
+# A body that would inject a second variable, point at another host, or
+# name a path the registry cannot hold (upper case).
+for bad in "{\"read\":\"$reg/acme/widgets\\nLD_PRELOAD=/tmp/x\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"evil.example.com/acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"$reg/Acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"admin\"}" "not json"; do
 	run_hook hook-200-bad FAKE_CURL=200 FAKE_BODY="$bad"
 	check "exits 0 on a malformed answer" '[ "$rc" = 0 ]'
 	check "writes nothing" "$nothing_written"
@@ -454,9 +461,9 @@ check "retries 409 until LUXGHA_REGISTRY_WAIT (2s) runs out" '[ "$(cat "$d/curl.
 check "one line" "$one_line"
 
 run_hook hook-409-then-200 FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT=10 \
-	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/gha/1001\",\"push\":\"$reg/gha/1001\",\"trust\":\"trusted\",\"expiresAt\":\"x\"}"
+	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"$reg/acme/widgets\",\"trust\":\"trusted\",\"expiresAt\":\"x\"}"
 check "exits 0" '[ "$rc" = 0 ]'
-check "a 409 then a 200 writes both paths" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(wc -l <"$d/github_env")" = 2 ] && grep -qx "LUX_REGISTRY_PUSH=$reg/gha/1001" "$d/github_env"'
+check "a 409 then a 200 writes both paths" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(wc -l <"$d/github_env")" = 2 ] && grep -qx "LUX_REGISTRY_PUSH=$reg/acme/widgets" "$d/github_env"'
 
 run_hook hook-refused FAKE_CURL=refused
 check "exits 0 when nothing listens" '[ "$rc" = 0 ]'
@@ -472,7 +479,7 @@ check "exits 0 without the identity file" '[ "$rc" = 0 ]'
 check "asks nothing, writes nothing" '[ ! -f "$d/curl.count" ] && [ ! -s "$d/github_env" ]'
 
 run_hook hook-github-env-unwritable FAKE_CURL=200 GITHUB_ENV=/proc/version \
-	FAKE_BODY="{\"read\":\"$reg/gha/1001\",\"push\":\"\",\"trust\":\"trusted\"}"
+	FAKE_BODY="{\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}"
 check "exits 0 when GITHUB_ENV cannot be written" '[ "$rc" = 0 ]'
 
 # The credential helper wrapper strips the job's AWS environment and hands

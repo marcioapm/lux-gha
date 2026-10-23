@@ -358,12 +358,12 @@ func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := c.Registry
-	if g.RepositoryPrefix != "gha" || !slices.Equal(g.TrustedRefs, []string{"<default branch>", "refs/heads/release/*", "refs/tags/v*"}) ||
+	if !slices.Equal(g.TrustedRefs, []string{"<default branch>", "refs/heads/release/*", "refs/tags/v*"}) ||
 		g.RunnerEndpoint != "http://10.0.0.5:8081" {
 		t.Fatalf("defaults: %+v", g)
 	}
-	c, err = Parse(withRegistry(`"region"`, `"repositoryPrefix": "ci/cache", "trustedRefs": ["refs/heads/main"], "region"`))
-	if err != nil || c.Registry.RepositoryPrefix != "ci/cache" || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/main"}) {
+	c, err = Parse(withRegistry(`"region"`, `"trustedRefs": ["refs/heads/main"], "region"`))
+	if err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/main"}) {
 		t.Fatalf("overrides: %+v err=%v", c.Registry, err)
 	}
 }
@@ -374,7 +374,7 @@ func TestRegistryValidation(t *testing.T) {
 		"bad region":        {`"region": "eu-west-1"`, `"region": "Europe"`, "registry.region"},
 		"host other region": {`dkr.ecr.eu-west-1`, `dkr.ecr.us-east-1`, "registry.host"},
 		"host with scheme":  {`"host": "`, `"host": "https://`, "registry.host"},
-		"bad prefix":        {`"region"`, `"repositoryPrefix": "GHA/", "region"`, "registry.repositoryPrefix"},
+		"removed prefix":    {`"region"`, `"repositoryPrefix": "gha", "region"`, `unknown field "repositoryPrefix"`},
 		"bad ref":           {`"region"`, `"trustedRefs": ["main"], "region"`, "registry.trustedRefs"},
 		"bad glob":          {`"region"`, `"trustedRefs": ["refs/heads/[x"], "region"`, "registry.trustedRefs"},
 		"bad listen":        {`"10.0.0.5:8081",`, `"10.0.0.5",`, "registry.runnerListen"},

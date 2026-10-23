@@ -126,7 +126,7 @@ func headRepo(id int64) *githubapp.HeadRepository { return &githubapp.HeadReposi
 // One case per row of the trust table, decided from the workflow run of the
 // job the runner executes.
 func TestRegistryTrustTable(t *testing.T) {
-	read := regHost + "/gha/1001"
+	read := regHost + "/acme/widgets"
 	for _, tc := range []struct {
 		name  string
 		run   githubapp.WorkflowRun
@@ -171,6 +171,48 @@ func TestRegistryTrustTable(t *testing.T) {
 			reqs := l.sts.requests()
 			if len(reqs) != 1 || tagValue(reqs[0], "lux-trust") != tc.trust {
 				t.Fatalf("sts requests %d, trust tag %q", len(reqs), tagValue(reqs[0], "lux-trust"))
+			}
+		})
+	}
+}
+
+// The path and the lux-owner and lux-repo tags are the repository's current
+// GitHub names, lower-cased.
+func TestRegistryNamesAreLowerCased(t *testing.T) {
+	l := newListener(t)
+	l.gh.repo(widgets).fullName = "ACME-Corp/My_Widgets.Go"
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	code, a := l.registry(runner)
+	want := regHost + "/acme-corp/my_widgets.go"
+	if code != http.StatusOK || a.Read != want || a.Push != want || a.Trust != "trusted" {
+		t.Fatalf("status %d answer %+v", code, a)
+	}
+	reqs := l.sts.requests()
+	if len(reqs) != 1 || tagValue(reqs[0], "lux-owner") != "acme-corp" || tagValue(reqs[0], "lux-repo") != "my_widgets.go" {
+		t.Fatalf("sts requests %+v", reqs)
+	}
+}
+
+// A repository name that is not a registry path component after
+// lower-casing gets no credentials on either route: 401, one log line, no
+// STS call.
+func TestRegistryRefusesNamesOutsideTheRegistryCharacterSet(t *testing.T) {
+	for _, full := range []string{"acme/wídgets", "acme/wid gets", "ac+me/widgets", "acme/.github", "acme/a--b", "acme/widgets-", "acme"} {
+		t.Run(full, func(t *testing.T) {
+			l := newListener(t)
+			l.gh.repo(widgets).fullName = full
+			runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+			token := identity.Token(testIdentityKey, runner)
+			for _, path := range []string{registry.RegistryPath, registry.CredentialsPath, registry.RegistryPath} {
+				if rec := l.post(path, token); rec.Code != http.StatusUnauthorized {
+					t.Fatalf("%s: %d", path, rec.Code)
+				}
+			}
+			if n := len(l.sts.requests()); n != 0 {
+				t.Fatalf("sts calls %d", n)
+			}
+			if got := strings.Count(l.logs.String(), "outside [a-z0-9._-]"); got != 1 {
+				t.Fatalf("refusal logged %d times: %s", got, l.logs)
 			}
 		})
 	}
@@ -230,7 +272,7 @@ func TestRegistryTrustIsTheExecutingJobsNotTheTriggeringJobs(t *testing.T) {
 				hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", a, 8))
 				hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", b, 7))
 			}
-			if _, got := l.registry(a); got.Trust != "untrusted" || got.Push != regHost+"/gha/1001/pr" {
+			if _, got := l.registry(a); got.Trust != "untrusted" || got.Push != regHost+"/acme/widgets/pr" {
 				t.Fatalf("runner provisioned for the main push, running the PR: %+v", got)
 			}
 			if _, got := l.registry(b); got.Trust != "trusted" {
@@ -393,7 +435,7 @@ func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
 	}
 	if aws.ToString(in.RoleArn) != "arn:aws:iam::123456789012:role/lux-gha-registry" || aws.ToInt32(in.DurationSeconds) != 3600 ||
-		!maps.Equal(tags, map[string]string{"lux-repo": "1001", "lux-trust": "untrusted"}) ||
+		!maps.Equal(tags, map[string]string{"lux-owner": "acme", "lux-repo": "widgets", "lux-trust": "untrusted"}) ||
 		aws.ToString(in.RoleSessionName) != "lux-gha-1001-7-1" || in.TransitiveTagKeys != nil || in.Policy != nil {
 		t.Fatalf("AssumeRole input %+v tags %v", in, tags)
 	}

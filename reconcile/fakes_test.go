@@ -56,10 +56,11 @@ type fakeRepo struct {
 	archived, disabled, uninstalled bool
 	checkRuns                       []githubapp.CheckRun
 	forceCancels                    []int64
-	// defaultBranch is GET /repos' default_branch ("main" when empty);
+	// defaultBranch and fullName are GET /repos' default_branch ("main"
+	// when empty) and full_name (the requested owner/name when empty);
 	// tags is GET /repos/.../tags, newest first.
-	defaultBranch string
-	tags          []githubapp.Tag
+	defaultBranch, fullName string
+	tags                    []githubapp.Tag
 }
 
 // Fake GitHub operations, for fail.
@@ -156,7 +157,7 @@ func (f *fakeGitHub) GetRepository(_ context.Context, repo githubapp.Repository)
 	if err != nil {
 		return githubapp.RepositoryInfo{}, err
 	}
-	return githubapp.RepositoryInfo{ID: r.id, FullName: repo.Owner + "/" + repo.Name, DefaultBranch: cmp.Or(r.defaultBranch, "main")}, nil
+	return githubapp.RepositoryInfo{ID: r.id, FullName: cmp.Or(r.fullName, repo.Owner+"/"+repo.Name), DefaultBranch: cmp.Or(r.defaultBranch, "main")}, nil
 }
 
 const opTags = "tags"

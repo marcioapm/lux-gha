@@ -89,21 +89,18 @@ var (
 // Registry configures the in-region image registry credentials that the
 // runner listener hands to Runs.
 type Registry struct {
-	RoleARN          string   `json:"roleArn"`
-	Region           string   `json:"region"`
-	Host             string   `json:"host"`
-	RepositoryPrefix string   `json:"repositoryPrefix"`
-	TrustedRefs      []string `json:"trustedRefs"`
-	RunnerListen     string   `json:"runnerListen"`
-	RunnerEndpoint   string   `json:"runnerEndpoint"`
-	IdentityKeyFile  string   `json:"identityKeyFile"`
+	RoleARN         string   `json:"roleArn"`
+	Region          string   `json:"region"`
+	Host            string   `json:"host"`
+	TrustedRefs     []string `json:"trustedRefs"`
+	RunnerListen    string   `json:"runnerListen"`
+	RunnerEndpoint  string   `json:"runnerEndpoint"`
+	IdentityKeyFile string   `json:"identityKeyFile"`
 }
 
 // DefaultBranchRef in trustedRefs stands for the repository's default
 // branch. It contains a space, so it is never a valid git ref name.
 const DefaultBranchRef = "<default branch>"
-
-const DefaultRepositoryPrefix = "gha"
 
 var DefaultTrustedRefs = []string{DefaultBranchRef, "refs/heads/release/*", "refs/tags/v*"}
 
@@ -247,8 +244,6 @@ var (
 	labelPattern     = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 	roleARNPattern   = regexp.MustCompile(`^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
 	awsRegionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
-	// ECR repository name components: lowercase, separators . _ - between.
-	repoPrefixPattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
 )
 
 func Load(path string) (*Config, error) {
@@ -582,12 +577,6 @@ func (g *Registry) validate(listen string) []error {
 	hostRe := regexp.MustCompile(`^[0-9]{12}\.dkr\.ecr\.` + regexp.QuoteMeta(g.Region) + `\.amazonaws\.com(\.cn)?$`)
 	if !hostRe.MatchString(g.Host) {
 		add("host %q must be <account>.dkr.ecr.%s.amazonaws.com", g.Host, g.Region)
-	}
-	if g.RepositoryPrefix == "" {
-		g.RepositoryPrefix = DefaultRepositoryPrefix
-	}
-	if !repoPrefixPattern.MatchString(g.RepositoryPrefix) {
-		add("repositoryPrefix %q is not an ECR repository name", g.RepositoryPrefix)
 	}
 	if g.TrustedRefs == nil {
 		g.TrustedRefs = slices.Clone(DefaultTrustedRefs)

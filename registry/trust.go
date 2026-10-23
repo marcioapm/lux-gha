@@ -9,7 +9,7 @@ import (
 	"github.com/marcioapm/lux-gha/githubapp"
 )
 
-var errRepository = errors.New("registry: repository id or default branch changed")
+var errRepository = errors.New("registry: repository id changed, or its name or default branch is missing")
 
 // forkEvents are the events whose run from a fork is read-only. A
 // pull_request_target run is not: it runs the base repository's workflow.
@@ -85,23 +85,30 @@ func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, run gith
 }
 
 func (s *Server) defaultBranch(ctx context.Context, repo githubapp.Repository, repoID int64) (string, error) {
+	info, err := s.repository(ctx, repo, repoID)
+	return info.DefaultBranch, err
+}
+
+// repository is GET /repos for the runner's repository, reused for
+// repositoryTTL: its current owner/name and default branch.
+func (s *Server) repository(ctx context.Context, repo githubapp.Repository, repoID int64) (githubapp.RepositoryInfo, error) {
 	now := s.o.Now()
 	s.mu.Lock()
 	d, ok := s.repos[repoID]
 	s.mu.Unlock()
-	if ok && now.Sub(d.at) < defaultBranchTTL {
-		return d.name, nil
+	if ok && now.Sub(d.at) < repositoryTTL {
+		return d.info, nil
 	}
 	info, err := s.o.GitHub.GetRepository(ctx, repo)
 	if err != nil {
-		return "", err
+		return githubapp.RepositoryInfo{}, err
 	}
-	if info.ID != repoID || info.DefaultBranch == "" {
+	if info.ID != repoID || info.DefaultBranch == "" || info.FullName == "" {
 		// A renamed-away or replaced repository: nothing is trusted.
-		return "", errRepository
+		return githubapp.RepositoryInfo{}, errRepository
 	}
 	s.mu.Lock()
-	s.repos[repoID] = defaultBranch{name: info.DefaultBranch, at: now}
+	s.repos[repoID] = cachedRepository{info: info, at: now}
 	s.mu.Unlock()
-	return info.DefaultBranch, nil
+	return info, nil
 }

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -89,8 +89,9 @@ const (
 	// searchGap spaces a runner's fallback job searches, which list the
 	// repository's in_progress runs, while its hook retries.
 	searchGap = 5 * time.Second
-	// defaultBranchTTL bounds how long a repository's default branch is reused.
-	defaultBranchTTL = 10 * time.Minute
+	// repositoryTTL bounds how long a repository's name and default branch
+	// are reused.
+	repositoryTTL = 10 * time.Minute
 	// maxTagPages bounds the tag listing that tells a tag push from a branch push.
 	maxTagPages = 10
 	// Token bucket per runner: burstTokens, refilled at refillPerSecond.
@@ -111,12 +112,12 @@ type Server struct {
 	o       Options
 	mu      sync.Mutex
 	runners map[string]*runnerState
-	repos   map[int64]defaultBranch
+	repos   map[int64]cachedRepository
 	pruned  time.Time
 }
 
-type defaultBranch struct {
-	name string
+type cachedRepository struct {
+	info githubapp.RepositoryInfo
 	at   time.Time
 }
 
@@ -136,10 +137,14 @@ type runnerState struct {
 	creds      *ststypes.Credentials
 }
 
+// grant is what the executing job may do. owner and repo are the
+// repository's lower-cased GitHub names: its registry path and the
+// lux-owner and lux-repo session tags.
 type grant struct {
-	repoID int64
-	trust  string
-	event  string
+	repoID      int64
+	owner, repo string
+	trust       string
+	event       string
 }
 
 func New(o Options) (*Server, error) {
@@ -152,7 +157,7 @@ func New(o Options) (*Server, error) {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]defaultBranch{}}, nil
+	return &Server{o: o, runners: map[string]*runnerState{}, repos: map[int64]cachedRepository{}}, nil
 }
 
 // Handler serves only the two runner routes.
@@ -186,7 +191,7 @@ func (s *Server) serveRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := s.o.Config
-	read := c.Host + "/" + c.RepositoryPrefix + "/" + strconv.FormatInt(g.repoID, 10)
+	read := c.Host + "/" + g.owner + "/" + g.repo
 	push := ""
 	switch g.trust {
 	case Trusted:
@@ -329,6 +334,20 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 	if err != nil {
 		return grant{}, err
 	}
+	// A JIT runner is registered on one repository, so the executing job's
+	// repository is the runner's: its current names come from GET /repos.
+	info, err := s.repository(ctx, repo, repoID)
+	if err != nil {
+		log.Warn("registry: reading the runner's repository failed", "error", err)
+		return grant{}, errUpstream
+	}
+	regOwner, regRepo, ok := registryNames(info.FullName)
+	if !ok {
+		// Refused for the rest of the runner's life, so logged once.
+		st.finished = true
+		log.Warn("registry: repository name has characters outside [a-z0-9._-]; no credentials", "repository", info.FullName, "job", j.ID)
+		return grant{}, errUnauthorized
+	}
 	run, err := s.o.GitHub.GetWorkflowRun(ctx, repo, j.RunID)
 	if err != nil {
 		log.Warn("registry: reading the job's workflow run failed", "job", j.ID, "error", err)
@@ -340,7 +359,7 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 		return grant{}, errUpstream
 	}
 	st.job, st.jobAt = &j, now
-	st.grant = grant{repoID: repoID, trust: trust, event: run.Event}
+	st.grant = grant{repoID: repoID, owner: regOwner, repo: regRepo, trust: trust, event: run.Event}
 	log.Info("registry: runner resolved", "repository", full, "job", j.ID, "workflowRun", j.RunID, "event", run.Event, "trust", trust)
 	return st.grant, nil
 }
@@ -393,7 +412,8 @@ func (s *Server) credentials(ctx context.Context, st *runnerState, runner string
 		RoleSessionName: aws.String(SessionName(g.repoID, st.job.ID, st.job.RunAttempt)),
 		DurationSeconds: aws.Int32(int32(SessionDuration / time.Second)),
 		Tags: []ststypes.Tag{
-			{Key: aws.String("lux-repo"), Value: aws.String(strconv.FormatInt(g.repoID, 10))},
+			{Key: aws.String("lux-owner"), Value: aws.String(g.owner)},
+			{Key: aws.String("lux-repo"), Value: aws.String(g.repo)},
 			{Key: aws.String("lux-trust"), Value: aws.String(g.trust)},
 		},
 	})
@@ -415,4 +435,19 @@ func (s *Server) credentials(ctx context.Context, st *runnerState, runner string
 func SessionName(repoID, jobID, attempt int64) string {
 	n := fmt.Sprintf("lux-gha-%d-%d-%d", repoID, jobID, attempt)
 	return n[:min(len(n), 64)]
+}
+
+// registryComponent is the shape ECR requires of a repository name
+// component: lower-case alphanumeric runs joined by single '.', '_' or '-'.
+// A GitHub name outside it (".github", "a--b") could not be pushed to.
+var registryComponent = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+
+// registryNames lower-cases owner/name and reports whether both are
+// registry path components.
+func registryNames(full string) (owner, repo string, ok bool) {
+	owner, repo, found := strings.Cut(strings.ToLower(full), "/")
+	if !found || !registryComponent.MatchString(owner) || !registryComponent.MatchString(repo) {
+		return "", "", false
+	}
+	return owner, repo, true
 }
