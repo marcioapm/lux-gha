@@ -239,6 +239,26 @@ run --network none $bk_env -e WANT_ARCH="$arch" \
 	echo "buildkit.tar: moby/buildkit:$BK_VERSION and :buildx-stable-1 -> $BK_INDEX, linux/$WANT_ARCH $BK_MANIFEST, $(stat -c %s "$a") bytes; blobs verified"
 '
 
+echo "== cache server patch (README \"Using the cache server\")"
+pin=$(containerfile_arg RUNNER_RESULTS_URL_LITERALS)
+# shellcheck disable=SC2016 # the script expands inside the container
+run -e PIN="$pin" --entrypoint sh "$TAG" -euc '
+	pw=/usr/local/lib/lux-gha/patch-worker.sh
+	[ "$(stat -c "%U %a" "$pw")" = "root 755" ] || { echo "$pw is $(stat -c "%U %a" "$pw"), want root 755" >&2; exit 1; }
+	# Shipped unpatched: the helper patches before each listener start.
+	"$pw" check "$PIN" "$RUNNER_DIR/bin/Runner.Worker.dll"
+	t=$RUNNER_DIR/run-helper.sh.template
+	[ "$(grep -c "^# lux-gha: point jobs at the Actions cache server" "$t")" = 1 ] || { echo "$t lacks the patch step" >&2; exit 1; }
+	bash -n "$t"
+	echo "Runner.Worker.dll unpatched with $PIN literal(s); run-helper.sh.template has the patch step"
+	# A copy patches cleanly, as the helper would.
+	cp "$RUNNER_DIR/bin/Runner.Worker.dll" /tmp/w.dll
+	"$pw" apply /tmp/w.dll
+	[ "$("$pw" count /tmp/w.dll)" = "0 $PIN" ] || { echo "patched copy counts $("$pw" count /tmp/w.dll)" >&2; exit 1; }
+' || fail "cache server patch"
+run -i --entrypoint sh "$TAG" -s /usr/local/lib/lux-gha/patch-worker.sh <"$dir/patch-worker_test.sh" ||
+	fail "patch-worker test"
+
 echo "== entrypoint lifecycle (entrypoint_test.sh against the installed entrypoint)"
 run -i --entrypoint sh "$TAG" -s /usr/local/bin/lux-gha-runner <"$dir/entrypoint_test.sh" ||
 	fail "entrypoint lifecycle test"
