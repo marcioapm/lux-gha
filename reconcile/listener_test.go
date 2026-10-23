@@ -77,9 +77,24 @@ func newListener(t *testing.T) *listener {
 }
 
 func (l *listener) post(path, token string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, path, nil)
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		token = "Bearer " + token
+	}
+	return l.postHeader(path, token)
+}
+
+// postAuth sends "Bearer <token>", or the rest of a "raw:" token verbatim.
+func (l *listener) postAuth(path, token string) *httptest.ResponseRecorder {
+	if raw, ok := strings.CutPrefix(token, "raw:"); ok {
+		return l.postHeader(path, raw)
+	}
+	return l.post(path, token)
+}
+
+func (l *listener) postHeader(path, authorization string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
 	}
 	rec := httptest.NewRecorder()
 	l.srv.Handler().ServeHTTP(rec, req)
@@ -342,9 +357,10 @@ func tagValue(in *sts.AssumeRoleInput, key string) string {
 }
 
 // The Run was provisioned for job A (a push on main); its runner executes
-// job B (a pull request from a branch). The trust is B's, both through a
-// pass's listing and through a signed in_progress delivery, and the other
-// way round.
+// job B (a pull request from a branch). The trust is B's, through a pass's
+// listing, a signed in_progress delivery or the fallback search, and the
+// other way round. In the pass and delivery cases the search cannot answer,
+// so the candidate is what resolves the runner.
 func TestRegistryTrustIsTheExecutingJobsNotTheTriggeringJobs(t *testing.T) {
 	for _, via := range []string{"pass", "delivery", "search"} {
 		t.Run(via, func(t *testing.T) {
@@ -371,6 +387,11 @@ func TestRegistryTrustIsTheExecutingJobsNotTheTriggeringJobs(t *testing.T) {
 				}
 				hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", a, 8))
 				hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", b, 7))
+			}
+			if via != "search" {
+				l.gh.fail = func(op, _ string, _ int) error {
+					return map[bool]error{true: &githubapp.APIError{StatusCode: http.StatusBadGateway}}[op == opRuns]
+				}
 			}
 			if _, got := l.registry(a); got.Trust != "untrusted" || got.Push != regHost+"/acme/widgets/pr" {
 				t.Fatalf("runner provisioned for the main push, running the PR: %+v", got)
@@ -402,6 +423,8 @@ func TestRegistryRefusesWhatItCannotAttribute(t *testing.T) {
 		want  int
 	}{
 		"no token":           {"", http.StatusUnauthorized},
+		"no Bearer scheme":   {"raw:" + identity.Token(testIdentityKey, runner), http.StatusUnauthorized},
+		"basic scheme":       {"raw:Basic " + identity.Token(testIdentityKey, runner), http.StatusUnauthorized},
 		"bad hmac":           {identity.Token([]byte("some-other-key-some-other-key-xx"), runner), http.StatusUnauthorized},
 		"truncated token":    {identity.Token(testIdentityKey, runner)[:40], http.StatusUnauthorized},
 		"other instance":     {identity.Token(testIdentityKey, "lux-gha-t2-1001-7-0"), http.StatusUnauthorized},
@@ -410,7 +433,7 @@ func TestRegistryRefusesWhatItCannotAttribute(t *testing.T) {
 		"job not picked yet": {identity.Token(testIdentityKey, idle), http.StatusConflict},
 	} {
 		for _, path := range []string{registry.RegistryPath, registry.CredentialsPath} {
-			if rec := l.post(path, tc.token); rec.Code != tc.want {
+			if rec := l.postAuth(path, tc.token); rec.Code != tc.want {
 				t.Errorf("%s %s: %d, want %d", name, path, rec.Code, tc.want)
 			}
 		}
@@ -419,12 +442,21 @@ func TestRegistryRefusesWhatItCannotAttribute(t *testing.T) {
 		t.Fatal("STS called for a refused request")
 	}
 	// The listener serves nothing else.
-	for _, req := range []*http.Request{httptest.NewRequest(http.MethodGet, registry.RegistryPath, nil), httptest.NewRequest(http.MethodPost, "/status", nil)} {
+	for _, tc := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, registry.RegistryPath, http.StatusMethodNotAllowed},
+		{http.MethodGet, registry.CredentialsPath, http.StatusMethodNotAllowed},
+		{http.MethodPost, "/status", http.StatusNotFound},
+		{http.MethodPost, "/webhook", http.StatusNotFound},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("Authorization", "Bearer "+identity.Token(testIdentityKey, runner))
 		rec := httptest.NewRecorder()
 		l.srv.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
-			t.Fatalf("%s %s: %d", req.Method, req.URL.Path, rec.Code)
+		if rec.Code != tc.want {
+			t.Fatalf("%s %s: %d, want %d", tc.method, tc.path, rec.Code, tc.want)
 		}
 	}
 	if code, _ := l.registry(runner); code != http.StatusOK {
@@ -480,7 +512,13 @@ func TestRegistryRefusesAfterTheJobOrRunEnds(t *testing.T) {
 }
 
 func TestRegistryUpstreamDownIs503(t *testing.T) {
-	for _, down := range []string{"lux", "github job", "github run", "github repository", "sts"} {
+	for down, logged := range map[string]string{
+		"lux":               "registry: reading the runner's Lux Run failed",
+		"github job":        "registry: reading the runner's candidate job failed",
+		"github run":        "registry: reading the job's workflow run failed",
+		"github repository": "registry: reading the runner's repository failed",
+		"sts":               "registry: assuming the registry role failed",
+	} {
 		t.Run(down, func(t *testing.T) {
 			l := newListener(t)
 			runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
@@ -506,7 +544,7 @@ func TestRegistryUpstreamDownIs503(t *testing.T) {
 			if code, _ := l.registry(runner); code != http.StatusOK {
 				t.Fatalf("after recovery: %d", code)
 			}
-			if !strings.Contains(l.logs.String(), "registry:") || strings.Contains(l.logs.String(), "SECRET-ACCESS-KEY") {
+			if !strings.Contains(l.logs.String(), logged) || strings.Contains(l.logs.String(), "SECRET-ACCESS-KEY") {
 				t.Fatalf("logs: %s", l.logs)
 			}
 		})
@@ -782,8 +820,8 @@ func TestDeliveryCandidatesOutliveLaggingPasses(t *testing.T) {
 			}
 			e.clock.Add(time.Second)
 			e.pass() // job 7 still listed queued
-			if as, ok := e.rec.RunnerAssignment(a); !ok || as.JobID != 7 {
-				t.Fatalf("delivery candidate dropped by a lagging pass: %+v %v", as, ok)
+			if _, job, ok := e.rec.CandidateJob(a); !ok || job != 7 {
+				t.Fatalf("delivery candidate dropped by a lagging pass: %d %v", job, ok)
 			}
 			switch end {
 			case "job completed":
@@ -799,9 +837,172 @@ func TestDeliveryCandidatesOutliveLaggingPasses(t *testing.T) {
 			case "ttl":
 				e.clock.Add(assignmentTTL + time.Second)
 			}
-			if as, ok := e.rec.RunnerAssignment(a); ok {
-				t.Fatalf("candidate kept after %s: %+v", end, as)
+			if _, job, ok := e.rec.CandidateJob(a); ok {
+				t.Fatalf("candidate kept after %s: job %d", end, job)
 			}
 		})
+	}
+}
+
+// A candidate GitHub contradicts is never used: one on another runner
+// sends the listener to the search, which finds the runner's own job; one
+// GitHub shows completed on the runner ends it with 401.
+func TestRegistryConfirmsEveryCandidate(t *testing.T) {
+	t.Run("another runner's job", func(t *testing.T) {
+		l := newListener(t)
+		l.gh.queue(7, "queued", "self-hosted", "lux")
+		l.gh.queue(8, "queued", "self-hosted", "lux")
+		l.gh.describeRun(githubapp.WorkflowRun{ID: 70, Event: "pull_request", HeadBranch: str("feature"), HeadRepository: headRepo(1001)})
+		l.gh.describeRun(githubapp.WorkflowRun{ID: 80, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+		l.pass()
+		a, b := "lux-gha-t1-1001-7-0", "lux-gha-t1-1001-8-0"
+		if err := l.gh.pick(a, 7); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.gh.pick(b, 8); err != nil {
+			t.Fatal(err)
+		}
+		hook, err := l.rec.Webhook([]byte("s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A stale or mis-keyed delivery names a on b's trusted job 8.
+		if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", a, 8)); err != nil {
+			t.Fatal(err)
+		}
+		if code, got := l.registry(a); code != http.StatusOK || got.Trust != "untrusted" {
+			t.Fatalf("a: %d %+v", code, got)
+		}
+		if s := aws.ToString(l.sts.requests()[0].RoleSessionName); s != "lux-gha-1001-7-1" {
+			t.Fatalf("session %q, want job 7", s)
+		}
+	})
+	t.Run("completed on the runner", func(t *testing.T) {
+		l := newListener(t)
+		runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+		l.pass()
+		if _, job, ok := l.rec.CandidateJob(runner); !ok || job != 7 {
+			t.Fatalf("candidate %d %v", job, ok)
+		}
+		l.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion = "completed", "success" })
+		for _, path := range []string{registry.RegistryPath, registry.CredentialsPath} {
+			if rec := l.post(path, identity.Token(testIdentityKey, runner)); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: %d", path, rec.Code)
+			}
+		}
+		if n := len(l.sts.requests()); n != 0 {
+			t.Fatalf("sts calls %d", n)
+		}
+	})
+	t.Run("candidate gone", func(t *testing.T) {
+		l := newListener(t)
+		runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+		hook, err := l.rec.Webhook([]byte("s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Job 99 does not exist: 404, then the search finds job 7.
+		if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", runner, 99)); err != nil {
+			t.Fatal(err)
+		}
+		if code, got := l.registry(runner); code != http.StatusOK || got.Trust != "trusted" {
+			t.Fatalf("%d %+v", code, got)
+		}
+	})
+}
+
+// GET /repos answering another id for the runner's owner/name (the
+// repository was renamed away and the name reused) is 503: no credentials
+// carry the other repository's names.
+func TestRegistryRefusesAReplacedRepository(t *testing.T) {
+	l := newListener(t)
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	l.gh.mu.Lock()
+	l.gh.repos[widgets].id = 3003
+	l.gh.mu.Unlock()
+	if code, _ := l.registry(runner); code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", code)
+	}
+	if n := len(l.sts.requests()); n != 0 {
+		t.Fatalf("sts calls %d", n)
+	}
+}
+
+// A rename shows in the registry path once the repository TTL (10 min)
+// has passed, and not before.
+func TestRegistryRepositoryNamesRefreshAfterTheirTTL(t *testing.T) {
+	l := newListener(t)
+	main := githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)}
+	a := l.provisionAndRun(7, main)
+	if _, got := l.registry(a); got.Read != regHost+"/acme/widgets" {
+		t.Fatalf("a: %+v", got)
+	}
+	l.gh.repo(widgets).fullName = "acme/gadgets"
+	l.clock.Add(10*time.Minute - searchGap)
+	b := l.provisionAndRun(8, main)
+	if _, got := l.registry(b); got.Read != regHost+"/acme/widgets" {
+		t.Fatalf("within the TTL: %+v", got)
+	}
+	l.clock.Add(searchGap) // also past the repository search gap
+	c := l.provisionAndRun(9, main)
+	if _, got := l.registry(c); got.Read != regHost+"/acme/gadgets" {
+		t.Fatalf("after the TTL: %+v", got)
+	}
+}
+
+// The search publishes in_progress jobs only, and reads every page of
+// in_progress runs within its budget.
+func TestRegistrySearchSkipsCompletedJobsAndPagesRuns(t *testing.T) {
+	t.Run("completed job in a running run", func(t *testing.T) {
+		l := newListener(t)
+		runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+		l.gh.queueIn(widgets, 70, 71, "queued", "other")
+		l.gh.pickElsewhere(widgets, 71, 9001, "elsewhere")
+		l.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion = "completed", "success" })
+		if code, _ := l.registry(runner); code != http.StatusConflict {
+			t.Fatalf("status %d", code)
+		}
+		if _, job, ok := l.rec.CandidateJob(runner); ok {
+			t.Fatalf("search published completed job %d", job)
+		}
+	})
+	t.Run("job on the third page of runs", func(t *testing.T) {
+		l := newListener(t)
+		for i := int64(1); i <= 4; i++ {
+			l.gh.queueIn(widgets, i, 100+i, "queued", "other")
+			l.gh.pickElsewhere(widgets, 100+i, 9000+i, "elsewhere-"+strconv.FormatInt(i, 10))
+		}
+		runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+		if code, got := l.registry(runner); code != http.StatusOK || got.Trust != "trusted" {
+			t.Fatalf("%d %+v", code, got)
+		}
+	})
+}
+
+// The hook and the credential helper call at once for one runner: one
+// job resolution and one STS session serve them all.
+func TestRegistryConcurrentRequestsForOneRunner(t *testing.T) {
+	l := newListener(t)
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	token := identity.Token(testIdentityKey, runner)
+	l.ghCalls()
+	const n = 16
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = l.post([]string{registry.RegistryPath, registry.CredentialsPath}[i%2], token).Code
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("request %d: %d", i, c)
+		}
+	}
+	if calls := l.ghCalls(); calls[opGetRun] != 1 || len(l.sts.requests()) != 1 {
+		t.Fatalf("github %v, sts %d", calls, len(l.sts.requests()))
 	}
 }

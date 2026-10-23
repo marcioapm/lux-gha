@@ -187,8 +187,17 @@ reached='[ -f "$d/runner.args" ]'
 not_reached='[ ! -f "$d/runner.args" ]'
 
 if [ "$root_case" = sigterm-root ]; then
-	run_case sigterm-root FAKE_RUN=await-term FAKE_TERM=1 RUNNER_USER=ubuntu
+	reg=123456789012.dkr.ecr.eu-west-1.amazonaws.com
+	ubuntu_home=$(getent passwd ubuntu | cut -d: -f6)
+	rm -rf "$ubuntu_home/.docker"
+	run_case sigterm-root FAKE_RUN=await-term FAKE_TERM=1 RUNNER_USER=ubuntu \
+		LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$(dirname "$ep")/job-started.sh"
 	check "exits 0 through setpriv" '[ "$rc" = 0 ]'
+	check "the runner user's Docker config names the helper" \
+		'[ "$(jq -c . "$ubuntu_home/.docker/config.json")" = "{\"credHelpers\":{\"$reg\":\"lux-gha\"}}" ]'
+	check "the runner user owns its Docker config" \
+		'[ "$(stat -c %u "$ubuntu_home/.docker")" = 1000 ] && [ "$(stat -c %u "$ubuntu_home/.docker/config.json")" = 1000 ]'
+	check "ACTIONS_RUNNER_HOOK_JOB_STARTED names the hook" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$(dirname "$ep")/job-started.sh" "$d/runner.env"'
 	check "RUNNER_MANUALLY_TRAP_SIG is set for run.sh" 'grep -qx "RUNNER_MANUALLY_TRAP_SIG=1" "$d/runner.env"'
 	check "SIGTERM reached run.sh's trap" '[ "$(cat "$d/term" 2>/dev/null)" = TERM ]'
 	check "run.sh runs as uid 1000" 'grep -qx "1000" "$d/runner.uid"'
@@ -434,10 +443,18 @@ check "owner and repo names with . _ - pass through" \
 	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/acme-corp/my_widgets.go" "$reg/acme-corp/my_widgets.go")" ]'
 
 # A body that would inject a second variable, point at another host, or
-# name a path the registry cannot hold (upper case).
+# name a path the registry cannot hold (upper case, an empty segment, a
+# trailing slash), in read or in push.
+ok_read="\"read\":\"$reg/acme/widgets\""
 for bad in "{\"read\":\"$reg/acme/widgets\\nLD_PRELOAD=/tmp/x\",\"push\":\"\",\"trust\":\"trusted\"}" \
 	"{\"read\":\"evil.example.com/acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}" \
 	"{\"read\":\"$reg/Acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"$reg/acme//widgets\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{\"read\":\"$reg/acme/widgets/\",\"push\":\"\",\"trust\":\"trusted\"}" \
+	"{$ok_read,\"push\":\"$reg/acme/widgets\\nLD_PRELOAD=/tmp/x\",\"trust\":\"trusted\"}" \
+	"{$ok_read,\"push\":\"evil.example.com/acme/widgets\",\"trust\":\"trusted\"}" \
+	"{$ok_read,\"push\":\"$reg/acme//widgets\",\"trust\":\"trusted\"}" \
+	"{$ok_read,\"push\":\"$reg/acme/widgets/\",\"trust\":\"trusted\"}" \
 	"{\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"admin\"}" "not json"; do
 	run_hook hook-200-bad FAKE_CURL=200 FAKE_BODY="$bad"
 	check "exits 0 on a malformed answer" '[ "$rc" = 0 ]'
@@ -477,6 +494,17 @@ check "asks nothing, writes nothing, prints nothing" '[ ! -f "$d/curl.count" ] &
 run_hook hook-no-identity LUXGHA_IDENTITY_FILE="$root/does-not-exist"
 check "exits 0 without the identity file" '[ "$rc" = 0 ]'
 check "asks nothing, writes nothing" '[ ! -f "$d/curl.count" ] && [ ! -s "$d/github_env" ]'
+
+# A token that would break out of curl's config line is never sent.
+i=0
+for bad_token in 'v1.lux-gha-test-1001-7-0.abc"def' "$(printf 'v1.lux-gha-test-1001-7-0.abc\nurl = "http://evil.example.com"')"; do
+	i=$((i + 1))
+	printf '%s' "$bad_token" >"$root/bad-token-$i"
+	run_hook "hook-bad-token-$i" FAKE_CURL=200 FAKE_BODY="{$ok_read,\"push\":\"\",\"trust\":\"trusted\"}" LUXGHA_IDENTITY_FILE="$root/bad-token-$i"
+	check "exits 0 on a malformed token" '[ "$rc" = 0 ]'
+	check "no curl call, nothing written" '[ ! -f "$d/curl.count" ] && [ ! -s "$d/github_env" ]'
+	check "one line" "$one_line"
+done
 
 run_hook hook-github-env-unwritable FAKE_CURL=200 GITHUB_ENV=/proc/version \
 	FAKE_BODY="{\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"trusted\"}"
@@ -564,6 +592,16 @@ check "exits 0 and reaches the runner" '[ "$rc" = 0 ] && [ -f "$d/runner.args" ]
 check "an unparsable config is left as it was" '[ "$(cat "$d/.docker/config.json")" = "not json" ]'
 check "one warning line" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "^lux-gha-runner: warning: " "$d/err"'
 check "no hook without the helper" '! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env"'
+
+run_case registry-hook-preset LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
+check "exits 0" '[ "$rc" = 0 ]'
+check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh" "$d/runner.env"'
+check "one warning line naming it" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "ACTIONS_RUNNER_HOOK_JOB_STARTED is already set" "$d/err"'
+check "the credential helper is still configured" '[ "$(jq -r --arg h "$reg" ".credHelpers[\$h]" "$d/.docker/config.json")" = lux-gha ]'
+
+run_case registry-no-hook-file LUXGHA_REGISTRY_HOST="$reg" LUXGHA_JOB_STARTED_HOOK="$root/does-not-exist"
+check "exits 0" '[ "$rc" = 0 ]'
+check "no hook exported when the hook file is absent" '! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env"'
 
 run_case registry-unset
 check "exits 0" '[ "$rc" = 0 ]'

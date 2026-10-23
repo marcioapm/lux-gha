@@ -242,6 +242,8 @@ var (
 	labelPattern     = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 	roleARNPattern   = regexp.MustCompile(`^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
 	awsRegionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
+	// ecrHostPattern's second group is the region, compared to Region.
+	ecrHostPattern = regexp.MustCompile(`^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?$`)
 )
 
 func Load(path string) (*Config, error) {
@@ -572,8 +574,7 @@ func (g *Registry) validate(listen string) []error {
 	}
 	// docker-credential-ecr-login serves only ECR registry hosts, and the
 	// credentials are minted for Region.
-	hostRe := regexp.MustCompile(`^[0-9]{12}\.dkr\.ecr\.` + regexp.QuoteMeta(g.Region) + `\.amazonaws\.com(\.cn)?$`)
-	if !hostRe.MatchString(g.Host) {
+	if m := ecrHostPattern.FindStringSubmatch(g.Host); m == nil || m[1] != g.Region {
 		add("host %q must be <account>.dkr.ecr.%s.amazonaws.com", g.Host, g.Region)
 	}
 	if g.TrustedRefs == nil {

@@ -57,9 +57,11 @@ func TestSessionPolicyPerTrustLevel(t *testing.T) {
 func TestSessionPolicyPartitionAndAccount(t *testing.T) {
 	c := &config.Registry{RoleARN: "arn:aws-cn:iam::210987654321:role/r", Region: "cn-north-1",
 		Host: "210987654321.dkr.ecr.cn-north-1.amazonaws.com.cn"}
-	got, err := SessionPolicy(c, "acme", "widgets", ReadOnly)
-	if err != nil || !strings.Contains(got, `"Resource":"arn:aws-cn:ecr:cn-north-1:210987654321:repository/acme/widgets/*"`) {
-		t.Fatalf("%s %v", got, err)
+	want := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},` +
+		`{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],` +
+		`"Resource":"arn:aws-cn:ecr:cn-north-1:210987654321:repository/acme/widgets/*"}]}`
+	if got, err := SessionPolicy(c, "acme", "widgets", ReadOnly); err != nil || got != want {
+		t.Fatalf("got  %s\nwant %s (%v)", got, want, err)
 	}
 }
 

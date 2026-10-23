@@ -1214,8 +1214,11 @@ func (p *pass) cleanUp() error {
 	return nil
 }
 
+// instancePrefix starts every runner name of this instance.
+func (r *Reconciler) instancePrefix() string { return "lux-gha-" + r.cfg.Instance + "-" }
+
 func (r *Reconciler) runnerPrefix(repoID int64) string {
-	return "lux-gha-" + r.cfg.Instance + "-" + strconv.FormatInt(repoID, 10) + "-"
+	return r.instancePrefix() + strconv.FormatInt(repoID, 10) + "-"
 }
 
 // parseRunnerName parses lux-gha-<instance>-<repo id>-<job id>-<gen>. Only

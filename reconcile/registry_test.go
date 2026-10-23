@@ -102,7 +102,7 @@ func TestPassesAndDeliveriesPublishRunnerAssignments(t *testing.T) {
 	e.gh.queue(8, "queued", "self-hosted", "lux")
 	e.pass()
 	a := "lux-gha-t1-1001-7-0"
-	if _, ok := e.rec.RunnerAssignment(a); ok {
+	if _, _, ok := e.rec.CandidateJob(a); ok {
 		t.Fatal("assignment before pickup")
 	}
 	// The runner provisioned for job 7 takes job 8.
@@ -110,16 +110,16 @@ func TestPassesAndDeliveriesPublishRunnerAssignments(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.pass()
-	as, ok := e.rec.RunnerAssignment(a)
-	if !ok || as.JobID != 8 || as.RunID != 80 || as.Repository != "acme/widgets" {
-		t.Fatalf("assignment %+v ok=%v", as, ok)
+	repo, job, ok := e.rec.CandidateJob(a)
+	if !ok || job != 8 || repo != "acme/widgets" {
+		t.Fatalf("assignment %s %d ok=%v", repo, job, ok)
 	}
 	if full, ok := e.rec.RepositoryName(1001); !ok || full != "acme/widgets" {
 		t.Fatalf("repository name %q %v", full, ok)
 	}
 	e.gh.complete(8, "success")
 	e.pass()
-	if _, ok := e.rec.RunnerAssignment(a); ok {
+	if _, _, ok := e.rec.CandidateJob(a); ok {
 		t.Fatal("assignment kept after the job completed")
 	}
 
@@ -136,10 +136,10 @@ func TestPassesAndDeliveriesPublishRunnerAssignments(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if as, ok := e.rec.RunnerAssignment(b); !ok || as.JobID != 9 || as.RunID != 90 {
-		t.Fatalf("delivery assignment %+v ok=%v", as, ok)
+	if repo, job, ok := e.rec.CandidateJob(b); !ok || job != 9 || repo != "acme/widgets" {
+		t.Fatalf("delivery assignment %s %d ok=%v", repo, job, ok)
 	}
-	if _, ok := e.rec.RunnerAssignment("someone-else"); ok {
+	if _, _, ok := e.rec.CandidateJob("someone-else"); ok {
 		t.Fatal("recorded a runner of another instance")
 	}
 }

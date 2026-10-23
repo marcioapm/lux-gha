@@ -11,14 +11,13 @@ import (
 	"github.com/marcioapm/lux-gha/githubapp"
 )
 
-// Assignment is a candidate for the job a runner of this instance executes:
+// assignment is a candidate for the job a runner of this instance executes:
 // a job a pass or a search listed as in_progress on it, or a signed
 // in_progress delivery naming it. The registry listener confirms it with a
 // job read before use.
-type Assignment struct {
-	Repository string // owner/name
-	JobID      int64
-	RunID      int64
+type assignment struct {
+	repository string // owner/name
+	jobID      int64
 	// fromPass: a pass's listing put it there, and the next pass's listing
 	// replaces it. Others (deliveries, searches) are kept until a pass
 	// contradicts them, the runner's Run ends, or assignmentTTL passes.
@@ -46,7 +45,7 @@ const (
 // listener goroutines share it.
 type attribution struct {
 	mu         sync.Mutex
-	byRunner   map[string]Assignment
+	byRunner   map[string]assignment
 	names      map[int64]string     // repo id: owner/name
 	completed  map[string]time.Time // runner name: when a completed delivery named it
 	searchedAt map[int64]time.Time  // repo id: last search start
@@ -59,7 +58,7 @@ type searchFlight struct {
 }
 
 func newAttribution() *attribution {
-	return &attribution{byRunner: map[string]Assignment{}, names: map[int64]string{}, completed: map[string]time.Time{},
+	return &attribution{byRunner: map[string]assignment{}, names: map[int64]string{}, completed: map[string]time.Time{},
 		searchedAt: map[int64]time.Time{}, searching: map[int64]*searchFlight{}}
 }
 
@@ -77,17 +76,17 @@ func (a *attribution) observe(v *repoView, start time.Time) {
 	defer a.mu.Unlock()
 	a.names[v.id] = v.full
 	for name, as := range a.byRunner {
-		if !strings.EqualFold(as.Repository, v.full) {
+		if !strings.EqualFold(as.repository, v.full) {
 			continue
 		}
-		on, running := v.inProgressOn[as.JobID]
-		contradicted := !as.at.After(start) && (v.completed[as.JobID] || running && on != name)
+		on, running := v.inProgressOn[as.jobID]
+		contradicted := !as.at.After(start) && (v.completed[as.jobID] || running && on != name)
 		if as.fromPass || contradicted || start.Sub(as.at) > assignmentTTL {
 			delete(a.byRunner, name)
 		}
 	}
 	for _, j := range v.stuck {
-		a.byRunner[*j.RunnerName] = Assignment{Repository: v.full, JobID: j.ID, RunID: j.RunID, fromPass: true, at: start}
+		a.byRunner[*j.RunnerName] = assignment{repository: v.full, jobID: j.ID, fromPass: true, at: start}
 	}
 }
 
@@ -118,19 +117,19 @@ func (a *attribution) observeName(id int64, full string) {
 // noteInProgress records a signed in_progress delivery whose runner is one
 // of this instance's: it arrives seconds after pickup, long before the next
 // pass would list the job.
-func (r *Reconciler) noteInProgress(repository string, runner string, jobID, runID int64) {
-	if r.att == nil || !strings.HasPrefix(runner, "lux-gha-"+r.cfg.Instance+"-") {
+func (r *Reconciler) noteInProgress(repository string, runner string, jobID int64) {
+	if r.att == nil || !strings.HasPrefix(runner, r.instancePrefix()) {
 		return
 	}
 	r.att.mu.Lock()
-	r.att.byRunner[runner] = Assignment{Repository: repository, JobID: jobID, RunID: runID, at: r.now()}
+	r.att.byRunner[runner] = assignment{repository: repository, jobID: jobID, at: r.now()}
 	r.att.mu.Unlock()
 }
 
 // noteCompleted records a signed completed delivery naming one of this
 // instance's runners. A JIT runner executes one job, so the runner is done.
 func (r *Reconciler) noteCompleted(runner string) {
-	if r.att == nil || !strings.HasPrefix(runner, "lux-gha-"+r.cfg.Instance+"-") {
+	if r.att == nil || !strings.HasPrefix(runner, r.instancePrefix()) {
 		return
 	}
 	now := r.now()
@@ -156,26 +155,20 @@ func (r *Reconciler) RunnerCompleted(runner string) bool {
 	return ok
 }
 
-// RunnerAssignment returns the last job a pass, search or delivery put on
-// runner within assignmentTTL. It is a candidate only: GitHub's job record
-// decides.
-func (r *Reconciler) RunnerAssignment(runner string) (Assignment, bool) {
+// CandidateJob returns the repository and id of the last job a pass, search
+// or delivery put on runner within assignmentTTL. It is a candidate only:
+// GitHub's job record decides.
+func (r *Reconciler) CandidateJob(runner string) (repository string, jobID int64, ok bool) {
 	if r.att == nil {
-		return Assignment{}, false
+		return "", 0, false
 	}
 	r.att.mu.Lock()
 	defer r.att.mu.Unlock()
 	as, ok := r.att.byRunner[runner]
-	if ok && r.now().Sub(as.at) > assignmentTTL {
-		return Assignment{}, false
+	if !ok || r.now().Sub(as.at) > assignmentTTL {
+		return "", 0, false
 	}
-	return as, ok
-}
-
-// CandidateJob is RunnerAssignment in the registry listener's terms.
-func (r *Reconciler) CandidateJob(runner string) (string, int64, bool) {
-	as, ok := r.RunnerAssignment(runner)
-	return as.Repository, as.JobID, ok
+	return as.repository, as.jobID, true
 }
 
 // RepositoryName returns owner/name of the repository with numeric id as
@@ -192,7 +185,7 @@ func (r *Reconciler) RepositoryName(id int64) (string, bool) {
 
 // ParseRunner returns the repository id of one of this instance's runner names.
 func (r *Reconciler) ParseRunner(name string) (repoID int64, ok bool) {
-	rest, found := strings.CutPrefix(name, "lux-gha-"+r.cfg.Instance+"-")
+	rest, found := strings.CutPrefix(name, r.instancePrefix())
 	if !found {
 		return 0, false
 	}
@@ -285,7 +278,7 @@ func (r *Reconciler) SearchRunnerJobs(ctx context.Context, repo githubapp.Reposi
 	r.NoteRateLimit(err)
 	a.mu.Lock()
 	for _, j := range jobs {
-		a.byRunner[*j.RunnerName] = Assignment{Repository: repo.Owner + "/" + repo.Name, JobID: j.ID, RunID: j.RunID, at: now}
+		a.byRunner[*j.RunnerName] = assignment{repository: repo.Owner + "/" + repo.Name, jobID: j.ID, at: now}
 	}
 	f.err = err
 	delete(a.searching, repoID)
