@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -172,7 +173,7 @@ func newServer(st store, o Options) (*Server, error) {
 		public:  pub,
 		log:     o.Log,
 		logOnce: newLogLimiter(time.Minute, o.Now),
-		proxies: newProxyLimiter(maxProxyPerJob, maxProxyAnonymous, maxProxyRequests),
+		proxies: newProxyLimiter(maxProxyPerJob, maxProxyPerAddr, maxProxyRequests),
 
 		twirpReadTimeout: defaultTwirpReadTimeout,
 		progressWindow:   defaultProgressWindow,
@@ -218,13 +219,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.serveBlob(w, r)
 	default:
-		job := s.passThroughJob(r)
-		release, refused := s.proxies.acquire(job)
+		release, refused := s.proxies.acquire(s.passThroughKey(r))
 		if release == nil {
 			if s.logOnce.allow("proxy-full:" + refused) {
 				s.log.Warn("cache: too many concurrent pass-through requests; answering 503 (logged once a minute)",
 					"limit", refused, "remote_addr", r.RemoteAddr,
-					"per_job", s.proxies.perJob, "anonymous", s.proxies.anonymous, "total", s.proxies.total)
+					"per_job", s.proxies.perJob, "per_addr", s.proxies.perAddr, "total", s.proxies.total)
 			}
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -241,29 +241,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// passThroughJob is the limiter key of a pass-through request: the job of
-// a runtime token that verifies (any repository's: the pass-through serves
-// every one), or anonymousJob for a request with no token, an invalid one,
-// or while the issuer is unreachable. The request is forwarded either way.
-func (s *Server) passThroughJob(r *http.Request) string {
+// passThroughKey is the limiter key of a pass-through request: the job of
+// an allowlisted runtime token that verifies, or else the TCP peer host
+// (never a forwarded header): no token, an invalid or oversized one, a
+// token that is not a runtime token, another repository's, or an issuer
+// not yet discovered. The request is forwarded either way.
+func (s *Server) passThroughKey(r *http.Request) string {
+	addr := addrKeyPrefix + peerHost(r.RemoteAddr)
 	authz := r.Header.Get("Authorization")
 	if authz == "" {
-		return anonymousJob
+		return addr
 	}
-	job, err := s.auth.job(r.Context(), authz)
-	if err != nil {
-		reason := "invalid runtime token"
+	reason := "oversized Authorization header"
+	if len(authz) <= maxVerifiedAuthz {
+		job, err := s.auth.job(r.Context(), authz, s.allow)
+		if err == nil {
+			return jobKeyPrefix + job
+		}
+		reason = "invalid or unserved runtime token"
 		if errors.Is(err, errIssuerDown) {
-			reason = "token issuer unavailable"
+			reason = "token issuer not yet discovered"
 		}
-		if s.logOnce.allow("proxy-anonymous") {
-			// The error is not logged: it may quote token content.
-			s.log.Info("cache: pass-through request counted as anonymous (logged once a minute)",
-				"reason", reason, "remote_addr", r.RemoteAddr)
-		}
-		return anonymousJob
 	}
-	return job
+	if s.logOnce.allow("proxy-addr") {
+		// The error is not logged: it may quote token content.
+		s.log.Info("cache: pass-through request limited by address (logged once a minute)",
+			"reason", reason, "remote_addr", r.RemoteAddr)
+	}
+	return addr
+}
+
+func peerHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 func (s *Server) serveTwirp(w http.ResponseWriter, r *http.Request, method string) {

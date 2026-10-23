@@ -3,6 +3,7 @@ package cache
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -162,6 +163,35 @@ func TestAuthorizationScheme(t *testing.T) {
 		r := h.callRawAuthz(authz, "CreateCacheEntry", []byte(`{"key":"k","version":"`+v1+`"}`))
 		if r.status != http.StatusUnauthorized {
 			t.Errorf("%.12q: %+v", authz, r)
+		}
+	}
+}
+
+// Other spellings of one signed token (whitespace inside it, a set
+// padding bit in its signature) are rejected or carry the token's own
+// TokenHash, so they cannot bind more than one upload reservation.
+func TestTokenHashIsCanonical(t *testing.T) {
+	h := newHarness(t)
+	raw := h.is.token(t, "100", writeMain())
+	id, err := h.srv.auth.verify(t.Context(), "Bearer "+raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := h.srv.auth.verify(t.Context(), "Bearer "+raw)
+	if err != nil || again.TokenHash != id.TokenHash {
+		t.Fatalf("same token, another hash: %v", err)
+	}
+	for name, v := range map[string]string{
+		"space":        raw[:10] + " " + raw[10:],
+		"tab":          raw[:20] + "\t" + raw[20:],
+		"trailing":     raw + " ",
+		"padding bits": paddingVariant(t, raw),
+	} {
+		got, err := h.srv.auth.verify(t.Context(), "Bearer "+v)
+		if err == nil && got.TokenHash != id.TokenHash {
+			t.Errorf("%s: verified with another TokenHash", name)
+		} else if err != nil && !errors.Is(err, errUnauthenticated) {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }

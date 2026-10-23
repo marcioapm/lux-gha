@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -67,6 +69,11 @@ type verifier struct {
 	keys      *keySet
 	lastTry   time.Time
 	lastError error
+	// ready is v once discovery has succeeded, readable without mu.
+	ready       atomic.Pointer[oidc.IDTokenVerifier]
+	discovering atomic.Bool
+	// verifications counts bearer tokens taken up for verification.
+	verifications atomic.Int64
 }
 
 // Discovery failures are retried at most this often.
@@ -105,7 +112,20 @@ func (v *verifier) idTokenVerifier() (*oidc.IDTokenVerifier, error) {
 		SupportedSigningAlgs: []string{oidc.RS256},
 		Now:                  v.now,
 	})
+	v.ready.Store(v.v)
 	return v.v, nil
+}
+
+// discoverInBackground starts a discovery attempt unless one started here
+// is still running; idTokenVerifier applies discoveryRetry.
+func (v *verifier) discoverInBackground() {
+	if !v.discovering.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer v.discovering.Store(false)
+		_, _ = v.idTokenVerifier()
+	}()
 }
 
 func providerJWKS(p *oidc.Provider) string {
@@ -121,54 +141,97 @@ type acEntry struct {
 	Permission int    `json:"Permission"`
 }
 
-// verifyToken checks a bearer token's signature, issuer, exp and nbf and
-// returns the raw token with its verified form.
-func (v *verifier) verifyToken(ctx context.Context, authz string) (string, *oidc.IDToken, error) {
+// canonicalJWS reports whether raw is a compact JWS with three segments
+// that each decode under strict unpadded base64url. go-jose strips
+// whitespace and ignores trailing padding bits, so without this check one
+// signed token has many accepted spellings.
+func canonicalJWS(raw string) bool {
+	segs := strings.Split(raw, ".")
+	if len(segs) != 3 {
+		return false
+	}
+	for _, s := range segs {
+		if _, err := base64.RawURLEncoding.Strict().DecodeString(s); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyToken checks a bearer token's form, signature, issuer, exp and nbf
+// and returns its verified form with tokenHash, the SHA-256 of its decoded
+// payload. With wait false, a verifier not yet discovered is reported as
+// errIssuerDown without waiting for a discovery in progress.
+func (v *verifier) verifyToken(ctx context.Context, authz string, wait bool) (*oidc.IDToken, string, error) {
 	raw, ok := strings.CutPrefix(authz, "Bearer ")
 	if !ok || raw == "" {
-		return "", nil, fmt.Errorf("%w: missing bearer token", errUnauthenticated)
+		return nil, "", fmt.Errorf("%w: missing bearer token", errUnauthenticated)
 	}
-	iv, err := v.idTokenVerifier()
-	if err != nil {
-		return "", nil, err
+	v.verifications.Add(1)
+	// RawURLEncoding has no '.' or whitespace, so a token passing this has
+	// exactly one spelling of its header, payload and signature bytes.
+	if !canonicalJWS(raw) {
+		return nil, "", fmt.Errorf("%w: token is not a canonical compact JWS", errUnauthenticated)
+	}
+	iv := v.ready.Load()
+	if iv == nil {
+		if !wait {
+			v.discoverInBackground()
+			return nil, "", fmt.Errorf("%w: not yet discovered", errIssuerDown)
+		}
+		var err error
+		if iv, err = v.idTokenVerifier(); err != nil {
+			return nil, "", err
+		}
 	}
 	tok, err := iv.Verify(ctx, raw)
 	if err != nil {
-		return "", nil, fmt.Errorf("%w: %v", errUnauthenticated, err)
+		return nil, "", fmt.Errorf("%w: %v", errUnauthenticated, err)
 	}
-	return raw, tok, nil
+	// Decoded after verification; canonicalJWS has already rejected any
+	// encoding that does not decode strictly.
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.Split(raw, ".")[1])
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: payload: %v", errUnauthenticated, err)
+	}
+	sum := sha256.Sum256(payload)
+	return tok, hex.EncodeToString(sum[:]), nil
 }
 
-func tokenHash(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
+// runtimeClaims are the claims verify requires of a runtime token.
+type runtimeClaims struct {
+	AC     *string `json:"ac"`
+	RepoID *string `json:"repository_id"`
+	// Raw: numericClaim accepts a string or a number and fails closed.
+	OwnerID json.RawMessage `json:"repository_owner_id"`
 }
 
-// job returns the key of the job a bearer token was issued to: the
-// token's hash, since the runtime token is per job and carries no
-// documented job claim. No claim beyond the signature, issuer, exp and nbf
-// is required, and no allowlist applies.
-func (v *verifier) job(ctx context.Context, authz string) (string, error) {
-	raw, _, err := v.verifyToken(ctx, authz)
+// job returns the limiter key of a runtime token's job, the hash of its
+// verified payload, for a token verify would accept that the allowlist
+// permits. It never waits for issuer discovery.
+func (v *verifier) job(ctx context.Context, authz string, allow allowlist) (string, error) {
+	id, err := v.identify(ctx, authz, false)
 	if err != nil {
 		return "", err
 	}
-	return tokenHash(raw), nil
+	if !allow.permits(id) {
+		return "", fmt.Errorf("%w: repository not served", errUnauthenticated)
+	}
+	return id.TokenHash, nil
 }
 
 // verify returns the identity of a bearer token. errUnauthenticated covers
 // every token or claim defect; errIssuerDown means the keys are unknown.
 func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) {
-	raw, tok, err := v.verifyToken(ctx, authz)
+	return v.identify(ctx, authz, true)
+}
+
+func (v *verifier) identify(ctx context.Context, authz string, wait bool) (*identity, error) {
+	tok, hash, err := v.verifyToken(ctx, authz, wait)
 	if err != nil {
 		return nil, err
 	}
-	var claims struct {
-		AC     *string `json:"ac"`
-		RepoID *string `json:"repository_id"`
-		// Raw: numericClaim accepts a string or a number and fails closed.
-		OwnerID json.RawMessage `json:"repository_owner_id"`
-	}
+	var claims runtimeClaims
 	if err := tok.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("%w: claims: %v", errUnauthenticated, err)
 	}
@@ -182,7 +245,7 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	if err := json.Unmarshal([]byte(*claims.AC), &acl); err != nil {
 		return nil, fmt.Errorf("%w: ac claim is not a JSON array of scopes", errUnauthenticated)
 	}
-	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(claims.OwnerID), TokenHash: tokenHash(raw)}
+	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(claims.OwnerID), TokenHash: hash}
 	for _, e := range acl {
 		if e.Scope == "" {
 			return nil, fmt.Errorf("%w: ac entry without a scope", errUnauthenticated)

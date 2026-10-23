@@ -237,10 +237,15 @@ func TestResponseProgressDeadline(t *testing.T) {
 // authz (none when empty) from 192.0.2.1 in the background and returns
 // its response once the handler returns.
 func serveAs(h *harness, authz, path string) <-chan *httptest.ResponseRecorder {
+	return serveFrom(h, "192.0.2.1", authz, path)
+}
+
+// serveFrom is serveAs from the peer host addr.
+func serveFrom(h *harness, addr, authz, path string) <-chan *httptest.ResponseRecorder {
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
-		r.RemoteAddr = "192.0.2.1:1000"
+		r.RemoteAddr = net.JoinHostPort(addr, "1000")
 		if authz != "" {
 			r.Header.Set("Authorization", authz)
 		}
@@ -312,11 +317,13 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// The pass-through limit is per job: two jobs behind one address are
-// limited independently, requests without a valid token (none, or a bad
-// signature) share one small bucket that does not touch the jobs' slots,
-// and the server-wide ceiling applies across all of them. No token reaches
-// the log.
+// The pass-through limit is per job for allowlisted runtime tokens and per
+// peer address for everything else: two jobs behind one address are
+// limited independently, other encodings of one token never open another
+// job bucket, tokens that are forged, not runtime-shaped, of another
+// repository or oversized count against their address, one address's
+// tokenless traffic touches neither another address nor a job, and the
+// server-wide ceiling applies across all of them. No token reaches the log.
 func TestProxyConcurrencyLimits(t *testing.T) {
 	upURL, held, release := heldUpstream(t)
 	logs := &syncBuffer{}
@@ -324,43 +331,74 @@ func TestProxyConcurrencyLimits(t *testing.T) {
 		o.Upstream = upURL
 		o.Log = slog.New(slog.NewTextHandler(logs, nil))
 	})
-	// 2 per job, 1 anonymous, 5 in total.
+	// 2 per job, 1 per address, 5 in total.
 	h.srv.proxies = newProxyLimiter(2, 1, 5)
-	// Any repository's job counts as a job: there is no allowlist here.
-	tokA := "Bearer " + h.is.token(t, "100", writeMain())
-	tokB := "Bearer " + h.is.token(t, "999", writeMain())
+	const x, y = "192.0.2.1", "198.51.100.7"
+	// Repositories 100 and 200 are allowlisted; 999 is not.
+	rawA := h.is.token(t, "100", writeMain())
+	tokA := "Bearer " + rawA
+	tokB := "Bearer " + h.is.token(t, "200", writeMain())
 	tokC := "Bearer " + h.is.token(t, "100", writePR())
 	tokD := "Bearer " + h.is.token(t, "200", readMain())
+	unserved := "Bearer " + h.is.token(t, "999", writeMain())
+	oidcClaims := h.is.claims(t, "100")
+	delete(oidcClaims, "ac")
+	noAC := "Bearer " + h.is.sign(t, oidcClaims)
 	forged := "Bearer " + signJWT(t, mustKey(t), h.is.kid, h.is.claims(t, "100", writeMain()))
+	bigClaims := h.is.claims(t, "100", writeMain())
+	bigClaims["pad"] = strings.Repeat("p", maxVerifiedAuthz)
+	oversized := "Bearer " + h.is.sign(t, bigClaims)
+	spaced := "Bearer " + rawA[:10] + " " + rawA[10:]
+	padded := "Bearer " + paddingVariant(t, rawA)
+	// The pass-through never waits for discovery; the cache path does it.
+	if _, err := h.srv.auth.verify(t.Context(), tokA); err != nil {
+		t.Fatal(err)
+	}
 
-	a1, a2 := serveAs(h, tokA, "/held"), serveAs(h, tokA, "/held")
+	a1, a2 := serveFrom(h, x, tokA, "/held"), serveFrom(h, x, tokA, "/held")
 	waitHeld(t, held, 2)
-	if w := recv(t, serveAs(h, tokA, "/other")); w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+	if w := recv(t, serveFrom(h, x, tokA, "/other")); w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("job over its limit: %d, Retry-After %q", w.Code, w.Header().Get("Retry-After"))
 	}
-	if w := recv(t, serveAs(h, tokB, "/other")); w.Code != http.StatusOK {
+	if w := recv(t, serveFrom(h, x, tokB, "/other")); w.Code != http.StatusOK {
 		t.Fatalf("a second job behind the same address: %d", w.Code)
 	}
 
-	// One tokenless request fills the anonymous bucket; more tokenless or
-	// forged requests are refused, and a job is still served.
-	anon := serveAs(h, "", "/held")
+	// Tokenless traffic fills X's bucket; Y and the jobs behind X are
+	// unaffected.
+	anon := serveFrom(h, x, "", "/held")
 	waitHeld(t, held, 3)
-	if w := recv(t, serveAs(h, "", "/other")); w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("tokenless request over the anonymous bucket: %d", w.Code)
+	if w := recv(t, serveFrom(h, x, "", "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("tokenless request over its address's limit: %d", w.Code)
 	}
-	if w := recv(t, serveAs(h, forged, "/other")); w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("a forged token escaped the anonymous bucket: %d", w.Code)
+	if w := recv(t, serveFrom(h, y, "", "/other")); w.Code != http.StatusOK {
+		t.Fatalf("another address during a tokenless flood: %d", w.Code)
 	}
-	if w := recv(t, serveAs(h, tokB, "/other")); w.Code != http.StatusOK {
-		t.Fatalf("a job during a tokenless flood: %d", w.Code)
+	if w := recv(t, serveFrom(h, x, tokB, "/other")); w.Code != http.StatusOK {
+		t.Fatalf("a job behind a flooding address: %d", w.Code)
+	}
+	// With A's and X's buckets both full, a request gets its own bucket
+	// only if it is wrongly keyed as a new job.
+	before := h.srv.auth.verifications.Load()
+	for name, authz := range map[string]string{
+		"tokA with a space": spaced, "tokA with padding bits set": padded,
+		"another repository": unserved, "no ac claim": noAC, "forged": forged,
+		"oversized header": oversized,
+	} {
+		if w := recv(t, serveFrom(h, x, authz, "/other")); w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s was given its own bucket: %d", name, w.Code)
+		}
+	}
+	// Every token above but the oversized one was taken up for verification.
+	if n := h.srv.auth.verifications.Load() - before; n != 5 {
+		t.Errorf("%d verifications for 5 verifiable headers and one oversized", n)
 	}
 
 	// B and C take the last server-wide slots; D, under its own limit, is
 	// refused by the ceiling.
-	b, c := serveAs(h, tokB, "/held"), serveAs(h, tokC, "/held")
+	b, c := serveFrom(h, x, tokB, "/held"), serveFrom(h, x, tokC, "/held")
 	waitHeld(t, held, 5)
-	if w := recv(t, serveAs(h, tokD, "/other")); w.Code != http.StatusServiceUnavailable {
+	if w := recv(t, serveFrom(h, y, tokD, "/other")); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("over the server-wide ceiling: %d", w.Code)
 	}
 	release()
@@ -371,24 +409,74 @@ func TestProxyConcurrencyLimits(t *testing.T) {
 	}
 	// Every slot was returned.
 	for _, authz := range []string{tokA, ""} {
-		if w := recv(t, serveAs(h, authz, "/other")); w.Code != http.StatusOK {
+		if w := recv(t, serveFrom(h, x, authz, "/other")); w.Code != http.StatusOK {
 			t.Fatalf("after release: %d", w.Code)
 		}
 	}
 
 	out := logs.String()
-	for _, limit := range []string{"limit=job", "limit=anonymous", "limit=total"} {
+	for _, limit := range []string{"limit=job", "limit=addr", "limit=total"} {
 		if !strings.Contains(out, limit) {
 			t.Errorf("no 503 log line with %s in %q", limit, out)
 		}
 	}
-	for _, tok := range []string{tokA, tokB, tokC, tokD, forged} {
+	for _, tok := range []string{tokA, tokB, tokC, tokD, unserved, noAC, forged} {
 		raw := strings.TrimPrefix(tok, "Bearer ")
 		sig := raw[strings.LastIndex(raw, ".")+1:]
-		if strings.Contains(out, sig) || strings.Contains(out, tokenHash(raw)) {
-			t.Fatalf("a token or its hash was logged: %q", out)
+		if strings.Contains(out, sig) {
+			t.Fatalf("a token was logged: %q", out)
 		}
 	}
+	id, err := h.srv.auth.verify(t.Context(), tokA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, id.TokenHash) {
+		t.Fatalf("a job key was logged: %q", out)
+	}
+}
+
+// While issuer discovery hangs, a valid allowlisted token on the
+// pass-through is keyed by its address at once, without waiting for it.
+func TestProxyLimitBeforeDiscovery(t *testing.T) {
+	upURL, held, _ := heldUpstream(t)
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	h := newHarness(t, func(o *Options) {
+		o.Upstream = upURL
+		o.IssuerClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			select {
+			case <-hang:
+			case <-r.Context().Done():
+			}
+			return nil, errors.New("issuer unreachable")
+		})}
+	})
+	h.srv.proxies = newProxyLimiter(2, 1, 5)
+	tok := "Bearer " + h.is.token(t, "100", writeMain())
+	serveFrom(h, "192.0.2.1", tok, "/held")
+	waitHeld(t, held, 1)
+	if w := recv(t, serveFrom(h, "192.0.2.1", "", "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("an undiscovered issuer's token was keyed as a job: %d", w.Code)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// paddingVariant sets the lowest unused bit of the last base64url
+// character of raw, an encoding that non-strict decoding maps to the same
+// bytes. The RS256 signature has 256 bytes, so that character has 4 unused
+// bits.
+func paddingVariant(t *testing.T, raw string) string {
+	t.Helper()
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	i := strings.IndexByte(alphabet, raw[len(raw)-1])
+	if i < 0 || i&0xf != 0 {
+		t.Fatalf("last character %q has padding bits set", raw[len(raw)-1])
+	}
+	return raw[:len(raw)-1] + string(alphabet[i|1])
 }
 
 func mustKey(t *testing.T) *rsa.PrivateKey {

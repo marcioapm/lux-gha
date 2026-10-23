@@ -636,16 +636,25 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
   (artifacts, logs, other Results calls) is passed here unchanged, method,
   path, query, headers and body included, and the response is streamed
   back. The upstream is fixed; no request chooses it. Pass-through
-  requests are limited per job: the official clients send the job's
-  runtime token as `Authorization: Bearer`, and a request whose token
-  verifies (signature, issuer, `exp`, `nbf`; any repository, since
-  artifacts and logs are not limited to the cache allowlist) counts against
-  that job's 32 concurrent requests, keyed on a hash of the token. A
-  request without a token, or with one that does not verify, is still
-  forwarded, but all such requests share one bucket of 8. The listener runs
-  at most 4096 in total. Past any limit the request gets `503` with
-  `Retry-After`. Client addresses play no part, so runners behind one NAT,
-  load balancer or TLS terminator do not share a limit.
+  requests are limited in two ways. A request whose
+  `Authorization: Bearer` token verifies (signature, issuer, `exp`, `nbf`),
+  is a runtime token (`ac` and a numeric `repository_id`, as for cache
+  calls) and names a repository this server serves counts against that
+  job's 32 concurrent requests, keyed on a hash of the token's decoded
+  payload. A token with whitespace inside it or non-canonical base64url
+  never verifies, here or on cache calls, so one token is one job. Every
+  other request (no token, one that does not verify, one longer than
+  8 KiB, an OIDC ID token, another repository's token, or any token before
+  the issuer has first been discovered) is still forwarded, but counts
+  against the 32 concurrent requests of its TCP peer address;
+  forwarded-for headers are ignored. The
+  listener runs at most 4096 in total. Past any limit the request gets
+  `503` with `Retry-After`. Jobs of served repositories behind one NAT,
+  load balancer or TLS terminator are limited separately; everything else
+  behind it shares that address's 32. Make the cache listener reachable
+  only from the runners' network, not from the public internet: the
+  address limits are per source address, so a client with many addresses
+  gets many buckets, up to the 4096 ceiling that every runner shares.
 - **Timeouts.** The cache listener has no overall body or response
   timeout, since a block upload or a proxied transfer can take minutes.
   Instead a Twirp request body must arrive within 30 s, and an upload or

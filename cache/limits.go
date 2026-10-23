@@ -3,6 +3,7 @@ package cache
 import (
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,14 +26,18 @@ const (
 	defaultTwirpReadTimeout = 30 * time.Second
 	defaultProgressWindow   = 60 * time.Second
 	minProgressBytes        = 64 << 10
-	// Pass-through requests are limited per job: each runtime token that
-	// verifies may run maxProxyPerJob at once. Requests without a valid
-	// token are still forwarded, but all of them share maxProxyAnonymous.
-	// maxProxyRequests is a server-wide safety net. Past any of them the
-	// proxy answers 503.
-	maxProxyPerJob    = 32
-	maxProxyAnonymous = 8
-	maxProxyRequests  = 4096
+	// Pass-through requests are limited per key: an allowlisted runtime
+	// token that verifies is keyed by its job, and may run maxProxyPerJob
+	// at once; every other request (no token, an invalid or oversized one,
+	// another repository's) is keyed by its TCP peer host and may run
+	// maxProxyPerAddr at once. maxProxyRequests is a server-wide safety
+	// net. Past any of them the proxy answers 503.
+	maxProxyPerJob   = 32
+	maxProxyPerAddr  = 32
+	maxProxyRequests = 4096
+	// maxVerifiedAuthz bounds the Authorization header the pass-through
+	// verifies; a longer one is keyed by address unverified.
+	maxVerifiedAuthz = 8 << 10
 )
 
 // progress applies the minimum-progress rule to one direction of a
@@ -134,46 +139,49 @@ func (w *progressWriter) Flush() {
 // reach the connection.
 func (w *progressWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// proxyLimiter bounds concurrent pass-through requests per job, for
-// requests without a valid token together, and in total.
+// proxyLimiter bounds concurrent pass-through requests per key and in
+// total. A key is jobKeyPrefix plus a job's payload hash, or addrKeyPrefix
+// plus a TCP peer host.
 type proxyLimiter struct {
-	perJob, anonymous, total int
+	perJob, perAddr, total int
 
 	mu   sync.Mutex
 	n    int
-	jobs map[string]int
+	keys map[string]int
 }
 
-func newProxyLimiter(perJob, anonymous, total int) *proxyLimiter {
-	return &proxyLimiter{perJob: perJob, anonymous: anonymous, total: total, jobs: map[string]int{}}
+func newProxyLimiter(perJob, perAddr, total int) *proxyLimiter {
+	return &proxyLimiter{perJob: perJob, perAddr: perAddr, total: total, keys: map[string]int{}}
 }
 
-// anonymousJob is the key every request without a valid token shares; a
-// job key is a token hash, never empty.
-const anonymousJob = ""
+const (
+	jobKeyPrefix  = "job:"
+	addrKeyPrefix = "addr:"
+)
 
-// acquire takes a slot for job; it reports which limit refused it ("total",
-// "job" or "anonymous"), or "" with a release function.
-func (l *proxyLimiter) acquire(job string) (release func(), refused string) {
+// acquire takes a slot for key; it reports which limit refused it ("total",
+// "job" or "addr"), or "" with a release function.
+func (l *proxyLimiter) acquire(key string) (release func(), refused string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.n >= l.total {
 		return nil, "total"
 	}
-	switch {
-	case job == anonymousJob && l.jobs[job] >= l.anonymous:
-		return nil, "anonymous"
-	case job != anonymousJob && l.jobs[job] >= l.perJob:
-		return nil, "job"
+	if strings.HasPrefix(key, jobKeyPrefix) {
+		if l.keys[key] >= l.perJob {
+			return nil, "job"
+		}
+	} else if l.keys[key] >= l.perAddr {
+		return nil, "addr"
 	}
 	l.n++
-	l.jobs[job]++
+	l.keys[key]++
 	return func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.n--
-		if l.jobs[job]--; l.jobs[job] == 0 {
-			delete(l.jobs, job)
+		if l.keys[key]--; l.keys[key] == 0 {
+			delete(l.keys, key)
 		}
 	}, ""
 }
