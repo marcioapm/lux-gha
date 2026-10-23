@@ -46,9 +46,16 @@ type Runners interface {
 	RunnerCompleted(runner string) bool
 	// RepositoryName returns owner/name for a repository id.
 	RepositoryName(id int64) (string, bool)
-	// FindRunnerJob searches the repository's in_progress runs for the
-	// job GitHub shows on the runner.
-	FindRunnerJob(ctx context.Context, repo githubapp.Repository, runner string) (githubapp.WorkflowJob, bool, error)
+	// SearchRunnerJobs lists the repository's in_progress runs, bounded,
+	// and publishes every in_progress job on a runner of this instance as
+	// that runner's candidate. A repository is searched at most once per
+	// gap, and concurrent callers share one search. before runs just
+	// before a search's first GitHub call; its error ends the search.
+	SearchRunnerJobs(ctx context.Context, repo githubapp.Repository, repoID int64, before func() error) error
+	// RateLimitedUntil is when GitHub's rate limit on the installation ends.
+	RateLimitedUntil() time.Time
+	// NoteRateLimit records err if it is a GitHub rate limit.
+	NoteRateLimit(err error)
 }
 
 type GitHub interface {
@@ -91,13 +98,11 @@ const (
 	// in_progress job read are reused; credential helpers call per pull.
 	liveTTL = 30 * time.Second
 	jobTTL  = 60 * time.Second
-	// searchGap spaces a runner's fallback job searches, which list the
-	// repository's in_progress runs, while its hook retries.
-	searchGap = 5 * time.Second
 	// repositoryTTL bounds how long a repository's name and default branch
 	// are reused.
 	repositoryTTL = 10 * time.Minute
-	// Token bucket per runner: burstTokens, refilled at refillPerSecond.
+	// Token bucket per runner: burstTokens, refilled at refillPerSecond,
+	// charged only by a request that calls Lux, GitHub or STS.
 	burstTokens     = 30
 	refillPerSecond = 0.5
 	// idleForget drops a runner's state after this long without a request.
@@ -109,6 +114,7 @@ var (
 	errUnauthorized = errors.New("unauthorized")
 	errUnresolved   = errors.New("job not resolved")
 	errUpstream     = errors.New("upstream unavailable")
+	errLimited      = errors.New("runner over its request rate")
 )
 
 type Server struct {
@@ -129,16 +135,16 @@ type cachedRepository struct {
 // most one job, so the resolved job and its grant never change; finished
 // marks a runner whose Run ended or whose job completed.
 type runnerState struct {
-	mu         sync.Mutex // serialises upstream calls for the runner
-	tokens     float64    // guarded by Server.mu
-	lastSeen   time.Time  // guarded by Server.mu
-	liveAt     time.Time
-	searchedAt time.Time
-	finished   bool
-	job        *githubapp.WorkflowJob
-	jobAt      time.Time
-	grant      grant
-	creds      *ststypes.Credentials
+	mu       sync.Mutex // serialises upstream calls for the runner
+	tokens   float64    // guarded by Server.mu
+	filledAt time.Time  // guarded by Server.mu: tokens' last refill
+	lastSeen time.Time  // guarded by Server.mu
+	liveAt   time.Time
+	finished bool
+	job      *githubapp.WorkflowJob
+	jobAt    time.Time
+	grant    grant
+	creds    *ststypes.Credentials
 }
 
 // grant is what the executing job may do. owner and repo are the
@@ -148,7 +154,6 @@ type grant struct {
 	repoID      int64
 	owner, repo string
 	trust       string
-	event       string
 }
 
 func New(o Options) (*Server, error) {
@@ -236,22 +241,16 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (grant, *stst
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return grant{}, nil, false
 	}
-	st, allowed := s.take(runner)
-	if !allowed {
-		// The contract's codes only: the hook and the helper fail open on 503.
-		w.Header().Set("Retry-After", "2")
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return grant{}, nil, false
-	}
+	st := s.state(runner)
 	ctx, cancel := context.WithTimeout(r.Context(), requestTime)
 	defer cancel()
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	log := s.o.Log.With("runner", runner)
-	g, err := s.resolve(ctx, st, runner, repoID, log)
+	rq := &request{s: s, st: st, runner: runner, log: s.o.Log.With("runner", runner)}
+	g, err := rq.resolve(ctx, repoID)
 	var creds *ststypes.Credentials
 	if err == nil {
-		creds, err = s.credentials(ctx, st, runner, g, log)
+		creds, err = rq.credentials(ctx, g)
 	}
 	switch {
 	case err == nil:
@@ -260,14 +259,59 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (grant, *stst
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	case errors.Is(err, errUnresolved):
 		http.Error(w, "job not resolved", http.StatusConflict)
+	case errors.Is(err, errLimited):
+		// The contract's codes only: the hook and the helper fail open on 503.
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}
 	return grant{}, nil, false
 }
 
-// take charges one request to the runner's token bucket.
-func (s *Server) take(runner string) (*runnerState, bool) {
+// request is one request's pass through the chain for a runner whose
+// st.mu it holds.
+type request struct {
+	s       *Server
+	st      *runnerState
+	runner  string
+	log     *slog.Logger
+	charged bool
+}
+
+// upstream charges the runner's bucket once per request, before its first
+// call to Lux, GitHub or STS; answers from the runner's cache are free.
+func (rq *request) upstream() error {
+	if rq.charged {
+		return nil
+	}
+	if !rq.s.take(rq.st) {
+		return errLimited
+	}
+	rq.charged = true
+	return nil
+}
+
+// github is upstream for a GitHub call: while GitHub rate-limits the
+// installation the listener answers 503 without calling it.
+func (rq *request) github() error {
+	if rq.s.o.Now().Before(rq.s.o.Runners.RateLimitedUntil()) {
+		return errUpstream
+	}
+	return rq.upstream()
+}
+
+// githubFailed logs a failed GitHub call and feeds a rate limit back to the
+// reconciler.
+func (rq *request) githubFailed(msg string, err error, args ...any) error {
+	rq.s.o.Runners.NoteRateLimit(err)
+	rq.log.Warn(msg, append(args, "error", err)...)
+	return errUpstream
+}
+
+// state returns the runner's state, created on first use; it prunes idle
+// runners and expired ref answers at most once a minute.
+func (s *Server) state(runner string) *runnerState {
 	now := s.o.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,21 +330,31 @@ func (s *Server) take(runner string) (*runnerState, bool) {
 	}
 	st, ok := s.runners[runner]
 	if !ok {
-		st = &runnerState{tokens: burstTokens, lastSeen: now}
+		st = &runnerState{tokens: burstTokens, filledAt: now}
 		s.runners[runner] = st
 	}
-	st.tokens = min(burstTokens, st.tokens+now.Sub(st.lastSeen).Seconds()*refillPerSecond)
 	st.lastSeen = now
+	return st
+}
+
+// take charges one request to the runner's token bucket.
+func (s *Server) take(st *runnerState) bool {
+	now := s.o.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st.tokens = min(burstTokens, st.tokens+now.Sub(st.filledAt).Seconds()*refillPerSecond)
+	st.filledAt = now
 	if st.tokens < 1 {
-		return st, false
+		return false
 	}
 	st.tokens--
-	return st, true
+	return true
 }
 
 // resolve checks the runner's Run is live, finds the job it is executing
-// and that job's trust level. The caller holds st.mu.
-func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, repoID int64, log *slog.Logger) (grant, error) {
+// and that job's trust level.
+func (rq *request) resolve(ctx context.Context, repoID int64) (grant, error) {
+	s, st, runner, log := rq.s, rq.st, rq.runner, rq.log
 	if st.finished {
 		return grant{}, errUnauthorized
 	}
@@ -312,13 +366,16 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 	}
 	now := s.o.Now()
 	if now.Sub(st.liveAt) >= liveTTL {
+		if err := rq.upstream(); err != nil {
+			return grant{}, err
+		}
 		live, err := s.o.Runners.LiveRun(ctx, runner, repoID)
 		if err != nil {
 			log.Warn("registry: reading the runner's Lux Run failed", "error", err)
 			return grant{}, errUpstream
 		}
 		if !live {
-			st.finished = true
+			st.finished, st.creds = true, nil
 			return grant{}, errUnauthorized
 		}
 		st.liveAt = now
@@ -333,10 +390,12 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 		if now.Sub(st.jobAt) < jobTTL {
 			return st.grant, nil
 		}
+		if err := rq.github(); err != nil {
+			return grant{}, err
+		}
 		j, err := s.o.GitHub.GetWorkflowJob(ctx, repo, st.job.ID)
 		if err != nil {
-			log.Warn("registry: re-reading the runner's job failed", "job", st.job.ID, "error", err)
-			return grant{}, errUpstream
+			return grant{}, rq.githubFailed("registry: re-reading the runner's job failed", err, "job", st.job.ID)
 		}
 		if !onRunner(j, runner) || j.Status != "in_progress" {
 			st.finished, st.creds = true, nil
@@ -345,7 +404,7 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 		st.jobAt = now
 		return st.grant, nil
 	}
-	j, err := s.findJob(ctx, st, repo, full, runner, log)
+	j, err := rq.findJob(ctx, repo, repoID, full)
 	if err != nil {
 		return grant{}, err
 	}
@@ -353,8 +412,7 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 	// repository is the runner's: its current names come from GET /repos.
 	info, err := s.repository(ctx, repo, repoID)
 	if err != nil {
-		log.Warn("registry: reading the runner's repository failed", "error", err)
-		return grant{}, errUpstream
+		return grant{}, rq.githubFailed("registry: reading the runner's repository failed", err)
 	}
 	regOwner, regRepo, ok := registryNames(info.FullName)
 	if !ok {
@@ -365,16 +423,14 @@ func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, re
 	}
 	run, err := s.o.GitHub.GetWorkflowRun(ctx, repo, j.RunID)
 	if err != nil {
-		log.Warn("registry: reading the job's workflow run failed", "job", j.ID, "error", err)
-		return grant{}, errUpstream
+		return grant{}, rq.githubFailed("registry: reading the job's workflow run failed", err, "job", j.ID)
 	}
 	trust, err := s.trust(ctx, repo, repoID, run)
 	if err != nil {
-		log.Warn("registry: resolving the trust level failed", "job", j.ID, "error", err)
-		return grant{}, errUpstream
+		return grant{}, rq.githubFailed("registry: resolving the trust level failed", err, "job", j.ID)
 	}
 	st.job, st.jobAt = &j, now
-	st.grant = grant{repoID: repoID, owner: regOwner, repo: regRepo, trust: trust, event: run.Event}
+	st.grant = grant{repoID: repoID, owner: regOwner, repo: regRepo, trust: trust}
 	log.Info("registry: runner resolved", "repository", full, "job", j.ID, "workflowRun", j.RunID, "event", run.Event, "trust", trust)
 	return st.grant, nil
 }
@@ -383,42 +439,64 @@ func onRunner(j githubapp.WorkflowJob, runner string) bool {
 	return j.RunnerName != nil && *j.RunnerName == runner
 }
 
-// findJob confirms the candidate a pass or delivery named, else searches
-// the repository's in_progress runs at most once per searchGap.
-func (s *Server) findJob(ctx context.Context, st *runnerState, repo githubapp.Repository, full, runner string, log *slog.Logger) (githubapp.WorkflowJob, error) {
-	if cand, jobID, ok := s.o.Runners.CandidateJob(runner); ok && strings.EqualFold(cand, full) {
-		j, err := s.o.GitHub.GetWorkflowJob(ctx, repo, jobID)
-		var apiErr *githubapp.APIError
-		switch {
-		case err == nil && onRunner(j, runner) && j.Status == "in_progress":
-			return j, nil
-		case err == nil && onRunner(j, runner) && j.Status == "completed":
-			st.finished = true
-			return githubapp.WorkflowJob{}, errUnauthorized
-		case err != nil && !(errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound):
-			log.Warn("registry: reading the runner's candidate job failed", "job", jobID, "error", err)
-			return githubapp.WorkflowJob{}, errUpstream
+// findJob confirms the runner's candidate job against GitHub. Without one,
+// or when GitHub contradicts it, it runs the repository's shared fallback
+// search, which publishes candidates for every runner it sees, and confirms
+// the runner's new candidate.
+func (rq *request) findJob(ctx context.Context, repo githubapp.Repository, repoID int64, full string) (githubapp.WorkflowJob, error) {
+	j, tried, ok, err := rq.confirmCandidate(ctx, repo, full)
+	if ok || err != nil {
+		return j, err
+	}
+	if err := rq.s.o.Runners.SearchRunnerJobs(ctx, repo, repoID, rq.github); err != nil {
+		if errors.Is(err, errLimited) || errors.Is(err, errUpstream) {
+			return githubapp.WorkflowJob{}, err
 		}
+		return githubapp.WorkflowJob{}, rq.githubFailed("registry: searching for the runner's job failed", err)
 	}
-	now := s.o.Now()
-	if now.Sub(st.searchedAt) < searchGap {
+	if _, jobID, ok := rq.s.o.Runners.CandidateJob(rq.runner); !ok || jobID == tried {
 		return githubapp.WorkflowJob{}, errUnresolved
 	}
-	st.searchedAt = now
-	j, found, err := s.o.Runners.FindRunnerJob(ctx, repo, runner)
-	if err != nil {
-		log.Warn("registry: searching for the runner's job failed", "error", err)
-		return githubapp.WorkflowJob{}, errUpstream
+	j, _, ok, err = rq.confirmCandidate(ctx, repo, full)
+	if err == nil && !ok {
+		err = errUnresolved
 	}
-	if !found {
-		return githubapp.WorkflowJob{}, errUnresolved
+	return j, err
+}
+
+// confirmCandidate reads the runner's candidate job. ok reports that GitHub
+// shows it in_progress on this runner; a candidate it shows completed on
+// this runner ends the runner. jobID is the candidate read, or 0.
+func (rq *request) confirmCandidate(ctx context.Context, repo githubapp.Repository, full string) (j githubapp.WorkflowJob, jobID int64, ok bool, err error) {
+	cand, jobID, found := rq.s.o.Runners.CandidateJob(rq.runner)
+	if !found || !strings.EqualFold(cand, full) {
+		return githubapp.WorkflowJob{}, 0, false, nil
 	}
-	return j, nil
+	if err := rq.github(); err != nil {
+		return githubapp.WorkflowJob{}, jobID, false, err
+	}
+	j, err = rq.s.o.GitHub.GetWorkflowJob(ctx, repo, jobID)
+	var apiErr *githubapp.APIError
+	switch {
+	case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound:
+		return githubapp.WorkflowJob{}, jobID, false, nil
+	case err != nil:
+		return githubapp.WorkflowJob{}, jobID, false, rq.githubFailed("registry: reading the runner's candidate job failed", err, "job", jobID)
+	case j.ID != jobID || !onRunner(j, rq.runner):
+		return githubapp.WorkflowJob{}, jobID, false, nil
+	case j.Status == "in_progress":
+		return j, jobID, true, nil
+	case j.Status == "completed":
+		rq.st.finished, rq.st.creds = true, nil
+		return githubapp.WorkflowJob{}, jobID, false, errUnauthorized
+	}
+	return githubapp.WorkflowJob{}, jobID, false, nil
 }
 
 // credentials returns the runner's cached session, or assumes the registry
-// role for it. The caller holds st.mu.
-func (s *Server) credentials(ctx context.Context, st *runnerState, runner string, g grant, log *slog.Logger) (*ststypes.Credentials, error) {
+// role for it.
+func (rq *request) credentials(ctx context.Context, g grant) (*ststypes.Credentials, error) {
+	s, st, log := rq.s, rq.st, rq.log
 	if st.creds != nil && s.o.Now().Add(refreshBefore).Before(*st.creds.Expiration) {
 		return st.creds, nil
 	}
@@ -426,6 +504,9 @@ func (s *Server) credentials(ctx context.Context, st *runnerState, runner string
 	if err != nil {
 		log.Warn("registry: building the session policy failed", "error", err)
 		return nil, errUpstream
+	}
+	if err := rq.upstream(); err != nil {
+		return nil, err
 	}
 	out, err := s.o.STS.AssumeRole(ctx, &sts.AssumeRoleInput{
 		RoleArn:         aws.String(s.o.Config.RoleARN),

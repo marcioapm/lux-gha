@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,34 +12,64 @@ import (
 )
 
 // Assignment is a candidate for the job a runner of this instance executes:
-// a job a pass listed as in_progress on it, or a signed in_progress delivery
-// naming it. The registry listener confirms it with a job read before use.
+// a job a pass or a search listed as in_progress on it, or a signed
+// in_progress delivery naming it. The registry listener confirms it with a
+// job read before use.
 type Assignment struct {
 	Repository string // owner/name
 	JobID      int64
 	RunID      int64
+	// fromPass: a pass's listing put it there, and the next pass's listing
+	// replaces it. Others (deliveries, searches) are kept until a pass
+	// contradicts them, the runner's Run ends, or assignmentTTL passes.
+	fromPass bool
+	at       time.Time
 }
 
-// attribution publishes, for the registry's runner listener, what passes and
-// deliveries learn of runner-to-job assignment (README "Runner attribution")
-// and of repository names. Passes and webhook goroutines write it; listener
-// goroutines read it.
+const (
+	// assignmentTTL bounds how long a candidate is offered. A JIT runner's
+	// job is confirmed within its first seconds, so an older one is stale.
+	assignmentTTL = 10 * time.Minute
+	// completedTTL bounds how long a completed delivery is remembered; the
+	// registry listener keeps its own refusal for the runner after reading it.
+	completedTTL = 2 * time.Hour
+	// searchGap spaces a repository's fallback searches.
+	searchGap = 5 * time.Second
+	// searchPageBudget bounds the GitHub pages one search reads, runs and
+	// jobs listings together; the runs listing is newest first.
+	searchPageBudget = 2 * maxRunPages
+)
+
+// attribution publishes, for the registry's runner listener, what passes,
+// searches and deliveries learn of runner-to-job assignment (README "Runner
+// attribution") and of repository names. Passes, webhook goroutines and
+// listener goroutines share it.
 type attribution struct {
-	mu        sync.Mutex
-	byRunner  map[string]Assignment
-	names     map[int64]string     // repo id: owner/name
-	completed map[string]time.Time // runner name: when a completed delivery named it
+	mu         sync.Mutex
+	byRunner   map[string]Assignment
+	names      map[int64]string     // repo id: owner/name
+	completed  map[string]time.Time // runner name: when a completed delivery named it
+	searchedAt map[int64]time.Time  // repo id: last search start
+	searching  map[int64]*searchFlight
+}
+
+type searchFlight struct {
+	done chan struct{}
+	err  error
 }
 
 func newAttribution() *attribution {
-	return &attribution{byRunner: map[string]Assignment{}, names: map[int64]string{}, completed: map[string]time.Time{}}
+	return &attribution{byRunner: map[string]Assignment{}, names: map[int64]string{}, completed: map[string]time.Time{},
+		searchedAt: map[int64]time.Time{}, searching: map[int64]*searchFlight{}}
 }
 
-// observe replaces the assignments a repository read this pass holds with
-// the in_progress jobs its listing put on this instance's runners. A runner
-// no longer listed is forgotten: its job completed, or GitHub listed it
-// elsewhere.
-func (a *attribution) observe(v *repoView) {
+// observe publishes a repository read by a pass that started at start. The
+// pass's own assignments for the repository are replaced by the in_progress
+// jobs its listing put on this instance's runners. Any other assignment is
+// kept unless the listing, taken after it was recorded, showed its job
+// completed or in_progress on another runner, or put the runner on another
+// job. A job still listed queued is GitHub's lag, not a contradiction.
+func (a *attribution) observe(v *repoView, start time.Time) {
 	if a == nil {
 		return
 	}
@@ -46,12 +77,32 @@ func (a *attribution) observe(v *repoView) {
 	defer a.mu.Unlock()
 	a.names[v.id] = v.full
 	for name, as := range a.byRunner {
-		if strings.EqualFold(as.Repository, v.full) {
+		if !strings.EqualFold(as.Repository, v.full) {
+			continue
+		}
+		on, running := v.inProgressOn[as.JobID]
+		contradicted := !as.at.After(start) && (v.completed[as.JobID] || running && on != name)
+		if as.fromPass || contradicted || start.Sub(as.at) > assignmentTTL {
 			delete(a.byRunner, name)
 		}
 	}
 	for _, j := range v.stuck {
-		a.byRunner[*j.RunnerName] = Assignment{Repository: v.full, JobID: j.ID, RunID: j.RunID}
+		a.byRunner[*j.RunnerName] = Assignment{Repository: v.full, JobID: j.ID, RunID: j.RunID, fromPass: true, at: start}
+	}
+}
+
+// forgetEnded drops the assignments, recorded before a Lux listing taken
+// at start, of runners with no live Run in it.
+func (a *attribution) forgetEnded(live map[string]bool, start time.Time) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for name, as := range a.byRunner {
+		if !live[name] && as.at.Before(start) {
+			delete(a.byRunner, name)
+		}
 	}
 }
 
@@ -72,13 +123,9 @@ func (r *Reconciler) noteInProgress(repository string, runner string, jobID, run
 		return
 	}
 	r.att.mu.Lock()
-	r.att.byRunner[runner] = Assignment{Repository: repository, JobID: jobID, RunID: runID}
+	r.att.byRunner[runner] = Assignment{Repository: repository, JobID: jobID, RunID: runID, at: r.now()}
 	r.att.mu.Unlock()
 }
-
-// completedTTL bounds how long a completed delivery is remembered; the
-// registry listener keeps its own refusal for the runner after reading it.
-const completedTTL = 2 * time.Hour
 
 // noteCompleted records a signed completed delivery naming one of this
 // instance's runners. A JIT runner executes one job, so the runner is done.
@@ -109,8 +156,9 @@ func (r *Reconciler) RunnerCompleted(runner string) bool {
 	return ok
 }
 
-// RunnerAssignment returns the last job a pass or delivery put on runner.
-// It is a candidate only: GitHub's job record decides.
+// RunnerAssignment returns the last job a pass, search or delivery put on
+// runner within assignmentTTL. It is a candidate only: GitHub's job record
+// decides.
 func (r *Reconciler) RunnerAssignment(runner string) (Assignment, bool) {
 	if r.att == nil {
 		return Assignment{}, false
@@ -118,6 +166,9 @@ func (r *Reconciler) RunnerAssignment(runner string) (Assignment, bool) {
 	r.att.mu.Lock()
 	defer r.att.mu.Unlock()
 	as, ok := r.att.byRunner[runner]
+	if ok && r.now().Sub(as.at) > assignmentTTL {
+		return Assignment{}, false
+	}
 	return as, ok
 }
 
@@ -172,25 +223,101 @@ func (r *Reconciler) LiveRun(ctx context.Context, runner string, repoID int64) (
 	return false, nil
 }
 
-// FindRunnerJob lists the repository's in_progress workflow runs and their
-// latest-attempt jobs, the listing a pass reads, for the job GitHub shows on
-// runner. It is the fallback when neither a pass nor a delivery has named
-// one yet; pages are bounded as in a pass.
-func (r *Reconciler) FindRunnerJob(ctx context.Context, repo githubapp.Repository, runner string) (githubapp.WorkflowJob, bool, error) {
-	for page := 1; page <= maxRunPages; page++ {
+// RateLimitedUntil is when GitHub's last rate limit on the installation,
+// seen by a pass or by the registry listener, ends.
+func (r *Reconciler) RateLimitedUntil() time.Time {
+	r.limitMu.Lock()
+	defer r.limitMu.Unlock()
+	return r.rateLimitedUntil
+}
+
+// NoteRateLimit records err if it is a GitHub rate limit, so passes and the
+// registry listener both stop calling GitHub until it ends.
+func (r *Reconciler) NoteRateLimit(err error) {
+	var apiErr *githubapp.APIError
+	if !errors.As(err, &apiErr) || !apiErr.RateLimited {
+		return
+	}
+	r.limitMu.Lock()
+	defer r.limitMu.Unlock()
+	if apiErr.RetryAt.After(r.rateLimitedUntil) {
+		r.rateLimitedUntil = apiErr.RetryAt
+	}
+}
+
+// SearchRunnerJobs is the fallback when neither a pass nor a delivery has
+// named a runner's job yet. It lists the repository's in_progress workflow
+// runs and their latest-attempt jobs, newest first and within
+// searchPageBudget pages, and publishes every in_progress job on one of
+// this instance's runners as a candidate. A repository is searched at most
+// once per searchGap; concurrent callers share one search and its error.
+// before runs ahead of the first GitHub call, and its error is returned
+// without a search.
+func (r *Reconciler) SearchRunnerJobs(ctx context.Context, repo githubapp.Repository, repoID int64, before func() error) error {
+	a := r.att
+	if a == nil {
+		return nil
+	}
+	now := r.now()
+	a.mu.Lock()
+	if f, ok := a.searching[repoID]; ok {
+		a.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if now.Sub(a.searchedAt[repoID]) < searchGap {
+		a.mu.Unlock()
+		return nil
+	}
+	if err := before(); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	f := &searchFlight{done: make(chan struct{})}
+	a.searching[repoID], a.searchedAt[repoID] = f, now
+	a.mu.Unlock()
+
+	jobs, err := r.searchInProgress(ctx, repo, repoID)
+	r.NoteRateLimit(err)
+	a.mu.Lock()
+	for _, j := range jobs {
+		a.byRunner[*j.RunnerName] = Assignment{Repository: repo.Owner + "/" + repo.Name, JobID: j.ID, RunID: j.RunID, at: now}
+	}
+	f.err = err
+	delete(a.searching, repoID)
+	a.mu.Unlock()
+	close(f.done)
+	return err
+}
+
+// searchInProgress returns the in_progress jobs on this instance's runners
+// that the first searchPageBudget pages show, found before any error.
+func (r *Reconciler) searchInProgress(ctx context.Context, repo githubapp.Repository, repoID int64) ([]githubapp.WorkflowJob, error) {
+	var found []githubapp.WorkflowJob
+	budget := searchPageBudget
+	for page := 1; page <= maxRunPages && budget > 0; page++ {
+		budget--
 		runs, err := r.gh.ListWorkflowRuns(ctx, repo, githubapp.WorkflowRunListOptions{PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Status: "in_progress"})
 		if err != nil {
-			return githubapp.WorkflowJob{}, false, err
+			return found, err
 		}
 		for _, run := range runs.Runs {
 			for jp := 1; jp <= maxRunPages; jp++ {
+				if budget <= 0 {
+					return found, nil
+				}
+				budget--
 				jobs, err := r.gh.ListWorkflowRunJobs(ctx, repo, run.ID, githubapp.WorkflowJobListOptions{PageOptions: githubapp.PageOptions{Page: jp, PerPage: pageSize}, Filter: "latest"})
 				if err != nil {
-					return githubapp.WorkflowJob{}, false, err
+					return found, err
 				}
 				for _, j := range jobs.Jobs {
-					if j.Status == "in_progress" && j.RunnerName != nil && *j.RunnerName == runner {
-						return j, true, nil
+					if j.Status == "in_progress" && j.RunnerName != nil && r.managedRunner(repoID, *j.RunnerName) {
+						found = append(found, j)
 					}
 				}
 				if !jobs.HasNext {
@@ -202,5 +329,5 @@ func (r *Reconciler) FindRunnerJob(ctx context.Context, repo githubapp.Repositor
 			break
 		}
 	}
-	return githubapp.WorkflowJob{}, false, nil
+	return found, nil
 }

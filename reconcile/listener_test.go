@@ -325,6 +325,7 @@ func TestRegistryDefaultBranchComesFromTheRepository(t *testing.T) {
 	if _, a := l.registry(runner); a.Trust != "untrusted" {
 		t.Fatalf("push on main with default trunk: %+v", a)
 	}
+	l.clock.Add(searchGap)
 	other := l.provisionAndRun(8, githubapp.WorkflowRun{Event: "push", HeadBranch: str("trunk"), HeadRepository: headRepo(1001)})
 	if _, a := l.registry(other); a.Trust != "trusted" {
 		t.Fatalf("push on trunk: %+v", a)
@@ -586,43 +587,221 @@ func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 }
 
 // A hook retrying through GitHub's attribution lag sees 409 until the job
-// shows its runner, then 200; a token beyond its bucket is refused with 503
-// while another runner is served.
-func TestRegistryResolvesAfterAttributionLagAndRateLimitsPerToken(t *testing.T) {
+// shows its runner, then 200; the repository's fallback search runs at most
+// once per searchGap.
+func TestRegistryResolvesAfterAttributionLag(t *testing.T) {
 	l := newListener(t)
 	l.gh.queue(7, "queued", "self-hosted", "lux")
 	l.gh.describeRun(githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
-	l.gh.queue(8, "queued", "self-hosted", "lux")
 	l.pass()
-	a, b := "lux-gha-t1-1001-7-0", "lux-gha-t1-1001-8-0"
+	a := "lux-gha-t1-1001-7-0"
 	if code, _ := l.registry(a); code != http.StatusConflict {
 		t.Fatalf("before pickup: %d", code)
 	}
 	if err := l.gh.pick(a, 7); err != nil {
 		t.Fatal(err)
 	}
-	// The fallback search runs at most every 5 s per runner.
 	if code, _ := l.registry(a); code != http.StatusConflict {
 		t.Fatalf("within the search gap: %d", code)
 	}
-	l.clock.Add(5 * time.Second)
+	l.clock.Add(searchGap)
 	if code, got := l.registry(a); code != http.StatusOK || got.Trust != "trusted" {
 		t.Fatalf("after pickup: %d %+v", code, got)
 	}
-	limited := 0
+}
+
+// The per-runner bucket (30, refilled at 0.5/s) is charged only by a
+// request that calls an upstream: a runner whose candidate GitHub keeps
+// contradicting is refused with 503 after exactly 30 requests, while a
+// resolved runner answered from its cache is never limited.
+func TestRegistryRateLimitsUpstreamRequestsPerToken(t *testing.T) {
+	l := newListener(t)
+	l.gh.queue(7, "queued", "self-hosted", "lux")
+	l.gh.queue(8, "queued", "self-hosted", "lux")
+	l.gh.describeRun(githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	l.pass()
+	a, b := "lux-gha-t1-1001-7-0", "lux-gha-t1-1001-8-0"
+	if err := l.gh.pick(a, 7); err != nil {
+		t.Fatal(err)
+	}
+	l.pass()
+	if code, _ := l.registry(a); code != http.StatusOK {
+		t.Fatalf("a: %d", code)
+	}
+	// A delivery names b on job 8, which GitHub still shows queued: every
+	// request for b reads the job.
+	hook, err := l.rec.Webhook([]byte("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", b, 8)); err != nil {
+		t.Fatal(err)
+	}
+	codes := map[int]int{}
 	for range 40 {
-		if code, _ := l.registry(a); code == http.StatusServiceUnavailable {
-			limited++
+		code, _ := l.registry(b)
+		codes[code]++
+	}
+	if codes[http.StatusConflict] != 30 || codes[http.StatusServiceUnavailable] != 10 {
+		t.Fatalf("b: %v", codes)
+	}
+	for range 40 {
+		if code, _ := l.registry(a); code != http.StatusOK {
+			t.Fatalf("cached runner limited: %d", code)
 		}
 	}
-	if limited == 0 || limited > 40-27 {
-		t.Fatalf("limited %d of 40", limited)
-	}
+	l.clock.Add(2 * time.Second) // one token
 	if code, _ := l.registry(b); code != http.StatusConflict {
-		t.Fatalf("another runner during the first's limit: %d", code)
+		t.Fatalf("after one token: %d", code)
 	}
-	l.clock.Add(10 * time.Second)
+	if code, _ := l.registry(b); code != http.StatusServiceUnavailable {
+		t.Fatalf("token spent: %d", code)
+	}
+}
+
+// ghCalls counts the fake GitHub's calls per operation since the last reset.
+func (l *listener) ghCalls() map[string]int {
+	l.gh.mu.Lock()
+	defer l.gh.mu.Unlock()
+	out := maps.Clone(l.gh.opCount)
+	clear(l.gh.opCount)
+	return out
+}
+
+// One search per repository serves every runner it sees: a second runner
+// whose job no pass or delivery named resolves from the first runner's
+// search with one job read, inside the search gap.
+func TestRegistrySearchIsPerRepositoryAndPublishesEveryRunner(t *testing.T) {
+	l := newListener(t)
+	for _, id := range []int64{7, 8} {
+		l.gh.queue(id, "queued", "self-hosted", "lux")
+		l.gh.describeRun(githubapp.WorkflowRun{ID: id * 10, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	}
+	l.pass()
+	a, b := "lux-gha-t1-1001-7-0", "lux-gha-t1-1001-8-0"
+	for _, p := range [][2]any{{a, int64(7)}, {b, int64(8)}} {
+		if err := l.gh.pick(p[0].(string), p[1].(int64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.ghCalls()
 	if code, _ := l.registry(a); code != http.StatusOK {
-		t.Fatalf("after refill: %d", code)
+		t.Fatalf("a: %d", code)
+	}
+	if calls := l.ghCalls(); calls[opRuns] != 1 || calls[opJobs] != 2 {
+		t.Fatalf("search for a: %v", calls)
+	}
+	if code, _ := l.registry(b); code != http.StatusOK {
+		t.Fatalf("b: %d", code)
+	}
+	if calls := l.ghCalls(); calls[opRuns] != 0 || calls[opJobs] != 0 || calls[opGetJob] != 1 {
+		t.Fatalf("b resolved with %v, want one job read", calls)
+	}
+}
+
+// A search reads at most searchPageBudget pages of runs and jobs together.
+func TestRegistrySearchIsBounded(t *testing.T) {
+	l := newListener(t)
+	l.gh.queue(7, "queued", "self-hosted", "lux")
+	l.pass()
+	// 40 other in_progress runs listed before run 70, each with an
+	// in_progress job on another tool's runner, at 2 per page.
+	for i := int64(0); i < 40; i++ {
+		l.gh.queueIn(widgets, 1+i, 100+i, "queued", "other")
+		l.gh.pickElsewhere(widgets, 100+i, 9000+i, "elsewhere-"+strconv.FormatInt(i, 10))
+	}
+	a := "lux-gha-t1-1001-7-0"
+	if err := l.gh.pick(a, 7); err != nil {
+		t.Fatal(err)
+	}
+	l.ghCalls()
+	if code, _ := l.registry(a); code != http.StatusConflict {
+		t.Fatalf("status %d", code)
+	}
+	if calls := l.ghCalls(); calls[opRuns]+calls[opJobs] != searchPageBudget {
+		t.Fatalf("search pages %v, want %d", calls, searchPageBudget)
+	}
+}
+
+// While GitHub rate-limits the installation the listener answers 503 and
+// calls nothing; a rate limit the listener meets pauses the reconciler's
+// passes too.
+func TestRegistryHonoursTheSharedGitHubRateLimit(t *testing.T) {
+	l := newListener(t)
+	l.gh.queue(7, "queued", "self-hosted", "lux")
+	l.gh.describeRun(githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	l.pass()
+	a := "lux-gha-t1-1001-7-0"
+	if err := l.gh.pick(a, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	// The listener meets the limit: 503, and the next pass does not run.
+	l.gh.rateLimitUntil = l.clock.Now().Add(time.Minute)
+	if code, _ := l.registry(a); code != http.StatusServiceUnavailable {
+		t.Fatalf("rate-limited search: %d", code)
+	}
+	if until := l.rec.RateLimitedUntil(); !until.Equal(l.gh.rateLimitUntil) {
+		t.Fatalf("limit not fed back: %v", until)
+	}
+	l.ghCalls()
+	if st := l.pass(); st.Error != ErrRateLimited {
+		t.Fatalf("pass during the listener's limit: %+v", st)
+	}
+	l.clock.Add(searchGap)
+	if code, _ := l.registry(a); code != http.StatusServiceUnavailable {
+		t.Fatalf("during the limit: %d", code)
+	}
+	if calls := l.ghCalls(); len(calls) != 0 {
+		t.Fatalf("GitHub called during the limit: %v", calls)
+	}
+
+	l.clock.Add(time.Minute)
+	if code, got := l.registry(a); code != http.StatusOK || got.Trust != "trusted" {
+		t.Fatalf("after the limit: %d %+v", code, got)
+	}
+}
+
+// A delivery's candidate survives a pass that still lists its job queued
+// (GitHub's lag) and is dropped when a later pass lists the job completed,
+// when the runner's Run ends, or after assignmentTTL.
+func TestDeliveryCandidatesOutliveLaggingPasses(t *testing.T) {
+	for _, end := range []string{"job completed", "run ended", "ttl"} {
+		t.Run(end, func(t *testing.T) {
+			e := newRegistryEnv(t)
+			e.gh.queue(7, "queued", "self-hosted", "lux")
+			e.pass()
+			a := "lux-gha-t1-1001-7-0"
+			hook, err := e.rec.Webhook([]byte("s"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.clock.Add(time.Second)
+			if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", a, 7)); err != nil {
+				t.Fatal(err)
+			}
+			e.clock.Add(time.Second)
+			e.pass() // job 7 still listed queued
+			if as, ok := e.rec.RunnerAssignment(a); !ok || as.JobID != 7 {
+				t.Fatalf("delivery candidate dropped by a lagging pass: %+v %v", as, ok)
+			}
+			switch end {
+			case "job completed":
+				// A second job keeps run 70 in_progress, so the pass lists it.
+				e.gh.queueIn(widgets, 70, 71, "queued", "other")
+				e.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion, j.runner = "completed", "success", a })
+				e.clock.Add(time.Second)
+				e.pass()
+			case "run ended":
+				e.lux.end(e.runID("7"), "succeeded; resumePolicy never")
+				e.clock.Add(time.Second)
+				e.pass()
+			case "ttl":
+				e.clock.Add(assignmentTTL + time.Second)
+			}
+			if as, ok := e.rec.RunnerAssignment(a); ok {
+				t.Fatalf("candidate kept after %s: %+v", end, as)
+			}
+		})
 	}
 }
