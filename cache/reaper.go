@@ -220,23 +220,38 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		res.DeletedStaging, res.Errors = len(delStaging)-len(failed), res.Errors+len(failed)
 	}
 	if len(delEntries) > 0 {
-		keys := make([]string, len(delEntries))
-		for i, o := range delEntries {
-			keys[i] = o.Key
-		}
-		failed := map[string]bool{}
-		for _, k := range deleteBatched(ctx, rp.st, rp.log, keys) {
-			failed[k] = true
-		}
-		res.Errors += len(failed)
-		for _, o := range delEntries {
-			if !failed[o.Key] {
-				res.DeletedEntries++
-				res.DeletedBytes += o.Size
-			}
+		rp.deleteEntries(ctx, delEntries, &res)
+	}
+	rp.abortStaleUploads(ctx, now, &res)
+	rp.log.Info("cache reaper pass",
+		"entries", res.Entries, "bytes", res.Bytes, "staging_bytes", res.StagingBytes,
+		"deleted_entries", res.DeletedEntries, "deleted_bytes", res.DeletedBytes,
+		"deleted_staging", res.DeletedStaging, "aborted_uploads", res.AbortedUploads,
+		"errors", res.Errors)
+	return res, true
+}
+
+func (rp *reaper) deleteEntries(ctx context.Context, del []object, res *reapResult) {
+	keys := make([]string, len(del))
+	for i, o := range del {
+		keys[i] = o.Key
+	}
+	failed := map[string]bool{}
+	for _, k := range deleteBatched(ctx, rp.st, rp.log, keys) {
+		failed[k] = true
+	}
+	res.Errors += len(failed)
+	for _, o := range del {
+		if !failed[o.Key] {
+			res.DeletedEntries++
+			res.DeletedBytes += o.Size
 		}
 	}
+}
 
+// abortStaleUploads aborts the multipart uploads under the prefix started
+// more than stagingMaxAge before now.
+func (rp *reaper) abortStaleUploads(ctx context.Context, now time.Time, res *reapResult) {
 	var stale []pendingUpload
 	if err := rp.st.listUploads(ctx, rp.lay.prefix, func(u pendingUpload) bool {
 		if u.Initiated.Before(now.Add(-stagingMaxAge)) {
@@ -254,10 +269,4 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		}
 		res.AbortedUploads++
 	}
-	rp.log.Info("cache reaper pass",
-		"entries", res.Entries, "bytes", res.Bytes, "staging_bytes", res.StagingBytes,
-		"deleted_entries", res.DeletedEntries, "deleted_bytes", res.DeletedBytes,
-		"deleted_staging", res.DeletedStaging, "aborted_uploads", res.AbortedUploads,
-		"errors", res.Errors)
-	return res, true
 }
