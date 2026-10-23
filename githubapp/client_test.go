@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -721,8 +722,9 @@ func TestRepositoryPathRejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestTagCommitBranchExistsAndDefaultBranch(t *testing.T) {
+func TestTagCommitBranchContainsAndDefaultBranch(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const compare = "/repos/octo-org/app.repo/compare/" + sha + "...refs/heads/"
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "GET" && r.URL.EscapedPath() == "/repos/octo-org/app.repo/commits/refs/tags/release/v1+1%23x":
@@ -735,10 +737,31 @@ func TestTagCommitBranchExistsAndDefaultBranch(t *testing.T) {
 			w.Write([]byte("not-a-sha"))
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/repos/octo-org/app.repo/commits/refs/tags/"):
 			http.Error(w, `{"message":"No commit found for SHA"}`, 422)
-		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/git/ref/heads/release/x":
-			w.Write([]byte(`{"ref":"refs/heads/release/x","object":{"sha":"` + sha + `"}}`))
-		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo/git/ref/heads/down":
-			http.Error(w, "down", 502)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.EscapedPath(), compare):
+			if r.URL.Query().Get("per_page") != "1" {
+				http.Error(w, "per_page", 400)
+				return
+			}
+			switch strings.TrimPrefix(r.URL.EscapedPath(), compare) {
+			case "release/x":
+				w.Write([]byte(`{"url":"u","base_commit":{"sha":"` + sha + `","status":"x"},"status":"ahead","ahead_by":3,"files":[{"status":"added"}]}`))
+			case "at-tip":
+				w.Write([]byte(`{"status":"identical"}`))
+			case "behind":
+				w.Write([]byte(`{"status":"behind"}`))
+			case "diverged":
+				w.Write([]byte(`{"files":[],"status":"diverged"}`))
+			case "unrelated":
+				http.Error(w, `{"message":"No common ancestor"}`, 422)
+			case "odd":
+				w.Write([]byte(`{"status":"sideways"}`))
+			case "no-status":
+				w.Write([]byte(`{"ahead_by":1}`))
+			case "a%23b":
+				w.Write([]byte(`{"status":"identical"}`))
+			default:
+				http.NotFound(w, r)
+			}
 		case r.Method == "GET" && r.URL.Path == "/repos/octo-org/app.repo":
 			w.Write([]byte(`{"id":5,"full_name":"octo-org/app.repo","default_branch":"trunk"}`))
 		default:
@@ -760,17 +783,54 @@ func TestTagCommitBranchExistsAndDefaultBranch(t *testing.T) {
 			t.Errorf("tag name %q accepted", bad)
 		}
 	}
-	if ok, err := c.BranchExists(ctx, repo, "release/x"); err != nil || !ok {
-		t.Fatalf("branch: %v %v", ok, err)
+	for name, want := range map[string]bool{"release/x": true, "at-tip": true, "a#b": true, "behind": false, "diverged": false, "unrelated": false, "gone": false} {
+		if ok, err := c.BranchContains(ctx, repo, name, sha); err != nil || ok != want {
+			t.Errorf("branch %s: %v %v, want %v", name, ok, err, want)
+		}
 	}
-	if ok, err := c.BranchExists(ctx, repo, "nope"); err != nil || ok {
-		t.Fatalf("missing branch: %v %v", ok, err)
+	for _, name := range []string{"odd", "no-status"} {
+		if ok, err := c.BranchContains(ctx, repo, name, sha); err == nil {
+			t.Errorf("branch %s: %v with no error", name, ok)
+		}
 	}
-	if _, err := c.BranchExists(ctx, repo, "down"); err == nil {
-		t.Fatal("502 reported as an answer")
+	for _, bad := range []string{"", "a//b", "a..b", "x/.."} {
+		if _, err := c.BranchContains(ctx, repo, bad, sha); err == nil {
+			t.Errorf("branch name %q accepted", bad)
+		}
+	}
+	for _, bad := range []string{"", "main", strings.ToUpper(sha), sha + "...refs/heads/x"} {
+		if _, err := c.BranchContains(ctx, repo, "release/x", bad); err == nil {
+			t.Errorf("commit %q accepted", bad)
+		}
 	}
 	info, err := c.GetRepository(ctx, repo)
 	if err != nil || info.DefaultBranch != "trunk" {
 		t.Fatalf("info=%+v err=%v", info, err)
+	}
+}
+
+// Only "no such tag" (404, 422) and "not on the branch" (404, 422, behind,
+// diverged) are answers. Every other status is an error, so the registry
+// answers 503 rather than resolving a tag named like a branch as that
+// branch while GitHub is failing.
+func TestRefLookupsFailClosed(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	codes := []int{400, 401, 403, 409, 429, 500, 502}
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		code, _ := strconv.Atoi(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+		if code == 403 {
+			http.Error(w, `{"message":"Resource not accessible by integration"}`, 403)
+			return
+		}
+		http.Error(w, "refused", code)
+	})
+	for _, code := range codes {
+		name := strconv.Itoa(code)
+		if _, found, err := c.TagCommit(context.Background(), repo, name); err == nil {
+			t.Errorf("TagCommit %d: found=%v, nil error", code, found)
+		}
+		if ok, err := c.BranchContains(context.Background(), repo, name, sha); err == nil {
+			t.Errorf("BranchContains %d: %v, nil error", code, ok)
+		}
 	}
 }

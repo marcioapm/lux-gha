@@ -22,7 +22,7 @@ var trustedEvents = map[string]bool{"push": true, "workflow_dispatch": true, "sc
 //     (a fork), for every event;
 //  2. untrusted: the event is not a trusted event, or the run's ref does not
 //     resolve to exactly one of refs/tags/<name> at the run's head commit
-//     and refs/heads/<name>;
+//     and refs/heads/<name> containing it;
 //  3. trusted: the ref is the repository's default branch or matches a
 //     trustedRefs pattern;
 //  4. untrusted otherwise.
@@ -64,9 +64,12 @@ type cachedRef struct {
 
 // runRef resolves the run's head_branch, which the API fills with a tag's
 // name for a tag push, release or dispatch on a tag, to its full ref: the
-// tag when it points at the run's head commit, else the branch. ok is false
-// when the name is both such a tag and a branch, or neither. The answer is
-// reused for repositoryTTL per repository, name and commit.
+// tag when it points at the run's head commit, the branch when the branch
+// contains that commit. A branch name alone proves nothing: a tag named
+// "main", pushed and then deleted or moved, leaves only the branch to find.
+// ok is false when the name is both such a tag and such a branch, or
+// neither. The answer is reused for repositoryTTL per repository, name and
+// commit.
 func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, repoID int64, name, sha string) (string, bool, error) {
 	key := refKey{repoID, name, sha}
 	now := s.o.Now()
@@ -81,15 +84,15 @@ func (s *Server) runRef(ctx context.Context, repo githubapp.Repository, repoID i
 		return "", false, err
 	}
 	isTag = isTag && tagSHA == sha
-	isBranch, err := s.o.GitHub.BranchExists(ctx, repo, name)
+	onBranch, err := s.o.GitHub.BranchContains(ctx, repo, name, sha)
 	if err != nil {
 		return "", false, err
 	}
 	ref := ""
 	switch {
-	case isTag && !isBranch:
+	case isTag && !onBranch:
 		ref = "refs/tags/" + name
-	case isBranch && !isTag:
+	case onBranch && !isTag:
 		ref = "refs/heads/" + name
 	}
 	s.mu.Lock()

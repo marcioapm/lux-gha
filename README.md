@@ -936,7 +936,7 @@ Decided for the job the runner is executing, from its workflow run's `event`, `h
 | # | Level | Workflow run | Pull `<owner>/<repo>/*` | Push |
 |---|---|---|---|---|
 | 1 | `read-only` | any event whose `head_repository` is missing or is another repository (`head_repository.id` ≠ the repository's): a pull request, review or review comment from a fork, `pull_request_target` from a fork, a `workflow_run` triggered from a fork | yes | nothing |
-| 2 | `untrusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` whose `head_branch` is both a tag at `head_sha` and a branch, or neither | yes | `<owner>/<repo>/pr/*` |
+| 2 | `untrusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` whose `head_branch` is both a tag at `head_sha` and a branch containing `head_sha`, or neither | yes | `<owner>/<repo>/pr/*` |
 | 3 | `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on `refs/heads/<default branch>` (always) or on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<owner>/<repo>/*` |
 | 4 | `untrusted` | anything else: a same-repository pull request (from any branch, `release/*` included), same-repository `pull_request_target`, `merge_group`, `issue_comment`, a push or dispatch on another branch, a tag named like a trusted branch | yes | `<owner>/<repo>/pr/*` |
 | | none (`401`/`409`/`503`) | the job cannot be resolved, the Run is not live, the job is not `in_progress` on this runner, or an upstream is down | | |
@@ -944,9 +944,15 @@ Decided for the job the runner is executing, from its workflow run's `event`, `h
 The API reports a tag push, a release or a dispatch on a tag by the tag's name in `head_branch`, like a
 branch. For the events of rows 2 and 3 the bridge resolves the name with
 `GET /repos/{owner}/{repo}/commits/refs/tags/{name}` (which peels an annotated tag): a tag of that name at
-the run's `head_sha` makes the ref `refs/tags/<name>`. `GET /repos/{owner}/{repo}/git/ref/heads/{name}`
-confirms a branch. A name that is both is untrusted, and so is one that is neither (a deleted branch). A
-tag named `main` therefore resolves to `refs/tags/main`, which no trusted pattern matches. The answer is
+the run's `head_sha` makes the ref `refs/tags/<name>`.
+`GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}` makes it `refs/heads/<name>` only when the
+branch contains `head_sha` (status `identical` or `ahead`); `behind`, `diverged`, a missing branch or an
+unrelated history (`404`, `422`) do not. A branch name alone is not enough: a tag named `main` pushed at
+an arbitrary commit and deleted or moved before the job starts would otherwise resolve to the default
+branch. A commit that is on the branch reached it through the branch's protection, so a re-run of an
+older commit of `main` stays trusted. A name that is both is untrusted, and so is one that is neither (a
+deleted branch). A tag named `main` therefore resolves to `refs/tags/main`, which no trusted pattern
+matches. Any other GitHub answer is `503`, never a guess. The answer is
 cached per repository, name and commit for 10 minutes. A reusable workflow's jobs report the caller's
 event. "Trusted" relies on branch and tag protection for the trusted refs: anyone who can push a
 `release/*` branch or a `v*` tag gets trusted credentials.
@@ -1055,7 +1061,8 @@ Repository permissions, and nothing else:
 | Administration | Read and write | `generate-jitconfig`, listing and deleting repository runners |
 | Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs (also the registry's runner attribution); force-cancelling a workflow run whose job's Lux Run was stopped, and re-running a job whose Run's host was lost |
 | Checks | Read and write | A check run explaining why Lux stopped a job, and listing it so it is posted once |
-| Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch and `GET /repos/{owner}/{repo}/tags` |
+| Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch |
+| Contents | Read-only | With a registry only: resolving a run's ref (`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` and `GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}`, see [Trust levels](#trust-levels)). Without it every trust decision is `503`. |
 
 Subscribe to the **Workflow job** webhook event. With a registry, its `in_progress` deliveries let the runner listener find a runner's job before the next pass lists it.
 

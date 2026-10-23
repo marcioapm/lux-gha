@@ -268,6 +268,13 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 		}
 		return resp.Header, e
 	}
+	if cs, ok := out.(*compareStatus); ok {
+		cs.status, err = readCompareStatus(io.LimitReader(resp.Body, maxBody))
+		if err != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return resp.Header, err
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		if ctx.Err() != nil {

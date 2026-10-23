@@ -141,7 +141,8 @@ func headRepo(id int64) *githubapp.HeadRepository { return &githubapp.HeadReposi
 
 // One case per row of the trust table, decided from the workflow run of the
 // job the runner executes. The run's head commit is fakeSHA(70); acme/widgets
-// has branches main (default), trunk, release/x, feature, releasex/1 and fix.
+// has branches main (default), trunk, release/x, feature, releasex/1 and fix,
+// each containing every run's head commit unless a case sets its history.
 func TestRegistryTrustTable(t *testing.T) {
 	read := regHost + "/acme/widgets"
 	run := func(event, branch string, head *githubapp.HeadRepository) githubapp.WorkflowRun {
@@ -149,6 +150,7 @@ func TestRegistryTrustTable(t *testing.T) {
 	}
 	same, fork := headRepo(1001), headRepo(2002)
 	tagAtHead := func(name string) func(*listener) { return func(l *listener) { l.gh.tag(name, fakeSHA(70)) } }
+	offMain := func(l *listener) { l.gh.branchAt("main", fakeSHA(99), fakeSHA(5)) }
 	for _, tc := range []struct {
 		name  string
 		run   githubapp.WorkflowRun
@@ -206,6 +208,45 @@ func TestRegistryTrustTable(t *testing.T) {
 			l.gh.tag("v1", fakeSHA(70))
 		}, "untrusted", read + "/pr"},
 		{"neither tag nor branch", run("push", "gone", same), nil, "untrusted", read + "/pr"},
+		// A branch counts only when it contains the run's head commit
+		// (fakeSHA(70)); offMain leaves it off main, and a tag that pointed
+		// at it is gone or moved by the time the job asks.
+		{"push on main at its tip", run("push", "main", same), func(l *listener) { l.gh.branchAt("main", fakeSHA(70), fakeSHA(5)) }, "trusted", read},
+		{"old commit on main re-run", run("push", "main", same), func(l *listener) {
+			l.gh.branchAt("main", fakeSHA(99), fakeSHA(70), fakeSHA(5))
+		}, "trusted", read},
+		{"deleted tag main", run("push", "main", same), func(l *listener) {
+			offMain(l)
+			l.gh.tag("main", fakeSHA(70))
+			l.gh.untag("main")
+		}, "untrusted", read + "/pr"},
+		{"tag main moved off the head commit", run("push", "main", same), func(l *listener) {
+			offMain(l)
+			l.gh.tag("main", fakeSHA(1))
+		}, "untrusted", read + "/pr"},
+		{"workflow_run, tag main moved", run("workflow_run", "main", same), func(l *listener) {
+			offMain(l)
+			l.gh.tag("main", fakeSHA(1))
+		}, "untrusted", read + "/pr"},
+		{"tag release/x deleted", run("push", "release/x", same), func(l *listener) {
+			l.gh.branchAt("release/x", fakeSHA(99), fakeSHA(5))
+			l.gh.tag("release/x", fakeSHA(70))
+			l.gh.untag("release/x")
+		}, "untrusted", read + "/pr"},
+		{"dispatch on tag release/x moved", run("workflow_dispatch", "release/x", same), func(l *listener) {
+			l.gh.branchAt("release/x", fakeSHA(99), fakeSHA(5))
+			l.gh.tag("release/x", fakeSHA(1))
+		}, "untrusted", read + "/pr"},
+		{"feature branch commit, tag main deleted", run("push", "main", same), func(l *listener) {
+			offMain(l)
+			l.gh.branchAt("feature", fakeSHA(70), fakeSHA(5))
+			l.gh.tag("main", fakeSHA(70))
+			l.gh.untag("main")
+		}, "untrusted", read + "/pr"},
+		{"tag main at the head commit, not on main", run("push", "main", same), func(l *listener) {
+			offMain(l)
+			l.gh.tag("main", fakeSHA(70))
+		}, "untrusted", read + "/pr"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newListener(t)

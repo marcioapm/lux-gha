@@ -58,11 +58,23 @@ type fakeRepo struct {
 	forceCancels                    []int64
 	// defaultBranch and fullName are GET /repos' default_branch ("main"
 	// when empty) and full_name (the requested owner/name when empty);
-	// tags maps a tag name to its (peeled) commit; branches holds the
-	// branch names that exist.
+	// tags maps a tag name to its (peeled) commit; branches maps a branch
+	// name to its history.
 	defaultBranch, fullName string
 	tags                    map[string]string
-	branches                map[string]bool
+	branches                map[string]*fakeBranch
+}
+
+// fakeBranch is a branch's tip and the commits reachable from it. A nil
+// history is the shared history of every workflow run's head commit, which
+// most tests need of main and the other branches they push on.
+type fakeBranch struct {
+	tip     string
+	history map[string]bool
+}
+
+func (b *fakeBranch) contains(sha string) bool {
+	return b.history == nil || sha == b.tip || b.history[sha]
 }
 
 // Fake GitHub operations, for fail.
@@ -130,7 +142,7 @@ func newFakeGitHub(clock *fakeClock) *fakeGitHub {
 
 func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
 	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, runs: map[int64]githubapp.WorkflowRun{}, unlisted: map[string]bool{},
-		tags: map[string]string{}, branches: map[string]bool{"main": true}}
+		tags: map[string]string{}, branches: map[string]*fakeBranch{"main": {}}}
 	f.repos[full] = r
 	return r
 }
@@ -184,17 +196,20 @@ func (f *fakeGitHub) TagCommit(_ context.Context, repo githubapp.Repository, nam
 	return sha, ok, nil
 }
 
-func (f *fakeGitHub) BranchExists(_ context.Context, repo githubapp.Repository, name string) (bool, error) {
+// BranchContains is the compare's yes for identical or ahead; a missing
+// branch, behind and diverged are no.
+func (f *fakeGitHub) BranchContains(_ context.Context, repo githubapp.Repository, name, sha string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, err := f.gate(opBranch, repo, 0)
 	if err != nil {
 		return false, err
 	}
-	if name == "" {
-		return false, errors.New("fake: invalid ref name")
+	if name == "" || sha == "" {
+		return false, errors.New("fake: invalid ref name or commit")
 	}
-	return r.branches[name], nil
+	b, ok := r.branches[name]
+	return ok && b.contains(sha), nil
 }
 
 // tag adds a tag at sha to acme/widgets.
@@ -204,13 +219,37 @@ func (f *fakeGitHub) tag(name, sha string) {
 	f.repos[widgets].tags[name] = sha
 }
 
-// branch adds or removes branches of acme/widgets.
+// untag deletes tag name of acme/widgets.
+func (f *fakeGitHub) untag(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.repos[widgets].tags, name)
+}
+
+// branch adds branches of acme/widgets holding every run's head commit,
+// or removes them.
 func (f *fakeGitHub) branch(exists bool, names ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, n := range names {
-		f.repos[widgets].branches[n] = exists
+		if exists {
+			f.repos[widgets].branches[n] = &fakeBranch{}
+		} else {
+			delete(f.repos[widgets].branches, n)
+		}
 	}
+}
+
+// branchAt sets branch name of acme/widgets to tip, with ancestors as the
+// rest of its history.
+func (f *fakeGitHub) branchAt(name, tip string, ancestors ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h := map[string]bool{}
+	for _, a := range ancestors {
+		h[a] = true
+	}
+	f.repos[widgets].branches[name] = &fakeBranch{tip: tip, history: h}
 }
 
 func (r *fakeRepo) runStatus(runID int64) string {

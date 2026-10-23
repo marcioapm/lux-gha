@@ -63,7 +63,7 @@ type GitHub interface {
 	GetWorkflowJob(context.Context, githubapp.Repository, int64) (githubapp.WorkflowJob, error)
 	GetWorkflowRun(context.Context, githubapp.Repository, int64) (githubapp.WorkflowRun, error)
 	TagCommit(ctx context.Context, repo githubapp.Repository, name string) (sha string, found bool, err error)
-	BranchExists(ctx context.Context, repo githubapp.Repository, name string) (bool, error)
+	BranchContains(ctx context.Context, repo githubapp.Repository, name, sha string) (bool, error)
 }
 
 type STS interface {
