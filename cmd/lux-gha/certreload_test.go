@@ -3,12 +3,8 @@
 package main
 
 import (
-	"crypto/tls"
 	"crypto/x509"
-	"io"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,66 +12,6 @@ import (
 	"testing"
 	"time"
 )
-
-// reloaderAt is a reloader on a test clock, serving TLS on loopback, and
-// served() reports the certificate a new connection is given.
-type reloaderAt struct {
-	r       *certReloader
-	logs    *countHandler
-	mu      sync.Mutex
-	now     time.Time
-	addr    string
-	cleanup func()
-}
-
-func newReloaderAt(t *testing.T, certFile, keyFile string) *reloaderAt {
-	t.Helper()
-	h := &reloaderAt{logs: &countHandler{msgs: map[string]int{}}}
-	r, err := newCertReloader(certFile, keyFile, slog.New(h.logs))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The test clock starts where the reloader's last check was, so
-	// advance(certCheckInterval) is exactly one interval later.
-	h.now = r.checked
-	r.now = func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.now }
-	h.r = r
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })}
-	go srv.Serve(tls.NewListener(ln, r.tlsConfig()))
-	t.Cleanup(func() { srv.Close() })
-	h.addr = ln.Addr().String()
-	return h
-}
-
-func (h *reloaderAt) advance(d time.Duration) { h.mu.Lock(); h.now = h.now.Add(d); h.mu.Unlock() }
-
-// jump moves the test clock to t, with the next handshake due a check.
-func (h *reloaderAt) jump(t time.Time) {
-	h.mu.Lock()
-	h.now = t
-	h.mu.Unlock()
-	h.r.mu.Lock()
-	h.r.checked = t.Add(-certCheckInterval)
-	h.r.mu.Unlock()
-}
-
-func (h *reloaderAt) served(t *testing.T) *x509.Certificate {
-	t.Helper()
-	cfg := trusting()
-	cfg.InsecureSkipVerify = true
-	c, err := tls.Dial("tcp", h.addr, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	return c.ConnectionState().PeerCertificates[0]
-}
-
-const reloadFailed = "cache listener: TLS certificate reload failed; serving the previous certificate"
 
 // A renewal that writes the new certificate before its key is a valid
 // certificate that does not match the key in place: the old pair stays in

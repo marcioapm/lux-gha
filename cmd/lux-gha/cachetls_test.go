@@ -221,71 +221,101 @@ func (h *countHandler) count(msg string) int {
 	return h.msgs[msg]
 }
 
-func TestCertReloaderPicksUpRotationAndKeepsLastGoodPair(t *testing.T) {
-	dir := t.TempDir()
-	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-	first := selfSigned(t, certFile, keyFile)
-	logs := &countHandler{msgs: map[string]int{}}
-	r, err := newCertReloader(certFile, keyFile, slog.New(logs))
+// reloaderAt is a reloader on a test clock, serving TLS on loopback.
+type reloaderAt struct {
+	r    *certReloader
+	logs *countHandler
+	mu   sync.Mutex
+	now  time.Time
+	addr string
+}
+
+func newReloaderAt(t *testing.T, certFile, keyFile string) *reloaderAt {
+	t.Helper()
+	h := &reloaderAt{logs: &countHandler{msgs: map[string]int{}}}
+	r, err := newCertReloader(certFile, keyFile, slog.New(h.logs))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mu sync.Mutex
-	now := time.Now()
-	r.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
-	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
-
+	// The test clock starts where the reloader's last check was, so
+	// advance(certCheckInterval) is exactly one interval later.
+	h.now = r.checked
+	r.now = func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.now }
+	h.r = r
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })}
 	go srv.Serve(tls.NewListener(ln, r.tlsConfig()))
-	defer srv.Close()
-	// served reports the certificate a new connection is given.
-	served := func() *x509.Certificate {
-		t.Helper()
-		cfg := trusting()
-		cfg.InsecureSkipVerify = true
-		c, err := tls.Dial("tcp", ln.Addr().String(), cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer c.Close()
-		return c.ConnectionState().PeerCertificates[0]
+	t.Cleanup(func() { srv.Close() })
+	h.addr = ln.Addr().String()
+	return h
+}
+
+func (h *reloaderAt) advance(d time.Duration) { h.mu.Lock(); h.now = h.now.Add(d); h.mu.Unlock() }
+
+// jump moves the test clock to t, with the next handshake due a check.
+func (h *reloaderAt) jump(t time.Time) {
+	h.mu.Lock()
+	h.now = t
+	h.mu.Unlock()
+	h.r.mu.Lock()
+	h.r.checked = t.Add(-certCheckInterval)
+	h.r.mu.Unlock()
+}
+
+// served reports the certificate a new connection is given.
+func (h *reloaderAt) served(t *testing.T) *x509.Certificate {
+	t.Helper()
+	cfg := trusting()
+	cfg.InsecureSkipVerify = true
+	c, err := tls.Dial("tcp", h.addr, cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !served().Equal(first) {
+	defer c.Close()
+	return c.ConnectionState().PeerCertificates[0]
+}
+
+const reloadFailed = "cache listener: TLS certificate reload failed; serving the previous certificate"
+
+func TestCertReloaderPicksUpRotationAndKeepsLastGoodPair(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	first := selfSigned(t, certFile, keyFile)
+	h := newReloaderAt(t, certFile, keyFile)
+	if !h.served(t).Equal(first) {
 		t.Fatal("initial certificate not served")
 	}
 
 	second := selfSigned(t, certFile, keyFile)
-	advance(certCheckInterval - time.Second)
-	if !served().Equal(first) {
+	h.advance(certCheckInterval - time.Second)
+	if !h.served(t).Equal(first) {
 		t.Fatal("files re-read before the check interval elapsed")
 	}
-	advance(time.Second)
-	if !served().Equal(second) {
+	h.advance(time.Second)
+	if !h.served(t).Equal(second) {
 		t.Fatal("rotated certificate not served")
 	}
-	if n := logs.count("cache listener: TLS certificate reloaded"); n != 1 {
+	if n := h.logs.count("cache listener: TLS certificate reloaded"); n != 1 {
 		t.Fatalf("reload logged %d times", n)
 	}
 
-	const failed = "cache listener: TLS certificate reload failed; serving the previous certificate"
 	writeFile(t, certFile, []byte("-----BEGIN CERTIFICATE-----\nbroken\n-----END CERTIFICATE-----\n"))
 	for range 3 {
-		advance(certCheckInterval)
-		if !served().Equal(second) {
+		h.advance(certCheckInterval)
+		if !h.served(t).Equal(second) {
 			t.Fatal("broken replacement displaced the last good certificate")
 		}
 	}
-	if n := logs.count(failed); n != 1 {
+	if n := h.logs.count(reloadFailed); n != 1 {
 		t.Fatalf("failed reload logged %d times, want once", n)
 	}
 
 	third := selfSigned(t, certFile, keyFile)
-	advance(certCheckInterval)
-	if !served().Equal(third) {
+	h.advance(certCheckInterval)
+	if !h.served(t).Equal(third) {
 		t.Fatal("repaired files not picked up")
 	}
 }
