@@ -129,9 +129,8 @@ setup_registry() {
 	registry_ready=true
 }
 
-# cache_url_ok URL: the URLs the job-started hook writes to GITHUB_ENV (the
-# same test as in job-started.sh): http(s), URL characters only, so no
-# newline or space can add a second variable.
+# cache_url_ok URL: http(s), URL characters only, so no newline or space can
+# add a second variable to GITHUB_ENV (the same test as in job-started.sh).
 cache_url_ok() {
 	case $1 in http://* | https://*) ;; *) return 1 ;; esac
 	case $1 in *[!]A-Za-z0-9:/._~%[-]*) return 1 ;; esac
