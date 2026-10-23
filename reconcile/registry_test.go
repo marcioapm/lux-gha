@@ -106,9 +106,7 @@ func TestPassesAndDeliveriesPublishRunnerAssignments(t *testing.T) {
 		t.Fatal("assignment before pickup")
 	}
 	// The runner provisioned for job 7 takes job 8.
-	if err := e.gh.pick(a, 8); err != nil {
-		t.Fatal(err)
-	}
+	e.pick(a, 8)
 	e.pass()
 	repo, job, ok := e.rec.CandidateJob(a)
 	if !ok || job != 8 || repo != "acme/widgets" {
@@ -123,19 +121,8 @@ func TestPassesAndDeliveriesPublishRunnerAssignments(t *testing.T) {
 		t.Fatal("assignment kept after the job completed")
 	}
 
-	hook, err := e.rec.Webhook([]byte("s"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	b := "lux-gha-t1-1001-8-0"
-	for _, ev := range []struct {
-		runner string
-		job    int64
-	}{{b, 9}, {"someone-else", 10}} {
-		if err := hook.OnWorkflowJob(context.Background(), webhookEvent("in_progress", ev.runner, ev.job)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	e.onJob(webhookEvent("in_progress", b, 9), webhookEvent("in_progress", "someone-else", 10))
 	if repo, job, ok := e.rec.CandidateJob(b); !ok || job != 9 || repo != "acme/widgets" {
 		t.Fatalf("delivery assignment %s %d ok=%v", repo, job, ok)
 	}
@@ -164,6 +151,29 @@ func TestParseRunnerAcceptsOnlyThisInstancesCanonicalNames(t *testing.T) {
 func webhookEvent(action, runner string, jobID int64) webhook.WorkflowJobEvent {
 	return webhook.WorkflowJobEvent{Action: action, InstallationID: 42, Repository: widgets, JobID: jobID, RunID: jobID * 10,
 		Status: action, Labels: lux3, RunnerName: runner}
+}
+
+// onJob hands verified workflow_job events to the reconciler's webhook
+// callback, as a signed delivery would.
+func (e *env) onJob(events ...webhook.WorkflowJobEvent) {
+	e.t.Helper()
+	hook, err := e.rec.Webhook([]byte("s"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := hook.OnWorkflowJob(context.Background(), ev); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+}
+
+// pick has runner take job jobID on the fake GitHub.
+func (e *env) pick(runner string, jobID int64) {
+	e.t.Helper()
+	if err := e.gh.pick(runner, jobID); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 // A default-deny route's Runs can reach the runner endpoint: the bridge

@@ -289,11 +289,10 @@ func (c *Client) listPath(ctx context.Context, installationID int64, path string
 // InstallationRepository is the subset of a repository in
 // GET /installation/repositories the bridge reads.
 type InstallationRepository struct {
-	ID            int64  `json:"id"`
-	FullName      string `json:"full_name"`
-	Archived      bool   `json:"archived"`
-	Disabled      bool   `json:"disabled"`
-	DefaultBranch string `json:"default_branch"`
+	ID       int64  `json:"id"`
+	FullName string `json:"full_name"`
+	Archived bool   `json:"archived"`
+	Disabled bool   `json:"disabled"`
 }
 
 type InstallationRepositoryPage struct {
@@ -329,25 +328,18 @@ func (c *Client) ListInstallationRepositories(ctx context.Context, installationI
 // tag (GET /repos/{o}/{r}/commits/refs/tags/{name} as application/vnd.github.sha).
 // found is false when no such tag exists.
 func (c *Client) TagCommit(ctx context.Context, repo Repository, name string) (sha string, found bool, err error) {
-	suffix, err := refSuffix("/commits/refs/tags/", name)
-	if err != nil {
-		return "", false, err
-	}
-	path, err := repo.path(suffix)
+	path, err := refPath(repo, "/commits/refs/tags/", name)
 	if err != nil {
 		return "", false, err
 	}
 	var out shaResponse
 	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
-	var apiErr *APIError
-	// GitHub answers 422 "No commit found" for a ref that does not exist.
-	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity) {
+	switch {
+	case missingRef(err):
 		return "", false, nil
-	}
-	if err != nil {
+	case err != nil:
 		return "", false, err
-	}
-	if !shaPattern(out.sha) {
+	case !isSHA(out.sha):
 		return "", false, errors.New("githubapp: invalid commit SHA response")
 	}
 	return out.sha, true, nil
@@ -359,26 +351,21 @@ func (c *Client) TagCommit(ctx context.Context, repo Repository, name string) (s
 // unrelated history (422), behind and diverged are false; any other answer
 // is an error.
 func (c *Client) BranchContains(ctx context.Context, repo Repository, name, sha string) (bool, error) {
-	if !shaPattern(sha) {
+	if !isSHA(sha) {
 		return false, errors.New("githubapp: invalid commit SHA")
 	}
 	// git refuses ".." in a ref name; here it would also split the range.
 	if strings.Contains(name, "..") {
-		return false, errors.New("githubapp: invalid ref name")
+		return false, errInvalidRef
 	}
-	suffix, err := refSuffix("/compare/"+sha+"...refs/heads/", name)
-	if err != nil {
-		return false, err
-	}
-	path, err := repo.path(suffix)
+	path, err := refPath(repo, "/compare/"+sha+"...refs/heads/", name)
 	if err != nil {
 		return false, err
 	}
 	// One commit per page: only the status is read.
 	var out compareStatus
 	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path+"?per_page=1", nil, http.StatusOK, &out)
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity) {
+	if missingRef(err) {
 		return false, nil
 	}
 	if err != nil {
@@ -393,6 +380,18 @@ func (c *Client) BranchContains(ctx context.Context, repo Repository, name, sha 
 	return false, errors.New("githubapp: invalid compare response")
 }
 
+// missingRef: GitHub answers 404, or 422 ("No commit found", "No common
+// ancestor"), for a ref or commit that does not exist.
+func missingRef(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity)
+}
+
+var (
+	errInvalidJSON = errors.New("githubapp: invalid JSON response")
+	errInvalidRef  = errors.New("githubapp: invalid ref name")
+)
+
 // compareStatus, as request's out, receives the top-level "status" of a
 // compare response. The response also carries up to 300 changed files, so
 // it is scanned for that one key rather than decoded whole.
@@ -401,23 +400,23 @@ type compareStatus struct{ status string }
 func readCompareStatus(r io.Reader) (string, error) {
 	dec := json.NewDecoder(r)
 	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
-		return "", errors.New("githubapp: invalid JSON response")
+		return "", errInvalidJSON
 	}
 	for dec.More() {
 		t, err := dec.Token()
 		if err != nil {
-			return "", errors.New("githubapp: invalid JSON response")
+			return "", errInvalidJSON
 		}
 		if t == "status" {
 			var s string
 			if err := dec.Decode(&s); err != nil {
-				return "", errors.New("githubapp: invalid JSON response")
+				return "", errInvalidJSON
 			}
 			return s, nil
 		}
 		var skip json.RawMessage
 		if err := dec.Decode(&skip); err != nil {
-			return "", errors.New("githubapp: invalid JSON response")
+			return "", errInvalidJSON
 		}
 	}
 	return "", errors.New("githubapp: compare response has no status")
@@ -427,7 +426,8 @@ func readCompareStatus(r io.Reader) (string, error) {
 // receives the plain-text SHA.
 type shaResponse struct{ sha string }
 
-func shaPattern(s string) bool {
+// isSHA accepts a lower-case SHA-1 or SHA-256 commit id.
+func isSHA(s string) bool {
 	if len(s) != 40 && len(s) != 64 {
 		return false
 	}
@@ -439,17 +439,18 @@ func shaPattern(s string) bool {
 	return true
 }
 
-// refSuffix appends a ref name to prefix, escaping each '/'-separated
-// segment. Names git refuses (empty segments, "." or "..") are rejected.
-func refSuffix(prefix, name string) (string, error) {
+// refPath is repo's API path for prefix followed by a ref name, each
+// '/'-separated segment escaped. Names git refuses (empty segments, "." or
+// "..") are rejected.
+func refPath(repo Repository, prefix, name string) (string, error) {
 	segs := strings.Split(name, "/")
 	for i, s := range segs {
 		if s == "" || s == "." || s == ".." {
-			return "", errors.New("githubapp: invalid ref name")
+			return "", errInvalidRef
 		}
 		segs[i] = url.PathEscape(s)
 	}
-	return prefix + strings.Join(segs, "/"), nil
+	return repo.path(prefix + strings.Join(segs, "/"))
 }
 
 func (o PageOptions) query() (url.Values, error) {

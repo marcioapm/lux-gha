@@ -289,7 +289,7 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 		sha.sha = strings.TrimSpace(string(data))
 	} else if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
-			return nil, errors.New("githubapp: invalid JSON response")
+			return nil, errInvalidJSON
 		}
 	}
 	return resp.Header, nil

@@ -41,11 +41,11 @@ func (s *Server) trust(ctx context.Context, repo githubapp.Repository, repoID in
 	if err != nil || !ok {
 		return Untrusted, err
 	}
-	def, err := s.defaultBranch(ctx, repo, repoID)
+	info, err := s.repository(ctx, repo, repoID)
 	if err != nil {
 		return "", err
 	}
-	if ref == "refs/heads/"+def {
+	if ref == "refs/heads/"+info.DefaultBranch {
 		return Trusted, nil
 	}
 	for _, p := range s.o.Config.TrustedRefs {
@@ -122,11 +122,6 @@ func (s *Server) refLookupFailed(repo githubapp.Repository, repoID int64, err er
 			"category", "github_permission", "repository", repo.Owner+"/"+repo.Name)
 	}
 	return errNoContents
-}
-
-func (s *Server) defaultBranch(ctx context.Context, repo githubapp.Repository, repoID int64) (string, error) {
-	info, err := s.repository(ctx, repo, repoID)
-	return info.DefaultBranch, err
 }
 
 // repository is GET /repos for the runner's repository, reused for

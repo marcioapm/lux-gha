@@ -46,11 +46,9 @@ type Runners interface {
 	RunnerCompleted(runner string) bool
 	// RepositoryName returns owner/name for a repository id.
 	RepositoryName(id int64) (string, bool)
-	// SearchRunnerJobs lists the repository's in_progress runs, bounded,
-	// and publishes every in_progress job on a runner of this instance as
-	// that runner's candidate. A repository is searched at most once per
-	// gap, and concurrent callers share one search. before runs just
-	// before a search's first GitHub call; its error ends the search.
+	// SearchRunnerJobs runs the repository's shared, bounded search, which
+	// publishes candidates for every runner of this instance it sees.
+	// before runs ahead of its first GitHub call; its error ends the search.
 	SearchRunnerJobs(ctx context.Context, repo githubapp.Repository, repoID int64, before func() error) error
 	// RateLimitedUntil is when GitHub's rate limit on the installation ends.
 	RateLimitedUntil() time.Time

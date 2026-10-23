@@ -895,8 +895,7 @@ waiting on it, reads at most 20 pages of runs and jobs, and publishes every `in_
 this instance's runners, so a sibling runner then needs one job read. It runs for at most 8 s, within the
 hook's 10 s, and does not stop when the request that started it does; a search cut short answers `409`,
 which the hook retries. A delivery's candidate is kept until a
-pass lists its job completed or on another runner, the runner's Run ends, or 10 minutes pass. A signed
-`completed` delivery ends the runner only when it comes from the runner's own repository. While GitHub
+pass lists its job completed or on another runner, the runner's Run ends, or 10 minutes pass. While GitHub
 rate-limits the installation, the listener answers `503` without calling it; a rate limit it meets also
 pauses the reconciler's passes, and the other way round.
 
@@ -917,8 +916,8 @@ pauses the reconciler's passes, and the other way round.
 | `204` | Reserved for a registry that is not configured; the listener does not run then |
 
 The resolved job is kept per runner (a JIT runner runs one job) and re-read at most once a minute. A signed
-`workflow_job` `completed` delivery naming the runner refuses it at once; without one, a completed job is
-refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with `DurationSeconds` 900 (15
+`workflow_job` `completed` delivery naming the runner, from the runner's own repository, refuses it at once;
+without one, a completed job is refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with `DurationSeconds` 900 (15
 minutes, STS's minimum), session tags `lux-owner=<owner>`, `lux-repo=<repo>` and `lux-trust=<level>`, the
 [session policy](#session-policy) below and session name `lux-gha-<repo id>-<job id>-<attempt>` (at most 64
 characters of `[\w+=,.@-]`), cached per runner until 5 minutes before they expire; the credential helper asks
@@ -1065,9 +1064,9 @@ Repository permissions, and nothing else:
 | Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs (also the registry's runner attribution); force-cancelling a workflow run whose job's Lux Run was stopped, and re-running a job whose Run's host was lost |
 | Checks | Read and write | A check run explaining why Lux stopped a job, and listing it so it is posted once |
 | Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch |
-| Contents | Read-only | With a registry only: resolving a run's ref (`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` and `GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}`, see [Trust levels](#trust-levels)). Without it every trust decision is `503`. |
+| Contents | Read-only | With a registry only: resolving a run's ref (`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` and `GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}`, see [Trust levels](#trust-levels)) |
 
-Upgrading an existing App to use the registry: add **Contents: Read** and accept it on each installation before deploying; until then the runner listener answers `503`, and logs the refusal once per repository as `github_permission`.
+Upgrading an existing App to use the registry: add **Contents: Read** and accept it on each installation before deploying; until then the runner listener answers `503` to every trust decision, and logs the refusal once per repository as `github_permission`.
 
 Subscribe to the **Workflow job** webhook event. With a registry, its `in_progress` deliveries let the runner listener find a runner's job before the next pass lists it.
 
