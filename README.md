@@ -22,7 +22,8 @@ process.
 - `webhook`: signed `workflow_job` ingress that calls an injected function, and optionally `installation` and `installation_repositories` ingress.
 - `reconcile`: the single reconciler that provisions and removes runners.
 - `cache`: an optional GitHub Actions cache server (cache service v2) backed by S3, on its own listener ([Actions cache](#actions-cache)).
-- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`, and, with a `cache` section, the Actions cache on a second listener. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
+- `registry`: the runner listener of the [in-region image registry](#in-region-image-registry): identity tokens, trust levels and STS credentials for the job a runner executes.
+- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`, with a `cache` section the Actions cache on a second listener, and with a `registry` block the runner listener on its own address. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
 The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)). Besides the runner and rootless Docker, it ships `moby/buildkit` for its own architecture, pinned by digest. The entrypoint loads it into each Run's Docker store, so that `docker/setup-buildx-action`'s default `docker-container` builder does not pull BuildKit from Docker Hub on every job. Workflows should pin `driver-opts: image=moby/buildkit:<version>` to the version the image carries (its `io.github.marcioapm.lux-gha.buildkit` label). With `buildx-stable-1`, buildx downloads a newer BuildKit once that tag moves ([BuildKit driver](images/runner/README.md#buildkit-driver)).
 
@@ -537,6 +538,11 @@ environment prefix for itself.) The entrypoint:
   the running job ([When Lux stops a job](#when-lux-stops-a-job));
 - exits when the runner exits, after at most one job.
 
+With a [registry](#in-region-image-registry), the Run also has the identity token at
+`/run/lux-gha/identity` (`LUXGHA_IDENTITY_FILE`) and `LUXGHA_RUNNER_ENDPOINT`, `LUXGHA_REGISTRY_HOST` and
+`LUXGHA_REGISTRY_REGION`. The entrypoint then adds the credential helper for `LUXGHA_REGISTRY_HOST` and the
+job-started hook; neither can stop the runner from starting.
+
 `images/runner/entrypoint.sh` is a reference POSIX `sh` implementation. It
 also starts rootless Docker first when the image has it, then loads the
 image's BuildKit archive into it (a failed load only warns).
@@ -584,6 +590,7 @@ image's BuildKit archive into it (a failed load only warns).
 - **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
 - **`cache`**: optional; absent, nothing below runs ([Actions cache](#actions-cache)).
+- **`registry`**: optional; see [In-region image registry](#in-region-image-registry). Without it nothing below applies: no runner listener, no identity secret, no registry env in Runs.
 
 ### Actions cache
 
@@ -824,6 +831,152 @@ The job is not submitted again while it stays queued. A restarted bridge
 submits it once more and is refused once more. Without Checks or Actions
 write, the check run or the force-cancel is skipped, as for stopped jobs.
 
+## In-region image registry
+
+With a `registry` block, jobs on lux-gha runners can pull and push container images (an image cache, a
+buildx layer cache) in an ECR registry in the Lux workers' own region, with no credentials in the workflow.
+The bridge decides, for the job a runner is **executing**, what that job may do, and mints short-lived AWS
+credentials scoped to it. Off Lux, or without the block, nothing changes: the variables below are unset.
+
+```json
+"registry": {
+  "roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry",
+  "region": "eu-west-1",
+  "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
+  "repositoryPrefix": "gha",
+  "trustedRefs": ["<default branch>", "refs/heads/release/*", "refs/tags/v*"],
+  "runnerListen": "10.0.0.5:8081",
+  "runnerEndpoint": "http://10.0.0.5:8081",
+  "identityKeyFile": "/etc/lux-gha/registry-identity-key"
+}
+```
+
+- **`roleArn`**, **`region`**, **`host`**: the registry role the bridge assumes, and the registry
+  (`<account>.dkr.ecr.<region>.amazonaws.com`, in `region`).
+- **`repositoryPrefix`** (default `gha`) and **`trustedRefs`** (default as shown): `<default branch>` is the
+  repository's default branch, read from GitHub; the other entries are `refs/heads/` or `refs/tags/` globs
+  (`path.Match`; `*` does not cross `/`).
+- **`runnerListen`**: the address of the **runner listener**, a server separate from `listen` that serves
+  only the two runner routes below. **`runnerEndpoint`**: the URL Runs use to reach it (scheme, host and
+  port only). It is plain HTTP on a private address in the example: the identity token and the credentials
+  cross that network, so put it on a network only the Runs and the bridge share, or terminate TLS in front of it.
+- **`identityKeyFile`**: at least 32 random bytes (`head -c 32 /dev/urandom | base64 > …`), read like the
+  other secrets. Changing it invalidates the tokens of Runs already submitted.
+- AWS credentials come from the bridge's default chain (on EC2, its instance role).
+
+### What a Run gets
+
+Each Run gets a second Lux file secret, `/run/lux-gha/identity`, holding
+`v1.<runner name>.<base64url(HMAC-SHA256(identity key, "v1." + runner name))>`, and the env
+`LUXGHA_IDENTITY_FILE`, `LUXGHA_RUNNER_ENDPOINT`, `LUXGHA_REGISTRY_HOST` and `LUXGHA_REGISTRY_REGION`. The
+token is a function of the runner name, so the `Idempotency-Key` and its replay are unchanged. It is never in
+labels, the command, env or logs. On a route with `egressHosts` (default-deny), the bridge adds one egress
+rule for `runnerEndpoint`'s host: a `/32` (or `/128`) CIDR rule for an IP address, a host rule for a name. An
+`unrestrictedEgress` route gets none.
+
+The runner image's entrypoint then names `docker-credential-lux-gha` in the runner user's
+`~/.docker/config.json` `credHelpers` for `host` (other keys are kept), which also covers the runner's own
+`services:` and `container:` pulls, and sets `ACTIONS_RUNNER_HOOK_JOB_STARTED` to a hook that runs before
+the job's first step ([runner image README](images/runner/README.md#in-region-image-registry)).
+
+### Runner routes
+
+Both take `Authorization: Bearer <token>` and answer only after these checks, each from Lux or GitHub, never
+from the request: the HMAC (constant time) → a live Lux Run of this instance with that runner name → the job
+GitHub shows `in_progress` on that runner ([Runner attribution](#runner-attribution); the jobs a pass
+already lists, a signed `in_progress` delivery naming the runner, or a search of the repository's
+`in_progress` runs at most every 5 s per runner, each confirmed with
+`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) → its workflow run → the trust level below.
+
+- `POST /runner/v1/registry` → `200 {"registry", "read", "push", "trust", "expiresAt"}`: `read` is
+  `<host>/<prefix>/<repo id>`; `push` is the same for `trusted`, `…/pr` for `untrusted` and `""` for
+  `read-only`.
+- `POST /runner/v1/aws-credentials` → `200` with AWS `credential_process` JSON
+  (`Version`, `AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration`).
+
+| Status | When |
+|---|---|
+| `401` | Missing or bad token, a runner name of another instance, no live Run, or the job has completed |
+| `409` | The Run is live but GitHub does not show a job `in_progress` on the runner yet |
+| `503` | Lux, GitHub or STS failed, or the token exceeded its rate limit (a bucket of 30, refilled at one request per 2 s) |
+| `204` | Reserved for a registry that is not configured; the listener does not run then |
+
+The resolved job is kept per runner (a JIT runner runs one job) and re-read at most once a minute, so a
+completed job is refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with
+`DurationSeconds` 3600, session tags `lux-repo=<repo id>` and `lux-trust=<level>` and session name
+`lux-gha-<repo id>-<job id>-<attempt>`, cached per runner until 5 minutes before they expire. They are never
+logged; each resolution and mint logs one line with the runner, job, event and trust level.
+
+### Trust levels
+
+Decided for the job the runner is executing, from its workflow run's `event`, `head_branch`,
+`head_sha` and `head_repository`; the first row that matches wins.
+
+| Level | Workflow run | Pull `<prefix>/<id>/*` | Push |
+|---|---|---|---|
+| `read-only` | `pull_request`, `pull_request_review`, `pull_request_review_comment` from a fork (`head_repository.id` ≠ the repository's) | yes | nothing |
+| `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<prefix>/<id>/*` |
+| `untrusted` | anything else: a same-repository pull request, `pull_request_target`, `merge_group`, a push or dispatch on another branch | yes | `<prefix>/<id>/pr/*` |
+| none (`401`/`409`/`503`) | the job cannot be resolved, the Run is not live, the job is not `in_progress` on this runner, or an upstream is down | | |
+
+The API reports a tag push by the tag's name in `head_branch`. A name a trusted `refs/tags/` pattern could
+match is taken as a tag only if the repository's tag of that name (`GET /repos/{owner}/{repo}/tags`, up to
+10 pages) points at the run's `head_sha`; otherwise it is a branch. A reusable workflow's jobs report the
+caller's event. "Trusted" relies on branch and tag protection for the trusted refs: anyone who can push a
+`release/*` branch gets trusted credentials.
+
+### IAM the operator provides
+
+- **Bridge principal** (the instance role): `sts:AssumeRole` and `sts:TagSession` on the registry role.
+- **Registry role trust policy**: allow the bridge principal `sts:AssumeRole` and `sts:TagSession`, requiring
+  `aws:RequestTag/lux-repo`, `aws:RequestTag/lux-trust` in `trusted`, `untrusted`, `read-only`, and
+  `sts:RoleSessionName` like `lux-gha-*`. Session chaining caps the session at 1 hour.
+- **Registry role permissions**, keyed on `aws:PrincipalTag/lux-repo` and `lux-trust`:
+  - `ecr:GetAuthorizationToken` on `*`;
+  - pull (`BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability`) on
+    `repository/<prefix>/${aws:PrincipalTag/lux-repo}/*` for every level;
+  - push (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`, and
+    `CreateRepository` if create-on-push needs it) on `…/pr/*` for `untrusted` and `trusted`, and on
+    `…/<repo id>/*` for `trusted` only;
+  - an explicit **Deny** of `BatchGetImage` and `GetDownloadUrlForLayer` on `…/<repo id>/pr/*` when
+    `lux-trust` is `trusted`, so a pull request cannot poison a trusted build's layer cache;
+  - nothing on other repository ids, no deletes, no lifecycle or policy changes.
+- **Repository creation template** for the prefix (create on push), with a lifecycle: untagged images expire
+  after 1 day, images under `<prefix>/*/pr/` after 7 days.
+
+### Network
+
+Runs must reach `runnerListen` on the bridge host: the runner security group (or equivalent) must allow the
+Runs' source addresses to that port. The bridge adds the egress rule for default-deny routes (above). Lux
+documents hard blocks that apply even to unrestricted Runs, among them cloud metadata and the control plane
+([Configuration](#configuration)); a bridge on the Lux control host may fall under them. Check from a Run
+(`curl -sS -o /dev/null -w '%{http_code}' -X POST "$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry"` should print
+`401`) before relying on it.
+
+### Fail-open
+
+The registry is an optimisation. The hook always exits 0 (a failing job-started hook fails the job): on any
+answer but `200`, after retrying `409` for up to 20 s, or when nothing listens, it writes nothing and prints
+one line, `lux-gha registry: unavailable (HTTP <code>); continuing without it`. On `200` it prints
+`lux-gha registry: trust=<level>`. A pull through the credential helper that fails later (the bridge went
+down mid-job) fails that `docker` command as any registry error would.
+
+### In a workflow
+
+After the hook, a job sees `LUX_REGISTRY` (where it may pull) and, unless it is `read-only`,
+`LUX_REGISTRY_PUSH` (where it may push). No `docker login`: the credential helper answers for the host.
+
+```yaml
+- run: |
+    cache=${LUX_REGISTRY:-ghcr.io/example-org/cache}
+    docker pull "${LUX_REGISTRY_PUSH:-$cache}/app:deps" || docker pull "$cache/app:deps" || true
+    if [ -n "${LUX_REGISTRY_PUSH:-}" ]; then
+      docker tag app:deps "$LUX_REGISTRY_PUSH/app:deps" && docker push "$LUX_REGISTRY_PUSH/app:deps"
+    fi
+```
+
+buildx needs `image-manifest=true,oci-mediatypes=true` in `cache-to` for an ECR cache.
+
 ## GitHub App permissions
 
 Repository permissions, and nothing else:
@@ -831,11 +984,11 @@ Repository permissions, and nothing else:
 | Permission | Access | Used for |
 |---|---|---|
 | Administration | Read and write | `generate-jitconfig`, listing and deleting repository runners |
-| Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs; force-cancelling a workflow run whose job's Lux Run was stopped, and re-running a job whose Run's host was lost |
+| Actions | Read and write | `workflow_job` webhook events, reading workflow jobs and runs (also the registry's runner attribution); force-cancelling a workflow run whose job's Lux Run was stopped, and re-running a job whose Run's host was lost |
 | Checks | Read and write | A check run explaining why Lux stopped a job, and listing it so it is posted once |
-| Metadata | Read-only | Granted to every App; `GET /installation/repositories` |
+| Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch and `GET /repos/{owner}/{repo}/tags` |
 
-Subscribe to the **Workflow job** webhook event.
+Subscribe to the **Workflow job** webhook event. With a registry, its `in_progress` deliveries let the runner listener find a runner's job before the next pass lists it.
 
 Actions and Checks write serve only [When Lux stops a job](#when-lux-stops-a-job).
 With Actions read-only and no Checks permission, the bridge still
@@ -891,7 +1044,7 @@ The JIT config is delivered only as a Lux file secret. It never appears in label
 make lint              # gofmt check, go vet ./..., scripts/check-license.sh
 make test              # go test -race -count=1 ./...
 make check             # lint, then test
-make entrypoint-test   # images/runner/entrypoint_test.sh as uid 1000 in the runner's pinned ubuntu base (Docker)
+make entrypoint-test   # images/runner/entrypoint_test.sh as uid 1000 in the runner's pinned ubuntu base plus jq and curl (Docker)
 make image             # the runner image for the host's architecture, as lux-gha-runner:dev (IMAGE_TAG=..., PLATFORM=linux/amd64)
 make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
