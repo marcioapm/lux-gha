@@ -400,6 +400,7 @@ func (s *Server) finalize(ctx context.Context, id *identity, r *http.Request, c 
 		}
 		if herr == nil && o.Owner == staging {
 			s.cleanStaging(ctx, staging)
+			s.log.Info("cache: saved", "repository_id", id.RepoID, "bytes", m.Size)
 			return finalizeResponse{OK: true, EntryID: entryID(final)}, nil
 		}
 		s.cleanStaging(ctx, staging)

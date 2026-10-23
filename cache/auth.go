@@ -41,9 +41,10 @@ type identity struct {
 	TokenHash string
 }
 
-// ownerIDClaim names the repository owner's numeric ID in a runtime token.
-// It is taken from GitHub's OIDC token claims and has not been confirmed in
-// a runtime token; repositoryIDs does not depend on it.
+// ownerIDClaim names the repository owner's numeric ID in a runtime token;
+// verify's claims struct tag spells the same name. It is taken from
+// GitHub's OIDC token claims and has not been confirmed in a runtime
+// token; repositoryIDs does not depend on it.
 const ownerIDClaim = "repository_owner_id"
 
 var (
@@ -138,12 +139,10 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	var claims struct {
 		AC     *string `json:"ac"`
 		RepoID *string `json:"repository_id"`
+		// Raw: numericClaim accepts a string or a number and fails closed.
+		OwnerID json.RawMessage `json:"repository_owner_id"`
 	}
 	if err := tok.Claims(&claims); err != nil {
-		return nil, fmt.Errorf("%w: claims: %v", errUnauthenticated, err)
-	}
-	var all map[string]json.RawMessage
-	if err := tok.Claims(&all); err != nil {
 		return nil, fmt.Errorf("%w: claims: %v", errUnauthenticated, err)
 	}
 	if claims.RepoID == nil || !repoIDPattern.MatchString(*claims.RepoID) {
@@ -156,7 +155,7 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	if err := json.Unmarshal([]byte(*claims.AC), &acl); err != nil {
 		return nil, fmt.Errorf("%w: ac claim is not a JSON array of scopes", errUnauthenticated)
 	}
-	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(all[ownerIDClaim])}
+	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(claims.OwnerID)}
 	sum := sha256.Sum256([]byte(raw))
 	id.TokenHash = hex.EncodeToString(sum[:])
 	for _, e := range acl {

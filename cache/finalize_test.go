@@ -3,6 +3,7 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"strings"
@@ -23,7 +24,8 @@ func (h *harness) stagingOf(token, key, version string) string {
 // A Finalize retried after its CompleteMultipartUpload succeeded but the
 // reply was lost reports the save, not "another job saved first".
 func TestFinalizeRetryAfterLostSuccess(t *testing.T) {
-	h := newHarness(t)
+	logs := &logRecorder{}
+	h := newHarness(t, func(o *Options) { o.Log = slog.New(logs) })
 	tok := h.is.token(t, "100", writeMain())
 	h.putBlobOK(h.reserve(tok, "k", v1), []byte("mine"))
 	h.st.loseAssembleReply = true
@@ -33,6 +35,9 @@ func TestFinalizeRetryAfterLostSuccess(t *testing.T) {
 	f := h.finalize(tok, "k", v1, 4)
 	if !f.ok() || str(f.body["entry_id"]) == "" {
 		t.Fatalf("retry: %+v", f)
+	}
+	if !contains(logs.snapshot(), "cache: saved") {
+		t.Fatalf("the retried save was not logged: %q", logs.snapshot())
 	}
 	if left := h.st.keys(h.stagingOf(tok, "k", v1) + "/"); len(left) != 0 {
 		t.Fatalf("staging left %q", left)
