@@ -381,6 +381,7 @@ func TestRegistryValidation(t *testing.T) {
 	for name, tc := range map[string]struct{ old, new, want string }{
 		"bad role":          {`role/lux-gha-registry`, `user/x`, "registry.roleArn"},
 		"bad region":        {`"region": "eu-west-1"`, `"region": "Europe"`, "registry.region"},
+		"non-AWS region":    {`"region": "eu-west-1"`, `"region": "auto"`, "registry.region"},
 		"host other region": {`dkr.ecr.eu-west-1`, `dkr.ecr.us-east-1`, "registry.host"},
 		"host with scheme":  {`"host": "`, `"host": "https://`, "registry.host"},
 		"removed prefix":    {`"region"`, `"repositoryPrefix": "gha", "region"`, `unknown field "repositoryPrefix"`},

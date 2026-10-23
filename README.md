@@ -589,8 +589,8 @@ image's BuildKit archive into it (a failed load only warns).
 - **Routing**: a job is routed only when **every** label it requests is in exactly one route's label set. Label comparison is case-insensitive. Configuration is rejected if one route's label set contains another's, because a job could then match both.
 - **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
-- **`cache`**: optional; absent, nothing below runs ([Actions cache](#actions-cache)).
-- **`registry`**: optional; see [In-region image registry](#in-region-image-registry). Without it nothing below applies: no runner listener, no identity secret, no registry env in Runs.
+- **`cache`**: optional; absent, the [Actions cache](#actions-cache) does not run.
+- **`registry`**: optional; absent, nothing in [In-region image registry](#in-region-image-registry) applies: no runner listener, no identity secret, no registry env in Runs.
 
 ### Actions cache
 
