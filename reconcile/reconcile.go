@@ -19,6 +19,8 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -941,6 +943,9 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 		spec.Secrets = append(spec.Secrets, luxclient.FileSecret{Name: identitySecretName, Value: identity.Token(r.identityKey, name), Path: IdentityPath})
 		maps.Copy(spec.Env, map[string]string{IdentityEnv: IdentityPath, RunnerEndpointEnv: g.RunnerEndpoint,
 			RegistryHostEnv: g.Host, RegistryRegionEnv: g.Region})
+		if !route.UnrestrictedEgress {
+			spec.Egress = append(spec.Egress, runnerEndpointRule(g.RunnerEndpoint))
+		}
 	}
 	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%s/%d", r.host, r.cfg.Instance, repoID, job, gen), spec)
 	if run != nil && !carries(*run, owned, gen, jobPrefix) {
@@ -975,6 +980,17 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
 	return run, nil
+}
+
+// runnerEndpointRule lets a default-deny Run reach the runner listener: a
+// single-address CIDR for an IP endpoint (route egress takes names only),
+// else a host rule.
+func runnerEndpointRule(endpoint string) luxclient.EgressRule {
+	u, _ := url.Parse(endpoint) // validated by config
+	if ip, err := netip.ParseAddr(u.Hostname()); err == nil {
+		return luxclient.EgressRule{CIDR: netip.PrefixFrom(ip, ip.BitLen()).String()}
+	}
+	return luxclient.EgressRule{Host: u.Hostname()}
 }
 
 // routeResources is a size route's size, or a raw route's cpus, memory and disk.

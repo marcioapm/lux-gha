@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/marcioapm/lux-gha/internal/identity"
+	"github.com/marcioapm/lux-gha/luxclient"
 	"github.com/marcioapm/lux-gha/webhook"
 )
 
@@ -162,4 +164,40 @@ func TestParseRunnerAcceptsOnlyThisInstancesCanonicalNames(t *testing.T) {
 func webhookEvent(action, runner string, jobID int64) webhook.WorkflowJobEvent {
 	return webhook.WorkflowJobEvent{Action: action, InstallationID: 42, Repository: widgets, JobID: jobID, RunID: jobID * 10,
 		Status: action, Labels: lux3, RunnerName: runner}
+}
+
+// A default-deny route's Runs can reach the runner listener: the bridge adds
+// one egress rule for runnerEndpoint, a /32 for an IP; an unrestricted route
+// needs none. Without a registry the route's egress is as configured.
+func TestRegistryRunsMayReachTheRunnerEndpoint(t *testing.T) {
+	e := newRegistryEnv(t)
+	e.gh.queue(7, "queued", "self-hosted", "lux")
+	e.gh.queue(8, "queued", "lux-big")
+	e.pass()
+	egress := map[string][]luxclient.EgressRule{}
+	for _, r := range e.lux.all() {
+		egress[r.run.Labels[LabelRoute]] = r.spec.Egress
+	}
+	want := []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {CIDR: "10.0.0.5/32"}}
+	if !slices.Equal(egress["default"], want) || !slices.Equal(egress["big"], []luxclient.EgressRule{{CIDR: "10.0.0.5/32"}}) {
+		t.Fatalf("egress %v", egress)
+	}
+
+	named := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "http://10.0.0.5:8081", "https://bridge.internal.example:8443", 1)),
+		replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`, `"unrestrictedEgress": true`))
+	named.gh.queue(7, "queued", "self-hosted", "lux")
+	named.gh.queue(8, "queued", "lux-big")
+	named.pass()
+	for _, r := range named.lux.all() {
+		switch r.run.Labels[LabelRoute] {
+		case "default":
+			if len(r.spec.Egress) != 0 || !r.spec.UnrestrictedEgress {
+				t.Fatalf("unrestricted route egress %v", r.spec.Egress)
+			}
+		case "big":
+			if !slices.Equal(r.spec.Egress, []luxclient.EgressRule{{Host: "bridge.internal.example"}}) {
+				t.Fatalf("named endpoint egress %v", r.spec.Egress)
+			}
+		}
+	}
 }
