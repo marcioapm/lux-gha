@@ -625,12 +625,13 @@ worker() {
 	' "$1/bin/Runner.Worker.dll" "$2" "$3"
 }
 cache_url=https://cache.example.com
-# run_cache_hook NAME N M [VAR=value...]: the hook as the runner runs it.
+# run_cache_hook NAME N M [VAR=value...]: the hook as the runner runs it; N
+# and M as for worker, or N "-" for a runner directory without a Worker.
 run_cache_hook() {
 	name=$1
 	d=$root/$name
-	mkdir -p "$d"
-	worker "$d/runner" "$2" "$3"
+	mkdir -p "$d/runner/bin"
+	[ "$2" = - ] || worker "$d/runner" "$2" "$3"
 	shift 3
 	printf '%s' "$token" >"$d/identity"
 	: >"$d/github_env"
@@ -657,14 +658,8 @@ check "a mixed Worker counts as unpatched: nothing written, a warning" '[ "$rc" 
 
 run_cache_hook cache-no-literal 0 0 LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
 check "a Worker without the literal: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
-name=cache-no-worker
-d=$root/$name
-mkdir -p "$d/runner/bin"
-: >"$d/github_env"
-rc=0
-env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" GITHUB_ENV="$d/github_env" RUNNER_DIR="$d/runner" \
-	LUXGHA_PATCH_WORKER="$patcher" LUXGHA_ACTIONS_RESULTS_URL="$cache_url" \
-	bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
+
+run_cache_hook cache-no-worker - - LUXGHA_ACTIONS_RESULTS_URL="$cache_url"
 check "a missing Worker: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
 
 run_cache_hook cache-ipv6 0 1 LUXGHA_ACTIONS_RESULTS_URL='http://[::1]:8090'
