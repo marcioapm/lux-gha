@@ -661,8 +661,11 @@ env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" GITHUB_ENV="$d/github_env" RUNNE
 	bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
 check "a missing Worker: exits 0, writes nothing, warns" '[ "$rc" = 0 ] && '"$nothing_written"' && grep -q "^::warning::" "$d/out"'
 
+run_cache_hook cache-ipv6 0 1 LUXGHA_ACTIONS_RESULTS_URL='http://[::1]:8090'
+check "an IPv6 loopback URL is written" '[ "$rc" = 0 ] && [ "$(cat "$d/github_env")" = "ACTIONS_RESULTS_URL=http://[::1]:8090" ]'
+
 for bad in 'https://cache.example.com
-LD_PRELOAD=/tmp/x' 'https://cache.example.com/a b' 'ftp://cache.example.com' 'cache.example.com'; do
+LD_PRELOAD=/tmp/x' 'https://cache.example.com/a b' 'https://cache.example.com/$(id)' 'ftp://cache.example.com' 'cache.example.com'; do
 	run_cache_hook cache-bad-url 0 1 LUXGHA_ACTIONS_RESULTS_URL="$bad"
 	check "exits 0 on a malformed URL" '[ "$rc" = 0 ]'
 	check "writes nothing" "$nothing_written"
@@ -692,6 +695,28 @@ check "nothing on stderr" '[ ! -s "$d/err" ]'
 run_case cache-hook-preset LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
 check "a hook already set is kept" 'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh" "$d/runner.env"'
 check "one warning naming both features" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "jobs run without LUX_REGISTRY and the cache server" "$d/err"'
+# Without our hook nothing would write the URL, so the Worker must stay as
+# shipped: run.sh (whose helper step patches) must not see the variable.
+check "run.sh does not see LUXGHA_ACTIONS_RESULTS_URL" '! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
+
+run_case cache-no-hook-file LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$root/does-not-exist"
+check "exits 0" '[ "$rc" = 0 ]'
+check "no hook, and run.sh does not see the URL" \
+	'! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env" && ! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
+check "one warning saying jobs use GitHub's cache service" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "no job-started hook at" "$d/err"'
+
+run_case cache-bad-url LUXGHA_ACTIONS_RESULTS_URL='https://cache.example.com/a b' LUXGHA_JOB_STARTED_HOOK="$hook"
+check "exits 0" '[ "$rc" = 0 ]'
+check "a URL the hook cannot write: no hook, run.sh does not see it" \
+	'! grep -q "^ACTIONS_RUNNER_HOOK_JOB_STARTED=" "$d/runner.env" && ! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
+check "one warning" '[ "$(wc -l <"$d/err")" = 1 ] && grep -q "not a URL the hook can write" "$d/err"'
+
+run_case cache-ipv6-url LUXGHA_ACTIONS_RESULTS_URL='http://[::1]:8090' LUXGHA_JOB_STARTED_HOOK="$hook"
+check "an IPv6 loopback URL is accepted" \
+	'grep -qx "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" "$d/runner.env" && grep -qx "LUXGHA_ACTIONS_RESULTS_URL=http://\[::1\]:8090" "$d/runner.env" && [ ! -s "$d/err" ]'
+
+run_case cache-with-registry-preset LUXGHA_REGISTRY_HOST="$reg" LUXGHA_ACTIONS_RESULTS_URL="$cache_url" LUXGHA_JOB_STARTED_HOOK="$hook" ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/own-hook.sh
+check "registry and cache with a preset hook: run.sh does not see the URL" '! grep -q "^LUXGHA_ACTIONS_RESULTS_URL=" "$d/runner.env"'
 
 if [ "$failures" -ne 0 ]; then
 	echo "entrypoint_test: $failures failed"

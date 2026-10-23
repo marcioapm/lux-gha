@@ -22,9 +22,10 @@ say() { echo "lux-gha registry: $*"; }
 cache() {
 	url=${LUXGHA_ACTIONS_RESULTS_URL:-}
 	[ -n "$url" ] || return 0
-	# The bridge validated it; this keeps a malformed value out of GITHUB_ENV.
+	# The bridge validated it and the entrypoint checked it (cache_url_ok);
+	# this keeps a malformed value out of GITHUB_ENV all the same.
 	case $url in http://* | https://*) ;; *) url= ;; esac
-	case $url in *[!A-Za-z0-9:/._~%-]*) url= ;; esac
+	case $url in *[!]A-Za-z0-9:/._~%[-]*) url= ;; esac
 	if [ -z "$url" ] || [ -z "${GITHUB_ENV:-}" ]; then
 		echo "lux-gha cache: not configured for this Run; this job uses GitHub's cache service"
 		return 0

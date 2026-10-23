@@ -129,17 +129,45 @@ setup_registry() {
 	registry_ready=true
 }
 
+# cache_url_ok URL: the URLs the job-started hook writes to GITHUB_ENV (the
+# same test as in job-started.sh): http(s), URL characters only, so no
+# newline or space can add a second variable.
+cache_url_ok() {
+	case $1 in http://* | https://*) ;; *) return 1 ;; esac
+	case $1 in *[!]A-Za-z0-9:/._~%[-]*) return 1 ;; esac
+}
+
 # The job-started hook exports LUX_REGISTRY (when the registry is set up)
 # and points the job at the Actions cache server (when the bridge set
 # LUXGHA_ACTIONS_RESULTS_URL; README "Using the cache server"). A hook the
 # image's own environment already names is kept.
+#
+# The run-helper step patches the Worker whenever LUXGHA_ACTIONS_RESULTS_URL
+# reaches run.sh, and a patched Worker no longer sets GitHub's URL: so the
+# variable reaches it only when our hook is installed and will write the
+# URL. Otherwise it is unset and jobs use GitHub's service.
 setup_hook() {
-	[ "$registry_ready" = true ] || [ -n "${LUXGHA_ACTIONS_RESULTS_URL:-}" ] || return 0
-	hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
-	if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
-		echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; jobs run without LUX_REGISTRY and the cache server" >&2
-	elif [ -f "$hook" ]; then
-		export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
+	url=${LUXGHA_ACTIONS_RESULTS_URL:-}
+	if [ -n "$url" ] && ! cache_url_ok "$url"; then
+		echo "lux-gha-runner: warning: LUXGHA_ACTIONS_RESULTS_URL is not a URL the hook can write; jobs use GitHub's cache service" >&2
+		url=
+	fi
+	if [ "$registry_ready" = true ] || [ -n "$url" ]; then
+		hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
+		if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
+			echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; jobs run without LUX_REGISTRY and the cache server" >&2
+			url=
+		elif [ -f "$hook" ]; then
+			export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
+		elif [ -n "$url" ]; then
+			echo "lux-gha-runner: warning: no job-started hook at $hook; jobs use GitHub's cache service" >&2
+			url=
+		fi
+	fi
+	if [ -n "$url" ]; then
+		export LUXGHA_ACTIONS_RESULTS_URL="$url"
+	else
+		unset LUXGHA_ACTIONS_RESULTS_URL
 	fi
 }
 

@@ -862,11 +862,15 @@ runner image therefore ships `images/runner/patch-worker.sh`:
   `ACTIONS_RESULTS_URL=<cacheURL>` to `$GITHUB_ENV`, so every step sees it,
   including steps in a job `container:` (the runner passes a container only
   the job's environment).
-- **Fail-open.** If the Worker cannot be patched (a runner version the
-  script does not recognise), the helper step warns and the listener starts
-  anyway; the hook then writes nothing and the job log gets a
-  `::warning::` that the job uses GitHub's cache service. Caching falls back,
-  jobs do not fail.
+- **Fail-open.** The Worker is patched only when the hook will write the
+  URL: the entrypoint passes `LUXGHA_ACTIONS_RESULTS_URL` on to the runner
+  only after installing the hook and checking the URL, and unsets it (with a
+  warning) when the image already names another job-started hook, the hook
+  file is missing, or the URL is not one the hook can write. If the Worker
+  cannot be patched (a runner version the script does not recognise), the
+  helper step warns and the listener starts anyway; the hook then writes
+  nothing and the job log gets a `::warning::` that the job uses GitHub's
+  cache service. Caching falls back, jobs do not fail.
 
 Artifacts go through the same variable, so they reach GitHub through the
 cache server's pass-through ([Actions cache](#actions-cache)). The Run must be
