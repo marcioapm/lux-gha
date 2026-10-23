@@ -433,12 +433,8 @@ func (c *Config) validate() error {
 			add("route %q: unrestrictedEgress and egressHosts are mutually exclusive", r.Name)
 		}
 		if r.CacheURL != "" {
-			// checkURL passes an empty query or fragment ("?" or "#"), which
-			// would survive normalisation.
-			if err := checkURL(r.CacheURL); err != nil {
+			if err := checkCacheURL(r.CacheURL); err != nil {
 				add("route %q: cacheURL: %v", r.Name, err)
-			} else if strings.ContainsAny(r.CacheURL, "?#") {
-				add("route %q: cacheURL %q must not have a query or fragment", r.Name, r.CacheURL)
 			} else {
 				r.CacheURL = strings.TrimSuffix(r.CacheURL, "/")
 			}
@@ -735,6 +731,36 @@ func readBounded(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s exceeds %d bytes", path, limit)
 	}
 	return b, nil
+}
+
+// cacheURLChars are the characters the runner image's job-started hook
+// writes to GITHUB_ENV (cache_url_ok in images/runner/entrypoint.sh): a
+// cacheURL with any other character would leave the job without it.
+const cacheURLChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/._~%-[]"
+
+// checkCacheURL accepts a route's cacheURL: what checkURL accepts, as a
+// scheme and host with an optional trailing "/" (the form of the cache
+// block's publicURL), with a lowercase scheme and only cacheURLChars.
+// checkURL alone passes an empty query or fragment ("?" or "#"), which
+// would survive normalisation.
+func checkCacheURL(raw string) error {
+	if err := checkURL(raw); err != nil {
+		return err
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return fmt.Errorf("%q must not have a query or fragment", raw)
+	}
+	if strings.Trim(raw, cacheURLChars) != "" {
+		return fmt.Errorf("%q must be ASCII, with no characters outside a URL's", raw)
+	}
+	u, _ := url.Parse(raw) // checked by checkURL
+	if !strings.HasPrefix(raw, u.Scheme+"://") {
+		return fmt.Errorf("%q must have a lowercase scheme", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("%q must be a scheme and host with no path", raw)
+	}
+	return nil
 }
 
 func checkURL(raw string) error {

@@ -669,8 +669,8 @@ LD_PRELOAD=/tmp/x' 'https://cache.example.com/a b' 'https://cache.example.com/$(
 	run_cache_hook cache-bad-url 0 1 LUXGHA_ACTIONS_RESULTS_URL="$bad"
 	check "exits 0 on a malformed URL" '[ "$rc" = 0 ]'
 	check "writes nothing" "$nothing_written"
-	check "one line saying the job uses GitHub's cache service" \
-		'[ "$(wc -l <"$d/out")" = 1 ] && grep -q "uses GitHub'"'"'s cache service" "$d/out"'
+	check "one workflow warning saying the job uses GitHub's cache service" \
+		'[ "$(wc -l <"$d/out")" = 1 ] && grep -q "^::warning::.*malformed; this job uses GitHub'"'"'s cache service" "$d/out"'
 done
 
 run_cache_hook cache-unset 0 1

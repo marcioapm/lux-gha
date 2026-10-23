@@ -26,8 +26,12 @@ cache() {
 	# this keeps a malformed value out of GITHUB_ENV all the same.
 	case $url in http://* | https://*) ;; *) url= ;; esac
 	case $url in *[!]A-Za-z0-9:/._~%[-]*) url= ;; esac
-	if [ -z "$url" ] || [ -z "${GITHUB_ENV:-}" ]; then
-		echo "lux-gha cache: not configured for this Run; this job uses GitHub's cache service"
+	if [ -z "$url" ]; then
+		echo "::warning::lux-gha: this Run's cache server URL is malformed; this job uses GitHub's cache service"
+		return 0
+	fi
+	if [ -z "${GITHUB_ENV:-}" ]; then
+		echo "::warning::lux-gha: GITHUB_ENV is not set; this job uses GitHub's cache service"
 		return 0
 	fi
 	dll=${RUNNER_DIR:-/home/runner/actions-runner}/bin/Runner.Worker.dll
@@ -40,7 +44,7 @@ cache() {
 		;;
 	esac
 	echo "ACTIONS_RESULTS_URL=$url" >>"$GITHUB_ENV" || {
-		echo "lux-gha cache: could not write GITHUB_ENV; this job uses GitHub's cache service"
+		echo "::warning::lux-gha: could not write GITHUB_ENV; this job uses GitHub's cache service"
 		return 0
 	}
 	echo "lux-gha cache: $url"

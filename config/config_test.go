@@ -208,6 +208,8 @@ func TestRouteCacheURL(t *testing.T) {
 		"https://u:p@cache.example.com", "https://u@cache.example.com",
 		"https://cache.example.com?a=1", "https://cache.example.com/?", "https://cache.example.com#f", "https://cache.example.com/#",
 		"/cache", "cache.example.com", "https:///x",
+		"HTTPS://cache.example.com", "Https://cache.example.com", "https://cache.example.com/prefix",
+		"https://cache.example.com/a/", "https://cäche.example.com", "https://cache.example.com/a b",
 	} {
 		_, err := parse(raw)
 		want := `route "docker": cacheURL`
