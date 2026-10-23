@@ -48,7 +48,8 @@ type Cache struct {
 	UpstreamResultsURL string   `json:"upstreamResultsURL"`
 	DownloadURLTTL     Duration `json:"downloadURLTTL"`
 	TTL                Duration `json:"ttl"`
-	// MaxBytes caps the total size of entries; 0 is no cap.
+	// MaxBytes caps entries (90 %) and uploads in progress (10 %)
+	// together; 0 is no cap.
 	MaxBytes      int64    `json:"maxBytes"`
 	MaxEntryBytes int64    `json:"maxEntryBytes"`
 	ReapInterval  Duration `json:"reapInterval"`

@@ -22,9 +22,9 @@ const (
 	DefaultTTL                = 7 * 24 * time.Hour
 	DefaultMaxEntryBytes      = 10 << 30
 	DefaultReapInterval       = time.Hour
-	// uploadURLTTL bounds the signed upload URL. It is well below
-	// stagingMaxAge, so the reaper never deletes staging data a valid
-	// upload URL can still write to.
+	// uploadURLTTL bounds the signed upload URL. It is below stagingMaxAge,
+	// so the age sweep never deletes an upload whose URL is still valid;
+	// the staging budget may still trim one (see selectReap).
 	uploadURLTTL  = 6 * time.Hour
 	stagingMaxAge = 24 * time.Hour
 	// minPartBytes is S3's lower bound for every multipart part but the last.
@@ -86,7 +86,8 @@ type Options struct {
 	Prefix             string
 	DownloadURLTTL     time.Duration
 	TTL                time.Duration
-	// MaxBytes caps the total size of final entries; 0 is no cap.
+	// MaxBytes caps entries and uploads in progress together, split into
+	// EntryBudgetFor and StagingBudgetFor; 0 is no cap.
 	MaxBytes      int64
 	MaxEntryBytes int64
 	ReapInterval  time.Duration
