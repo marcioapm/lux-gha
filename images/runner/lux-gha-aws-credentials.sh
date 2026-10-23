@@ -7,7 +7,10 @@ set -eu
 
 endpoint=${LUXGHA_RUNNER_ENDPOINT:-}
 file=${LUXGHA_IDENTITY_FILE:-}
-[ -n "$endpoint" ] && [ -r "$file" ] || { echo "lux-gha-aws-credentials: LUXGHA_RUNNER_ENDPOINT or LUXGHA_IDENTITY_FILE is not set" >&2; exit 1; }
+if [ -z "$endpoint" ] || [ ! -r "$file" ]; then
+	echo "lux-gha-aws-credentials: LUXGHA_RUNNER_ENDPOINT or LUXGHA_IDENTITY_FILE is not set" >&2
+	exit 1
+fi
 token=$(cat "$file")
 case $token in '' | *[!A-Za-z0-9._-]*) echo "lux-gha-aws-credentials: identity token is malformed" >&2; exit 1 ;; esac
 printf 'header = "Authorization: Bearer %s"\n' "$token" |

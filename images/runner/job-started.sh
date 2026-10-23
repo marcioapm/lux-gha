@@ -33,7 +33,9 @@ main() {
 		code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
 			curl --config - --silent --output "$body" --write-out '%{http_code}' \
 				--connect-timeout 3 --max-time 10 -X POST "$endpoint/runner/v1/registry" 2>/dev/null) || code=${code:-000}
-		[ "$code" = 409 ] && [ "$(date +%s)" -lt "$deadline" ] || break
+		if [ "$code" != 409 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+			break
+		fi
 		sleep 1
 	done
 	if [ "$code" != 200 ]; then
