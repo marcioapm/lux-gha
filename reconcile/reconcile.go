@@ -969,8 +969,7 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	if route.CacheURL != "" {
 		spec.Env[CacheURLEnv] = route.CacheURL
-		if rule, ok := egressHostRule(route.CacheURL); ok && !route.UnrestrictedEgress &&
-			!slices.ContainsFunc(spec.Egress, func(e luxclient.EgressRule) bool { return strings.EqualFold(e.Host, rule.Host) }) {
+		if rule, ok := egressHostRule(route.CacheURL); ok && !route.UnrestrictedEgress && !hasEgressHost(spec.Egress, rule.Host) {
 			spec.Egress = append(spec.Egress, rule)
 		}
 	}
@@ -1019,6 +1018,11 @@ func egressHostRule(rawURL string) (luxclient.EgressRule, bool) {
 		return luxclient.EgressRule{}, false
 	}
 	return luxclient.EgressRule{Host: u.Hostname()}, true
+}
+
+// hasEgressHost reports whether rules already name host (case-insensitively).
+func hasEgressHost(rules []luxclient.EgressRule, host string) bool {
+	return slices.ContainsFunc(rules, func(e luxclient.EgressRule) bool { return strings.EqualFold(e.Host, host) })
 }
 
 // routeResources is a size route's size, or a raw route's cpus, memory and disk.
