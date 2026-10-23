@@ -199,24 +199,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = rc.SetWriteDeadline(time.Time{})
 	defer func() { _ = rc.SetWriteDeadline(time.Now().Add(s.progressWindow)) }()
 	w = newProgressWriter(w, rc, s.progressWindow, s.progressBytes)
-	// A read deadline left set after the body is consumed would cancel the
-	// request's context (net/http's background read fails), so it is set
-	// only for a non-empty body, and progressBody clears it at the end.
-	hasBody := r.ContentLength != 0
 	switch {
 	case strings.HasPrefix(r.URL.Path, twirpPrefix):
-		if hasBody {
-			// Also bounds the drain of an unread body after a rejection.
-			_ = rc.SetReadDeadline(time.Now().Add(s.twirpReadTimeout))
-			r.Body = newProgressBody(r, rc, 0, 0)
-		}
+		// The absolute deadline also bounds the drain of an unread body
+		// after a rejection.
+		s.limitBody(r, rc, s.twirpReadTimeout, 0)
 		s.serveTwirp(w, r, strings.TrimPrefix(r.URL.Path, twirpPrefix))
 	case r.URL.Path == blobPath:
-		if hasBody {
-			// Also bounds the drain of a body left unread by a rejection.
-			_ = rc.SetReadDeadline(time.Now().Add(s.progressWindow))
-			r.Body = newProgressBody(r, rc, s.progressWindow, s.progressBytes)
-		}
+		// The first window also bounds the drain of a body left unread by
+		// a rejection.
+		s.limitBody(r, rc, s.progressWindow, s.progressWindow)
 		s.serveBlob(w, r)
 	default:
 		release, refused := s.proxies.acquire(s.passThroughKey(r))
@@ -231,14 +223,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer release()
-		// A request without a body keeps http.NoBody, which ReverseProxy
-		// recognises.
-		if hasBody {
-			_ = rc.SetReadDeadline(time.Now().Add(s.progressWindow))
-			r.Body = newProgressBody(r, rc, s.progressWindow, s.progressBytes)
-		}
+		s.limitBody(r, rc, s.progressWindow, s.progressWindow)
 		s.proxy.ServeHTTP(w, r)
 	}
+}
+
+// limitBody sets a read deadline timeout from now on a non-empty body and
+// wraps it in a progressBody with the given window (0: none). A read
+// deadline left set after the body is consumed would cancel the request's
+// context (net/http's background read fails), so an empty body, which
+// also keeps http.NoBody for ReverseProxy, gets neither, and progressBody
+// clears the deadline at the end.
+func (s *Server) limitBody(r *http.Request, rc *http.ResponseController, timeout, window time.Duration) {
+	if r.ContentLength == 0 {
+		return
+	}
+	_ = rc.SetReadDeadline(time.Now().Add(timeout))
+	r.Body = newProgressBody(r, rc, window, s.progressBytes)
 }
 
 // passThroughKey is the limiter key of a pass-through request: the job of
