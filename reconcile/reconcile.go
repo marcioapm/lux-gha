@@ -403,9 +403,7 @@ func (p *pass) fail(err error) {
 	var apiErr *githubapp.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.RateLimited {
-			p.r.limitMu.Lock()
-			p.r.rateLimitedUntil = apiErr.RetryAt
-			p.r.limitMu.Unlock()
+			p.r.NoteRateLimit(err)
 			p.st.Error = ErrRateLimited
 			p.r.log.Warn("GitHub rate limit: pausing reconciliation", "until", apiErr.RetryAt)
 			return

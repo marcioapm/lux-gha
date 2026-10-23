@@ -1427,6 +1427,35 @@ func TestTwoRepositoriesShareTheGlobalCapAndFailIndependently(t *testing.T) {
 	}
 }
 
+// A pass that meets a limit ending sooner than one already recorded (the
+// registry listener's secondary limit, say) keeps the later deadline.
+func TestPassRateLimitKeepsTheLaterDeadline(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	later := e.clock.Now().Add(time.Hour)
+	sooner := e.clock.Now().Add(time.Minute)
+	e.gh.fail = func(op, _ string, _ int) error {
+		if op != opRuns {
+			return nil
+		}
+		// Recorded by the listener while the pass is running.
+		e.rec.NoteRateLimit(&githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: later})
+		return &githubapp.APIError{StatusCode: 403, RateLimited: true, RetryAt: sooner}
+	}
+	if st := e.pass(); st.Error != ErrRateLimited || st.RateLimitedUntil == nil || !st.RateLimitedUntil.Equal(later) {
+		t.Fatalf("status %+v", st)
+	}
+	if until := e.rec.RateLimitedUntil(); !until.Equal(later) {
+		t.Fatalf("shared deadline %v, want %v", until, later)
+	}
+	e.gh.fail = nil
+	e.clock.Add(2 * time.Minute)
+	calls := e.gh.callCount()
+	if st := e.pass(); st.Error != ErrRateLimited || e.gh.callCount() != calls {
+		t.Fatalf("called GitHub after the sooner deadline: %d -> %d, %+v", calls, e.gh.callCount(), st)
+	}
+}
+
 func rateLimitOn(e *env, target string, until time.Time) {
 	e.gh.fail = func(op, _ string, _ int) error {
 		if op == target {
