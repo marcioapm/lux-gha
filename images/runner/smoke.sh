@@ -257,10 +257,13 @@ run -e PIN="$pin" --entrypoint sh "$TAG" -euc '
 	cp "$RUNNER_DIR/run-helper.sh.template" "$r/run-helper.sh"
 	mkdir "$r/bin"
 	cp "$RUNNER_DIR/bin/Runner.Worker.dll" "$r/bin/"
-	printf "#!/bin/sh\n%s count \"\$(dirname \"\$0\")/Runner.Worker.dll\"\necho \"\${BASH_ENV-unset}\"\n" "$pw" >"$r/bin/Runner.Listener"
+	# The listener writes what it sees to files: run-helper.sh prints its
+	# own lines after the listener exits.
+	printf "#!/bin/sh\n%s count \"\$(dirname \"\$0\")/Runner.Worker.dll\" >%s/seen\necho \"\${BASH_ENV-unset}\" >%s/bash_env\n" "$pw" "$r" "$r" >"$r/bin/Runner.Listener"
 	chmod 755 "$r/run-helper.sh" "$r/bin/Runner.Listener"
-	got=$(BASH_ENV=$pl "$r/run-helper.sh" 2>/dev/null | tail -2 | tr "\n" " ")
-	[ "$got" = "0 $PIN unset " ] || { echo "run-helper.sh under BASH_ENV: listener saw \"$got\", want \"0 $PIN unset \"" >&2; exit 1; }
+	BASH_ENV=$pl "$r/run-helper.sh" >/dev/null 2>&1 || true
+	got="$(cat "$r/seen" 2>/dev/null || :) $(cat "$r/bash_env" 2>/dev/null || :)"
+	[ "$got" = "0 $PIN unset" ] || { echo "run-helper.sh under BASH_ENV: listener saw \"$got\", want \"0 $PIN unset\"" >&2; exit 1; }
 	echo "shipped run-helper.sh patches through BASH_ENV; the listener sees no BASH_ENV"
 	# A copy patches cleanly, as pre-listener.sh would.
 	cp "$RUNNER_DIR/bin/Runner.Worker.dll" /tmp/w.dll
