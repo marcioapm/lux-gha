@@ -34,7 +34,10 @@ type memStore struct {
 	// loseAssembleReply makes the next assemble store the object and then
 	// report an error, as a lost CompleteMultipartUpload response.
 	loseAssembleReply bool
-	deleteCalls       int
+	// assembleDelay makes assemble wait this long first, failing with the
+	// context's error if it ends sooner, as a slow server-side copy does.
+	assembleDelay time.Duration
+	deleteCalls   int
 }
 
 type memObj struct {
@@ -156,7 +159,17 @@ func (m *memStore) deleteKeys(_ context.Context, keys []string) ([]string, error
 	return failed, nil
 }
 
-func (m *memStore) assemble(_ context.Context, dst string, parts []string, owner string) error {
+func (m *memStore) assemble(ctx context.Context, dst string, parts []string, owner string) error {
+	m.mu.Lock()
+	delay := m.assembleDelay
+	m.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	var buf bytes.Buffer
 	for _, p := range parts {
 		b, ok := m.get(p)

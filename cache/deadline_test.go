@@ -96,8 +96,9 @@ func TestUploadProgressDeadline(t *testing.T) {
 	}
 }
 
-// A Twirp body is read within its own short deadline, with or without a
-// token.
+// A Twirp body is read within an absolute deadline, with or without a
+// token: a body arriving above the minimum-progress rate is still cut
+// once twirpReadTimeout has passed.
 func TestTwirpReadDeadline(t *testing.T) {
 	h := newHarness(t)
 	shortWindows(h)
@@ -106,11 +107,59 @@ func TestTwirpReadDeadline(t *testing.T) {
 	ct := map[string]string{"Content-Type": "application/json"}
 	authed := map[string]string{"Content-Type": "application/json", "Authorization": "Bearer " + tok}
 	for name, hd := range map[string]map[string]string{"no token": ct, "token": authed} {
-		code, took := trickle(t, h.http.URL, http.MethodPost, path, hd, 100, 100*time.Millisecond)
-		if code == http.StatusOK || took > 3*time.Second {
+		// 40 bytes at steadyGap take 1.2 s and pass the progress rule; only
+		// the absolute 300 ms deadline cuts them before 1 s.
+		code, took := trickle(t, h.http.URL, http.MethodPost, path, hd, 40, steadyGap)
+		if code == http.StatusOK || took > time.Second {
 			t.Errorf("%s: %d after %v", name, code, took)
 		}
 	}
+}
+
+// Once a body has been read in full its read deadline is cleared, so a
+// handler that works past the window afterwards (an upstream answering
+// late, a slow Finalize copy) still answers.
+func TestReadDeadlineClearedAfterBody(t *testing.T) {
+	var upstreamErr atomic.Pointer[string]
+	fail := func(err error) { s := err.Error(); upstreamErr.Store(&s) }
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			fail(err)
+		}
+		time.Sleep(900 * time.Millisecond)
+		if err := r.Context().Err(); err != nil {
+			fail(err)
+		}
+		io.WriteString(w, "done")
+	}))
+	defer up.Close()
+	h := newHarness(t, func(o *Options) { o.Upstream = up.URL })
+	shortWindows(h)
+
+	t.Run("proxy", func(t *testing.T) {
+		resp, err := http.Post(h.http.URL+"/twirp/x.ArtifactService/Upload", "application/octet-stream", strings.NewReader("0123456789"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || string(b) != "done" {
+			t.Fatalf("proxied call answering after 3 windows: %d %q", resp.StatusCode, b)
+		}
+		if err := upstreamErr.Load(); err != nil {
+			t.Fatalf("the upstream saw %s", *err)
+		}
+	})
+	t.Run("finalize", func(t *testing.T) {
+		tok := h.is.token(t, "100", writeMain())
+		h.putBlobOK(h.reserve(tok, "k", v1), []byte("data"))
+		h.st.mu.Lock()
+		h.st.assembleDelay = 900 * time.Millisecond
+		h.st.mu.Unlock()
+		if f := h.finalize(tok, "k", v1, 4); !f.ok() {
+			t.Fatalf("finalize with a copy outlasting the Twirp deadline: %+v", f)
+		}
+	})
 }
 
 // A proxied request body is under the same minimum-progress rule, and the

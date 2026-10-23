@@ -234,6 +234,10 @@ func TestS3AssembleOutcomes(t *testing.T) {
 func TestS3AssembleCancelsCopiesOnFirstFailure(t *testing.T) {
 	f, st := newFakeS3(t)
 	cancelled := make(chan struct{}, 100)
+	// release frees copies that were never cancelled; the cleanup runs
+	// before the fake server's, so a failing test strands no handler.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
 	f.copyHook = func(r *http.Request, n int) (int, string) {
 		if n == 1 {
 			// Fail once the others are in flight.
@@ -243,7 +247,7 @@ func TestS3AssembleCancelsCopiesOnFirstFailure(t *testing.T) {
 		select {
 		case <-r.Context().Done():
 			cancelled <- struct{}{}
-		case <-time.After(10 * time.Second):
+		case <-release:
 		}
 		return http.StatusInternalServerError, "InternalError"
 	}
@@ -251,13 +255,16 @@ func TestS3AssembleCancelsCopiesOnFirstFailure(t *testing.T) {
 	for i := range parts {
 		parts[i] = fmt.Sprintf("p/s/%02d", i)
 	}
-	start := time.Now()
-	err := st.assemble(context.Background(), "p/v1/entry", parts, "r")
+	done := make(chan error, 1)
+	go func() { done <- st.assemble(context.Background(), "p/v1/entry", parts, "r") }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("assemble did not return within 5 s: the failed copy cancelled nothing")
+	}
 	if err == nil || errors.Is(err, errNotFound) || !strings.Contains(err.Error(), "copy part 1") {
 		t.Fatalf("err %v", err)
-	}
-	if took := time.Since(start); took > 5*time.Second {
-		t.Fatalf("assemble took %v", took)
 	}
 	f.mu.Lock()
 	started := f.copyStarted
