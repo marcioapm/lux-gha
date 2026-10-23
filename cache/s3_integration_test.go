@@ -28,6 +28,20 @@ import (
 // LUXGHA_CACHE_S3_BUCKET, created if missing, with credentials from the
 // AWS default chain, e.g. AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
 // Each test works under its own random prefix.
+//
+// Two opt-ins claim what the server enforces:
+//   - LUXGHA_CACHE_S3_CONDITIONAL=1: CompleteMultipartUpload with
+//     If-None-Match: * fails against an existing object;
+//   - LUXGHA_CACHE_S3_CONCURRENT_CONDITIONAL=1: of concurrent such
+//     completes, exactly one succeeds. AWS S3 documents this; versitygw
+//     v1.7.0 does not do it.
+//
+// Without them the tests still require atomicity: every read sees one
+// whole input.
+func concurrentConditional() bool {
+	return os.Getenv("LUXGHA_CACHE_S3_CONCURRENT_CONDITIONAL") == "1"
+}
+
 func s3TestStore(t *testing.T) (*s3Store, string) {
 	t.Helper()
 	endpoint, bucket := os.Getenv("LUXGHA_CACHE_S3_ENDPOINT"), os.Getenv("LUXGHA_CACHE_S3_BUCKET")
@@ -176,12 +190,12 @@ func TestS3StoreAssembleIsFirstWriterWins(t *testing.T) {
 	if len(b) != 1000 || !bytes.Equal(b, bytes.Repeat(b[:1], 1000)) {
 		t.Fatal("mixed or partial object")
 	}
-	t.Logf("racing finalizes: %d of %d completed (1 means the server enforced If-None-Match)", won, racers)
+	t.Logf("racing finalizes: %d of %d completed (1 means the server serialised the conditional completes)", won, racers)
 	if won < 1 {
 		t.Fatal("no finalize completed")
 	}
-	if os.Getenv("LUXGHA_CACHE_S3_CONDITIONAL") == "1" && won != 1 {
-		t.Fatalf("%d racers completed; the server ignores If-None-Match on CompleteMultipartUpload", won)
+	if concurrentConditional() && won != 1 {
+		t.Fatalf("%d racers completed; the server does not serialise concurrent CompleteMultipartUpload with If-None-Match", won)
 	}
 	var left []string
 	st.listUploads(ctx, prefix, func(u pendingUpload) bool { left = append(left, u.Key); return true })

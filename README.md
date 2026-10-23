@@ -696,10 +696,12 @@ attempt staged toward `maxEntryBytes`.
 blocks, is not supported. Blocks are streamed to S3, never held in memory.
 `FinalizeCacheEntryUpload` checks the uploaded size against `size_bytes`
 and only then makes the entry visible, as one server-side multipart copy
-completed with `If-None-Match: *`: of two jobs saving the same key and
-version, the first to finalize wins and the other gets `ok: false`. A store
-that ignores the condition makes the last finalize win instead; either way a
-reader sees one whole archive.
+completed with `If-None-Match: *`. A finalize after another job's entry of
+the same key and version exists gets `ok: false`. Of two finalizes in
+flight together, exactly one wins only on a store that serialises
+conditional completes, which AWS S3 documents and which has not been
+verified here; a store that does not (versitygw v1.7.0) lets the last one
+win. Either way a reader sees one whole archive.
 
 **Restoring.** `GetCacheEntryDownloadURL` returns a presigned S3 `GET` URL;
 the client downloads it with plain HTTP, so runners need egress to the S3
@@ -887,8 +889,22 @@ LUXGHA_CACHE_S3_ENDPOINT=http://127.0.0.1:59240 LUXGHA_CACHE_S3_BUCKET=cache-buc
   go test -tags s3integration -count=1 ./cache/
 ```
 
-`LUXGHA_CACHE_S3_CONDITIONAL=1` fails the run unless the server enforces
-`If-None-Match` on `CompleteMultipartUpload`, as AWS S3 and versitygw do.
+`LUXGHA_CACHE_S3_CONDITIONAL=1` fails the run unless the server refuses
+`CompleteMultipartUpload` with `If-None-Match: *` against an object that
+already exists. versitygw v1.7.0 does, so a finalize that comes after
+another job's finalized entry gets `ok: false` there.
+
+versitygw v1.7.0 does not serialise two such completes in flight together:
+both succeed, and the last to finish is the entry. The command above
+therefore does not assert that exactly one of several concurrent saves
+wins; it asserts that at least one does and that every restore sees one
+whole archive, which holds on any server. The concurrent first-writer-wins
+guarantee is targeted at AWS S3, which documents conditional writes as
+admitting one of concurrent writers; it has not been run against AWS here.
+To assert it against a server that should enforce it, add
+`LUXGHA_CACHE_S3_CONCURRENT_CONDITIONAL=1`; against versitygw that run
+fails intermittently.
+
 `make test` covers the S3 requests themselves (conditional complete, part
 order, copy-source escaping, error mapping, abort and cancellation) against
 an in-process fake S3 (`cache/s3store_test.go`).

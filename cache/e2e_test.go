@@ -260,9 +260,13 @@ func TestE2EConcurrentSavesOfOneKey(t *testing.T) {
 			won++
 		}
 	}
-	if won != 1 {
-		t.Fatalf("%d of %d concurrent saves succeeded, want 1: %v", won, jobs, results)
+	// At least one save wins on any server; exactly one only where
+	// concurrent conditional completes are serialised (see
+	// concurrentConditional).
+	if won < 1 || (concurrentConditional() && won != 1) {
+		t.Fatalf("%d of %d concurrent saves succeeded: %v", won, jobs, results)
 	}
+	t.Logf("%d of %d concurrent saves succeeded", won, jobs)
 	e.wipe("deps")
 	if res := e.node(e.is.token(t, "100", readMain()), map[string]any{"op": "restore", "paths": []any{"deps"}, "key": "same-key"}); res["matchedKey"] != "same-key" {
 		t.Fatalf("restore: %v", res)
