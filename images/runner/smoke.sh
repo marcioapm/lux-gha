@@ -239,6 +239,40 @@ run --network none $bk_env -e WANT_ARCH="$arch" \
 	echo "buildkit.tar: moby/buildkit:$BK_VERSION and :buildx-stable-1 -> $BK_INDEX, linux/$WANT_ARCH $BK_MANIFEST, $(stat -c %s "$a") bytes; blobs verified"
 '
 
+echo "== cache server patch (README \"Using the cache server\")"
+pin=$(containerfile_arg RUNNER_RESULTS_URL_LITERALS)
+# shellcheck disable=SC2016 # the script expands inside the container
+run -e PIN="$pin" --entrypoint sh "$TAG" -euc '
+	pw=/usr/local/lib/lux-gha/patch-worker.sh
+	[ "$(stat -c "%U %a" "$pw")" = "root 755" ] || { echo "$pw is $(stat -c "%U %a" "$pw"), want root 755" >&2; exit 1; }
+	pl=/usr/local/lib/lux-gha/pre-listener.sh
+	[ "$(stat -c "%U %a" "$pl")" = "root 644" ] || { echo "$pl is $(stat -c "%U %a" "$pl"), want root 644" >&2; exit 1; }
+	bash -n "$pl"
+	# Shipped unpatched: pre-listener.sh patches at every run-helper.sh start.
+	"$pw" check "$PIN" "$RUNNER_DIR/bin/Runner.Worker.dll"
+	echo "Runner.Worker.dll unpatched with $PIN literal(s); pre-listener.sh installed"
+	# The shipped run-helper.sh.template under BASH_ENV, as run.sh starts it,
+	# against a copy of the Worker and a listener that reports what it sees.
+	r=$(mktemp -d)
+	cp "$RUNNER_DIR/run-helper.sh.template" "$r/run-helper.sh"
+	mkdir "$r/bin"
+	cp "$RUNNER_DIR/bin/Runner.Worker.dll" "$r/bin/"
+	# The listener writes what it sees to files: run-helper.sh prints its
+	# own lines after the listener exits.
+	printf "#!/bin/sh\n%s count \"\$(dirname \"\$0\")/Runner.Worker.dll\" >%s/seen\necho \"\${BASH_ENV-unset}\" >%s/bash_env\n" "$pw" "$r" "$r" >"$r/bin/Runner.Listener"
+	chmod 755 "$r/run-helper.sh" "$r/bin/Runner.Listener"
+	BASH_ENV=$pl "$r/run-helper.sh" >/dev/null 2>&1 || true
+	got="$(cat "$r/seen" 2>/dev/null || :) $(cat "$r/bash_env" 2>/dev/null || :)"
+	[ "$got" = "0 $PIN unset" ] || { echo "run-helper.sh under BASH_ENV: listener saw \"$got\", want \"0 $PIN unset\"" >&2; exit 1; }
+	echo "shipped run-helper.sh patches through BASH_ENV; the listener sees no BASH_ENV"
+	# A copy patches cleanly, as pre-listener.sh would.
+	cp "$RUNNER_DIR/bin/Runner.Worker.dll" /tmp/w.dll
+	"$pw" apply /tmp/w.dll
+	[ "$("$pw" count /tmp/w.dll)" = "0 $PIN" ] || { echo "patched copy counts $("$pw" count /tmp/w.dll)" >&2; exit 1; }
+' || fail "cache server patch"
+run -i --entrypoint sh "$TAG" -s /usr/local/lib/lux-gha/patch-worker.sh <"$dir/patch-worker_test.sh" ||
+	fail "patch-worker test"
+
 echo "== entrypoint lifecycle (entrypoint_test.sh against the installed entrypoint)"
 run -i --entrypoint sh "$TAG" -s /usr/local/bin/lux-gha-runner <"$dir/entrypoint_test.sh" ||
 	fail "entrypoint lifecycle test"

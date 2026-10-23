@@ -181,6 +181,46 @@ func TestParseEgressModes(t *testing.T) {
 	}
 }
 
+func TestRouteCacheURL(t *testing.T) {
+	parse := func(raw string) (*Config, error) {
+		return Parse(mutate(`"nestedContainers": true,`, `"nestedContainers": true, "cacheURL": "`+raw+`",`))
+	}
+	valid := map[string]string{
+		"https://cache.example.com":       "https://cache.example.com",
+		"https://cache.example.com/":      "https://cache.example.com",
+		"https://cache.example.com:8443/": "https://cache.example.com:8443",
+		"http://127.0.0.1:8090":           "http://127.0.0.1:8090",
+		"http://localhost:8090/":          "http://localhost:8090",
+		"http://[::1]:8090":               "http://[::1]:8090",
+	}
+	for raw, want := range valid {
+		c, err := parse(raw)
+		if err != nil {
+			t.Errorf("%q: %v", raw, err)
+			continue
+		}
+		if c.Routes[1].CacheURL != want || c.Routes[0].CacheURL != "" {
+			t.Errorf("%q: cacheURL %q, want %q", raw, c.Routes[1].CacheURL, want)
+		}
+	}
+	for _, raw := range []string{
+		"http://cache.example.com", "http://10.0.0.5:8090", "ftp://cache.example.com",
+		"https://u:p@cache.example.com", "https://u@cache.example.com",
+		"https://cache.example.com?a=1", "https://cache.example.com/?", "https://cache.example.com#f", "https://cache.example.com/#",
+		"/cache", "cache.example.com", "https:///x",
+		"HTTPS://cache.example.com", "Https://cache.example.com", "https://cache.example.com/prefix",
+		"https://cache.example.com/a/", "https://cäche.example.com", "https://cache.example.com/a b",
+		"https://cache.example.com:", "https://cache.example.com:0", "https://cache.example.com:99999",
+		"https://a]b", "https://[cache.example.com]",
+	} {
+		_, err := parse(raw)
+		want := `route "docker": cacheURL`
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: err = %v, want it to contain %q", raw, err, want)
+		}
+	}
+}
+
 func TestMatchRouteRequiresAllJobLabels(t *testing.T) {
 	c, err := Parse([]byte(validConfig))
 	if err != nil {

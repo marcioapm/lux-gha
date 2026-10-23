@@ -75,6 +75,12 @@ FROM $UBUNTU_IMAGE
 
 ARG TARGETARCH
 ARG RUNNER_VERSION=2.338.0
+# Occurrences of the UTF-16LE literal ACTIONS_RESULTS_URL in this version's
+# bin/Runner.Worker.dll (patch-worker.sh count), the same on every
+# architecture. A runner bump that changes it fails the build: re-measure
+# and check that patch-worker.sh still applies (README "Using the cache server").
+# The image ships the Worker unpatched; pre-listener.sh patches it at run time.
+ARG RUNNER_RESULTS_URL_LITERALS=1
 # SHA-256 of actions-runner-linux-<arch>-2.338.0.tar.gz, from the v2.338.0
 # release notes (also the asset digests the GitHub releases API reports).
 ARG RUNNER_SHA256_ARM64=628b4a7258487b80c1d3c221095a7ded349f5ae0175fd3dfab708d07428f041b
@@ -173,6 +179,8 @@ RUN userdel -r ubuntu; \
     cp /etc/subuid /etc/subgid; \
     install -d -o runner -g runner -m 0755 /opt/hostedtoolcache
 
+COPY --chmod=755 patch-worker.sh /usr/local/lib/lux-gha/patch-worker.sh
+COPY --chmod=644 pre-listener.sh /usr/local/lib/lux-gha/pre-listener.sh
 WORKDIR /home/runner/actions-runner
 RUN case "$TARGETARCH" in \
       arm64) arch=arm64 sha=$RUNNER_SHA256_ARM64 ;; \
@@ -184,6 +192,7 @@ RUN case "$TARGETARCH" in \
     echo "${sha}  /tmp/runner.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/runner.tar.gz; \
     rm /tmp/runner.tar.gz; \
+    /usr/local/lib/lux-gha/patch-worker.sh check "$RUNNER_RESULTS_URL_LITERALS" bin/Runner.Worker.dll; \
     apt-get update; \
     ./bin/installdependencies.sh; \
     rm -rf /var/lib/apt/lists/*; \
@@ -301,7 +310,7 @@ COPY --chmod=644 LICENSE /usr/share/lux-gha/LICENSE
 COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
 # The in-region registry: credential helper, its AWS profile and
 # credential_process, and the job-started hook (README "In-region image registry").
-RUN install -d -m 0755 /etc/lux-gha /usr/local/lib/lux-gha
+RUN install -d -m 0755 /etc/lux-gha
 COPY --chmod=755 docker-credential-lux-gha.sh /usr/local/bin/docker-credential-lux-gha
 COPY --chmod=755 lux-gha-aws-credentials.sh /usr/local/bin/lux-gha-aws-credentials
 COPY --chmod=755 job-started.sh /usr/local/lib/lux-gha/job-started.sh

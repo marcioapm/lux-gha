@@ -20,7 +20,8 @@ license:
 test:
 	go test -race -count=1 ./...
 
-# entrypoint_test.sh against the working tree's entrypoint.sh, as uid 1000 in
+# entrypoint_test.sh against the working tree's entrypoint.sh (and
+# patch-worker_test.sh against patch-worker.sh), as uid 1000 in
 # the runner's base image plus the jq and curl the runner image installs: the
 # invocation smoke.sh uses inside the built image.
 ENTRYPOINT_TEST_IMAGE := lux-gha-entrypoint-test:local
@@ -31,6 +32,8 @@ entrypoint-test:
 		$(ENTRYPOINT_TEST_IMAGE) -s /src/entrypoint.sh <images/runner/entrypoint_test.sh
 	docker run --rm -i --workdir /home/ubuntu --user 0:0 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
 		$(ENTRYPOINT_TEST_IMAGE) -s /src/entrypoint.sh sigterm-root <images/runner/entrypoint_test.sh
+	docker run --rm -i --workdir /home/ubuntu --user 1000:1000 -v "$(CURDIR)/images/runner:/src:ro" --entrypoint sh \
+		$(ENTRYPOINT_TEST_IMAGE) -s /src/patch-worker.sh <images/runner/patch-worker_test.sh
 
 # The runner image, loaded into the local Docker: the host's architecture, or
 # PLATFORM=linux/arm64|linux/amd64.

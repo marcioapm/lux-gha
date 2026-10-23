@@ -541,7 +541,9 @@ environment prefix for itself.) The entrypoint:
 With a [registry](#in-region-image-registry), the Run also has the identity token at
 `/run/lux-gha/identity` (`LUXGHA_IDENTITY_FILE`) and `LUXGHA_RUNNER_ENDPOINT`, `LUXGHA_REGISTRY_HOST` and
 `LUXGHA_REGISTRY_REGION`. The entrypoint then adds the credential helper for `LUXGHA_REGISTRY_HOST` and the
-job-started hook; neither can stop the runner from starting.
+job-started hook; neither can stop the runner from starting. With a route's `cacheURL`, the Run has
+`LUXGHA_ACTIONS_RESULTS_URL` and the entrypoint sets the same hook
+([Using the cache server](#using-the-cache-server)).
 
 `images/runner/entrypoint.sh` is a reference POSIX `sh` implementation. It
 also starts rootless Docker first when the image has it, then loads the
@@ -583,6 +585,7 @@ image's BuildKit archive into it (a failed load only warns).
 - **`command`** (route): optional, overrides the Run's command (default `["/usr/local/bin/lux-gha-runner"]`).
 - **Resources** (route): either `size` or the raw `cpus`, `memoryMiB` and `diskGiB`, never both ([Sizes](#sizes)). Raw fields left out or `0` are not sent. On an unshaped pool, luxd's defaults fill them; on a shaped pool, the fields given are rounded up to the smallest size that covers all of them, and a route with none of them gets the pool's default size. `size` must be a name luxd can give a size: `<family>-<cpus>-<arch>`, the family a lowercase slug of `a-z`, `0-9` and `-` that starts and ends with a letter or digit, cpus `05` or a power of two, arch `arm64` or `amd64`, at most 63 characters.
 - **Egress** (route): Lux Runs are default-deny. `egressHosts` sends one `network.egress` host rule per entry, and the Run reaches only those names. `unrestrictedEgress: true` sends `network: {"unrestricted": true}` instead, which switches Lux's egress filtering off (Lux's hard blocks, such as cloud metadata and the control plane, still apply). Setting both is rejected. A route with neither is valid, but its Runs have **no network at all**, so the runner cannot reach GitHub.
+- **`cacheURL`** (route): optional. Address of an Actions cache server, usually the `cache` block's `publicURL` ([Using the cache server](#using-the-cache-server)). The route's Runs get it as `LUXGHA_ACTIONS_RESULTS_URL` and, on a default-deny route, an egress rule for its host. A scheme and host like `publicURL`: HTTPS (HTTP is accepted on loopback, which only a test runner can reach), a lowercase scheme, ASCII, no path, credentials, query or fragment; a trailing `/` is dropped. Omit to use GitHub's service.
 - **`appID`**: the JWT issuer. It can be the App's client ID (GitHub's recommendation) or its numeric app ID.
 - **`runnerGroupID`**: required by `generate-jitconfig`. Read the repository's runner group ID from GitHub rather than assuming `1`.
 - **`apiURL`**: optional. It defaults to `https://api.github.com` and must be HTTPS. Plain HTTP is accepted only for loopback test servers. The API host never comes from webhook payloads.
@@ -611,7 +614,8 @@ image's BuildKit archive into it (a failed load only warns).
 With `cache` present, lux-gha serves the GitHub Actions cache service (v2,
 the API `@actions/cache` 4 and later and `actions/cache@v4` use) on a second
 listener; the webhook listener is unchanged. Runners use `publicURL` as
-`ACTIONS_RESULTS_URL` (pointing runners at it is not part of lux-gha).
+`ACTIONS_RESULTS_URL`: set it as a route's `cacheURL` and the runner image
+points that route's jobs at it ([Using the cache server](#using-the-cache-server)).
 
 - **`listen`**, **`publicURL`**, **`s3.bucket`**, **`s3.region`** and
   **`signingKeyFile`** are required. `publicURL` is a scheme and host with no
@@ -830,6 +834,52 @@ does not resubmit it:
 The job is not submitted again while it stays queued. A restarted bridge
 submits it once more and is refused once more. Without Checks or Actions
 write, the check run or the force-cancel is skipped, as for stopped jobs.
+
+### Using the cache server
+
+Workflows change nothing: `actions/cache` and the `cache:` input of the
+`setup-*` actions use the cache server on a route with `cacheURL`, and
+GitHub's service everywhere else (GitHub-hosted runners, other routes).
+
+The runner's Worker sets `ACTIONS_RESULTS_URL` for JavaScript and container
+actions from the job's service connection, after copying the job's
+environment in, so no value set from outside reaches those actions. The
+runner image therefore ships `images/runner/patch-worker.sh`:
+
+- **Patch.** Renames the UTF-16LE literal `ACTIONS_RESULTS_URL` in
+  `bin/Runner.Worker.dll` to `ACTIONS_RESULTS_ORL`, the same length. The
+  Worker then stores GitHub's URL under a name nothing reads. Nothing else in
+  the file changes. The build pins the literal's count for the runner version
+  (`RUNNER_RESULTS_URL_LITERALS`) and fails on a mismatch; a runner bump
+  re-measures it with `patch-worker.sh count`.
+- **When.** The image ships the Worker unpatched. With a cache server, the
+  entrypoint sets `BASH_ENV` to `pre-listener.sh`, which bash runs at the
+  start of `run-helper.sh` (the script `run.sh` restarts before every
+  listener start): it patches the Worker that `bin/` names, then unsets
+  `BASH_ENV`, so the listener and job steps never see it. A JIT runner
+  cannot turn self-update off; an update replaces `bin/` and every script in
+  the runner directory, then restarts the listener before it takes the job.
+  The environment survives that, so the fresh copy is patched too.
+- **The value.** The job-started hook appends
+  `ACTIONS_RESULTS_URL=<cacheURL>` to `$GITHUB_ENV`, so every step sees it,
+  including steps in a job `container:` (the runner passes a container only
+  the job's environment).
+- **Fail-open.** The Worker is patched only when the hook will write the
+  URL: the entrypoint passes `LUXGHA_ACTIONS_RESULTS_URL` on to the runner
+  only after installing the hook and checking the URL, and unsets it (with a
+  warning) when the image already names another job-started hook or sets
+  `BASH_ENV`, the hook or `pre-listener.sh` is missing, or the URL is not one
+  the hook can write. If the Worker cannot be patched (a runner version the
+  script does not recognise), `pre-listener.sh` warns and the listener starts
+  anyway; the hook then writes nothing and the job log gets a `::warning::`
+  that the job uses GitHub's cache service. Caching falls back, jobs do not
+  fail.
+
+Artifacts go through the same variable, so they reach GitHub through the
+cache server's pass-through ([Actions cache](#actions-cache)). The Run must be
+able to reach `cacheURL`: lux-gha adds the egress rule, and the operator
+provides the network path. Lux blocks a Run from reaching the Lux control
+host, so the cache listener must run elsewhere.
 
 ## In-region image registry
 

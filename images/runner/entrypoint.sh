@@ -18,7 +18,7 @@
 #
 # With LUXGHA_REGISTRY_HOST set, it then merges a credHelpers entry for that
 # host into the runner user's Docker config and points the runner's
-# job-started hook at job-started.sh: see setup_registry.
+# job-started hook at job-started.sh: see setup_registry and setup_hook.
 set -eu
 
 RUNNER_DIR=${RUNNER_DIR:-/home/runner/actions-runner}
@@ -126,15 +126,67 @@ setup_registry() {
 		return 0
 	fi
 	if [ "$(id -u)" -eq 0 ]; then chown -R "$RUNNER_USER:" "$dir"; fi
-	hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
-	if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
-		echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; LUX_REGISTRY is not exported" >&2
-	elif [ -f "$hook" ]; then
-		export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
+	registry_ready=true
+}
+
+# cache_url_ok URL: http(s), URL characters only, so no newline or space can
+# add a second variable to GITHUB_ENV (the same test as in job-started.sh).
+cache_url_ok() {
+	case $1 in http://* | https://*) ;; *) return 1 ;; esac
+	case $1 in *[!]A-Za-z0-9:/._~%[-]*) return 1 ;; esac
+}
+
+# no_cache REASON: warn that jobs fall back to GitHub's cache service, and
+# drop the URL so setup_hook neither passes it on nor sets BASH_ENV.
+no_cache() {
+	echo "lux-gha-runner: warning: $1; jobs use GitHub's cache service" >&2
+	url=
+}
+
+# The job-started hook exports LUX_REGISTRY (when the registry is set up)
+# and points the job at the Actions cache server (when the bridge set
+# LUXGHA_ACTIONS_RESULTS_URL; README "Using the cache server"). A hook the
+# image's own environment already names is kept.
+#
+# With a usable URL and our hook installed, BASH_ENV names pre-listener.sh,
+# which patches the Worker at every run-helper.sh start (self-updates
+# included). A patched Worker no longer sets GitHub's URL, so the patch
+# happens only when the hook will write ours; otherwise neither the URL nor
+# BASH_ENV reaches run.sh and jobs use GitHub's service.
+setup_hook() {
+	url=${LUXGHA_ACTIONS_RESULTS_URL:-}
+	if [ -n "$url" ] && ! cache_url_ok "$url"; then
+		no_cache "LUXGHA_ACTIONS_RESULTS_URL is not a URL the hook can write"
+	fi
+	if [ "$registry_ready" = true ] || [ -n "$url" ]; then
+		hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
+		if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
+			echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; jobs run without LUX_REGISTRY and the cache server" >&2
+			url=
+		elif [ -f "$hook" ]; then
+			export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
+		elif [ -n "$url" ]; then
+			no_cache "no job-started hook at $hook"
+		fi
+	fi
+	if [ -n "$url" ]; then
+		pre=${LUXGHA_PRE_LISTENER:-/usr/local/lib/lux-gha/pre-listener.sh}
+		if [ -n "${BASH_ENV:-}" ]; then
+			no_cache "BASH_ENV is already set"
+		elif [ ! -f "$pre" ]; then
+			no_cache "no $pre"
+		fi
+	fi
+	if [ -n "$url" ]; then
+		export LUXGHA_ACTIONS_RESULTS_URL="$url" BASH_ENV="$pre"
+	else
+		unset LUXGHA_ACTIONS_RESULTS_URL
 	fi
 }
 
+registry_ready=false
 setup_registry || echo "lux-gha-runner: warning: registry setup failed; jobs run without LUX_REGISTRY" >&2
+setup_hook
 cd "$RUNNER_DIR"
 # run.sh forwards SIGTERM to the listener as SIGINT only with this set; the
 # listener then cancels the running job and uploads its logs before exiting.

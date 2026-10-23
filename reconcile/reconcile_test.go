@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -220,6 +221,106 @@ func TestUnrestrictedEgressRouteSubmitsUnrestrictedNetwork(t *testing.T) {
 	// "big" sets neither field: default deny with no rules, so no network.
 	if network["default"] != `{"unrestricted":true}` || network["big"] != `{}` {
 		t.Fatalf("network per route %v", network)
+	}
+}
+
+// specsByRoute provisions job 7 on "default" and job 8 on "big" and returns
+// each submitted spec by route.
+func specsByRoute(t *testing.T, edits ...func(string) string) map[string]luxclient.RunSpec {
+	t.Helper()
+	e := newEnv(t, edits...)
+	e.gh.queue(7, "queued", "self-hosted", "lux")
+	e.gh.queue(8, "queued", "lux-big")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 2 {
+		t.Fatalf("status %+v", st)
+	}
+	specs := map[string]luxclient.RunSpec{}
+	for _, r := range e.lux.all() {
+		specs[r.run.Labels[LabelRoute]] = r.spec
+	}
+	return specs
+}
+
+func TestRouteWithoutCacheURLSubmitsTheSameSpec(t *testing.T) {
+	specs := specsByRoute(t)
+	wantEnv := map[string]string{JITConfigEnv: JITConfigPath}
+	want := map[string]luxclient.RunSpec{
+		"default": {
+			ImageRef: "ghcr.io/acme/runner@sha256:abc", Command: config.DefaultCommand, Env: wantEnv,
+			Resources: luxclient.Resources{CPUs: 2, Memory: 4096 << 20, Disk: 20 << 30},
+			Timeout:   90 * time.Minute, Grace: config.DefaultStopGrace, Pool: "gha",
+			Egress: []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}},
+		},
+		"big": {
+			ImageRef: "ghcr.io/acme/runner-big@sha256:def", Command: []string{"/opt/start"}, Env: wantEnv,
+			Timeout: 2 * time.Hour, Grace: config.DefaultStopGrace, Pool: "gha-big",
+			Sandbox: luxclient.Sandbox{NestedContainers: true},
+		},
+	}
+	for route, w := range want {
+		got := specs[route]
+		if len(got.Secrets) != 1 || got.Secrets[0].Name != jitSecretName || got.Secrets[0].Path != JITConfigPath {
+			t.Fatalf("%s: secrets %+v", route, got.Secrets)
+		}
+		w.Name, w.Labels, w.Secrets = got.Name, got.Labels, got.Secrets
+		if !reflect.DeepEqual(got, w) {
+			t.Fatalf("%s: spec\n got %+v\nwant %+v", route, got, w)
+		}
+	}
+}
+
+func TestRouteCacheURLSetsEnvAndEgress(t *testing.T) {
+	const cache = `"cacheURL": "https://cache.example.com:8443/", `
+	specs := specsByRoute(t,
+		replace(`"timeout": "90m", `, `"timeout": "90m", `+cache),
+		replace(`"timeout": "2h", `, `"timeout": "2h", `+cache))
+	wantEnv := map[string]string{JITConfigEnv: JITConfigPath, CacheURLEnv: "https://cache.example.com:8443"}
+	wantEgress := map[string][]luxclient.EgressRule{
+		"default": {{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {Host: "cache.example.com"}},
+		"big":     {{Host: "cache.example.com"}},
+	}
+	for route, s := range specs {
+		if !mapsEqual(s.Env, wantEnv) || !slices.Equal(s.Egress, wantEgress[route]) || s.UnrestrictedEgress {
+			t.Fatalf("%s: env %v egress %v", route, s.Env, s.Egress)
+		}
+	}
+
+	// Unrestricted: the env, and no rule.
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "https://cache.example.com", "unrestrictedEgress": true`))
+	if s := specs["default"]; s.Env[CacheURLEnv] != "https://cache.example.com" || len(s.Egress) != 0 || !s.UnrestrictedEgress {
+		t.Fatalf("unrestricted: env %v egress %v", s.Env, s.Egress)
+	}
+	if _, ok := specs["big"].Env[CacheURLEnv]; ok {
+		t.Fatalf("route without cacheURL got env %v", specs["big"].Env)
+	}
+
+	// Already an egress host: not added twice.
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "https://cache.example.com", "egressHosts": ["cache.example.com", "github.com"]`))
+	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "cache.example.com"}, {Host: "github.com"}}) {
+		t.Fatalf("listed host: egress %v", s.Egress)
+	}
+
+	// Listed in another case: still one rule (hostnames are case-insensitive).
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "https://Cache.Example.com", "egressHosts": ["cache.example.com"]`))
+	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "cache.example.com"}}) {
+		t.Fatalf("listed host in another case: egress %v", s.Egress)
+	}
+
+	// The same host as the registry's runner endpoint: one rule.
+	specs = specsByRoute(t, replace(`"repositories"`, registryBlock),
+		replace(`"timeout": "90m", `, `"timeout": "90m", "cacheURL": "https://gha.example.com", `))
+	if s := specs["default"]; !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {Host: "gha.example.com"}}) {
+		t.Fatalf("cacheURL on the runner endpoint's host: egress %v", s.Egress)
+	}
+
+	// A loopback IP: the env, and no rule (no rule is ever added for an IP).
+	specs = specsByRoute(t, replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`,
+		`"cacheURL": "http://127.0.0.1:8090", "egressHosts": ["github.com"]`))
+	if s := specs["default"]; s.Env[CacheURLEnv] != "http://127.0.0.1:8090" || !slices.Equal(s.Egress, []luxclient.EgressRule{{Host: "github.com"}}) {
+		t.Fatalf("loopback IP: env %v egress %v", s.Env, s.Egress)
 	}
 }
 

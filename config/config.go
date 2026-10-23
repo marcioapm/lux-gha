@@ -14,6 +14,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -200,6 +201,9 @@ type Route struct {
 	// UnrestrictedEgress turns Lux's egress filtering off for the route's
 	// Runs. Without it, a Run reaches only EgressHosts, and nothing if empty.
 	UnrestrictedEgress bool `json:"unrestrictedEgress"`
+	// CacheURL is the Actions cache server the route's runners use; empty
+	// keeps GitHub's. Stored without a trailing slash.
+	CacheURL string `json:"cacheURL,omitempty"`
 }
 
 var DefaultCommand = []string{"/usr/local/bin/lux-gha-runner"}
@@ -428,6 +432,13 @@ func (c *Config) validate() error {
 		}
 		if r.UnrestrictedEgress && len(r.EgressHosts) > 0 {
 			add("route %q: unrestrictedEgress and egressHosts are mutually exclusive", r.Name)
+		}
+		if r.CacheURL != "" {
+			if err := checkCacheURL(r.CacheURL); err != nil {
+				add("route %q: cacheURL: %v", r.Name, err)
+			} else {
+				r.CacheURL = strings.TrimSuffix(r.CacheURL, "/")
+			}
 		}
 	}
 	// A job requesting the smaller set would satisfy both routes.
@@ -721,6 +732,44 @@ func readBounded(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s exceeds %d bytes", path, limit)
 	}
 	return b, nil
+}
+
+// cacheURLChars are the characters the runner image's job-started hook
+// writes to GITHUB_ENV (cache_url_ok in images/runner/entrypoint.sh): a
+// cacheURL with any other character would leave the job without it.
+const cacheURLChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/._~%-[]"
+
+// checkCacheURL accepts a route's cacheURL: what checkURL accepts, as a
+// scheme and host with an optional trailing "/" (the form of the cache
+// block's publicURL), with a lowercase scheme and only cacheURLChars.
+func checkCacheURL(raw string) error {
+	if err := checkURL(raw); err != nil {
+		return err
+	}
+	// Also rejects an empty query or fragment ("?" or "#"), which checkURL
+	// passes and normalisation would keep.
+	if strings.Trim(raw, cacheURLChars) != "" {
+		return fmt.Errorf("%q must be ASCII URL characters, with no query or fragment", raw)
+	}
+	u, _ := url.Parse(raw) // checked by checkURL
+	if !strings.HasPrefix(raw, u.Scheme+"://") {
+		return fmt.Errorf("%q must have a lowercase scheme", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("%q must be a scheme and host with no path", raw)
+	}
+	if h := u.Hostname(); strings.ContainsAny(h, "[]") || (strings.Contains(u.Host, "[") && net.ParseIP(h) == nil) {
+		return fmt.Errorf("%q: brackets only around an IP address", raw)
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return fmt.Errorf("%q has an empty port", raw)
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("%q has a port outside 1-65535", raw)
+		}
+	}
+	return nil
 }
 
 func checkURL(raw string) error {
