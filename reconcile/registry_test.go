@@ -219,3 +219,58 @@ func TestRegistryRunsMayReachTheRunnerEndpoint(t *testing.T) {
 		t.Fatalf("IP endpoint egress %+v", r)
 	}
 }
+
+const cacheBlock = `"cache": {"listen": "127.0.0.1:0", "publicURL": "https://gha-cache.example.com",
+    "s3": {"bucket": "cache-bucket", "region": "eu-west-1"}, "signingKeyFile": "/c", "repositoryIDs": [1001]},
+  "repositories"`
+
+// job7Wire is the request body for job 7 on the default route.
+func job7Wire(t *testing.T, edits ...func(string) string) string {
+	t.Helper()
+	e := newEnv(t, edits...)
+	e.gh.queue(7, "queued", "self-hosted", "lux")
+	if st := e.pass(); st.Error != "" || st.Provisioned != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	wire, err := json.Marshal(e.lux.all()[0].spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(wire)
+}
+
+// The cache is served by the bridge, not configured in the Run, so it adds
+// no env, secret or egress rule: a cache block leaves the Run spec of either
+// a plain or a registry configuration byte-identical, and with both the Run
+// carries the registry's full set.
+func TestCacheAndRegistryRunSpecs(t *testing.T) {
+	if got := job7Wire(t); got != rawRouteWire {
+		t.Fatalf("neither\n got: %s\nwant: %s", got, rawRouteWire)
+	}
+	if got := job7Wire(t, replace(`"repositories"`, cacheBlock)); got != rawRouteWire {
+		t.Fatalf("cache only\n got: %s\nwant: %s", got, rawRouteWire)
+	}
+	registryOnly := job7Wire(t, replace(`"repositories"`, registryBlock))
+	both := job7Wire(t, replace(`"repositories"`, registryBlock), replace(`"repositories"`, cacheBlock))
+	if both != registryOnly {
+		t.Fatalf("cache and registry\n got: %s\nwant: %s", both, registryOnly)
+	}
+	var w struct {
+		Env     map[string]string
+		Secrets []struct{ Name, Path string }
+		Network struct{ Egress []luxclient.EgressRule }
+	}
+	if err := json.Unmarshal([]byte(both), &w); err != nil {
+		t.Fatal(err)
+	}
+	wantEnv := map[string]string{
+		"LUXGHA_JITCONFIG_FILE": "/run/lux-gha/jitconfig", "LUXGHA_IDENTITY_FILE": "/run/lux-gha/identity",
+		"LUXGHA_RUNNER_ENDPOINT": "https://gha.example.com", "LUXGHA_REGISTRY_HOST": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
+		"LUXGHA_REGISTRY_REGION": "eu-west-1",
+	}
+	wantEgress := []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {Host: "gha.example.com"}}
+	if !maps.Equal(w.Env, wantEnv) || len(w.Secrets) != 2 || w.Secrets[0].Name != "jitconfig" || w.Secrets[1].Name != "identity" ||
+		!slices.Equal(w.Network.Egress, wantEgress) {
+		t.Fatalf("cache and registry spec %s", both)
+	}
+}

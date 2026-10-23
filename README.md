@@ -838,7 +838,8 @@ buildx layer cache) in an ECR registry in the Lux workers' own region, with no c
 The registry is shared: its paths are named like GHCR's, `<owner>/<repo>/…`, and lux-gha is one credential
 broker for it. The bridge decides, for the job a runner is **executing**, what that job may do, and mints
 short-lived AWS credentials scoped to it. Off Lux, or without the block, nothing changes: the variables below
-are unset.
+are unset. Like the [Actions cache](#actions-cache), it keeps CI traffic in-region instead of sending it out
+as internet egress; the two are configured and run independently.
 
 ```json
 "registry": {
@@ -1065,6 +1066,9 @@ Repository permissions, and nothing else:
 | Checks | Read and write | A check run explaining why Lux stopped a job, and listing it so it is posted once |
 | Metadata | Read-only | Granted to every App; `GET /installation/repositories`; with a registry, the default branch |
 | Contents | Read-only | With a registry only: resolving a run's ref (`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` and `GET /repos/{owner}/{repo}/compare/{head_sha}...refs/heads/{name}`, see [Trust levels](#trust-levels)) |
+
+The [Actions cache](#actions-cache) needs no App permission: it makes no GitHub App call, and checks each
+job's runtime token against the issuer's keys.
 
 Upgrading an existing App to use the registry: add **Contents: Read** and accept it on each installation before deploying; until then the runner listener answers `503` to every trust decision, and logs the refusal once per repository as `github_permission`.
 

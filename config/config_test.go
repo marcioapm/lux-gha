@@ -440,3 +440,23 @@ func TestRegistryIdentityKeyIsLoadedOnlyWithTheBlock(t *testing.T) {
 		t.Fatalf("missing key: %v", err)
 	}
 }
+
+// The cache and registry blocks parse side by side, each with its own
+// defaults, and an error in each is reported under its own prefix.
+func TestCacheAndRegistryTogether(t *testing.T) {
+	both := strings.Replace(string(withRegistry("", "")), `"listen"`, cacheConfig, 1)
+	c, err := Parse([]byte(both))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Cache == nil || c.Cache.TTL.Duration != 7*24*time.Hour || c.Cache.S3.Region != "eu-west-1" ||
+		c.Registry == nil || c.Registry.RunnerEndpoint != "https://gha.example.com" ||
+		!slices.Equal(c.Registry.TrustedRefs, DefaultTrustedRefs) {
+		t.Fatalf("cache %+v registry %+v", c.Cache, c.Registry)
+	}
+	bad := strings.Replace(strings.Replace(both, `"bucket": "cache-bucket"`, `"bucket": "X"`, 1), `"region": "eu-west-1",`, `"region": "Europe",`, 1)
+	_, err = Parse([]byte(bad))
+	if err == nil || !strings.Contains(err.Error(), "cache.s3.bucket") || !strings.Contains(err.Error(), "registry.region") {
+		t.Fatalf("err = %v", err)
+	}
+}
