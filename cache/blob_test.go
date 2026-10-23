@@ -233,19 +233,39 @@ func TestPutBlobAndPutBlockMix(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxEntryBytes = 2*minPartBytes + 10 })
 	tok := h.is.token(t, "100", writeMain())
 
-	// Blocks first: the first attempt stages a block and stops.
+	// Blocks first: the first attempt stages blocks and commits a block
+	// list, then is retried. Another upload's block is staged alongside.
 	up := h.reserve(tok, "blocks-then-blob", v1)
 	if resp, b := h.put(up, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, make([]byte, minPartBytes)); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("block: %d %s", resp.StatusCode, b)
 	}
-	staging := h.stagingOf(tok, "blocks-then-blob", v1)
-	// The retry: a fresh Create, then Put Blob.
-	h.putBlobOK(h.reserve(tok, "blocks-then-blob", v1), []byte("whole"))
-	if left := h.st.keys(staging + "/block/"); len(left) != 0 {
-		t.Fatalf("earlier blocks kept: %q", left)
+	if resp, b := h.put(up, "comp=blocklist", nil, blockListXML(blockID(0))); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("block list: %d %s", resp.StatusCode, b)
 	}
+	bystander := h.reserve(tok, "bystander", v1)
+	if resp, b := h.put(bystander, "comp=block&blockid="+url.QueryEscape(blockID(0)), nil, make([]byte, minPartBytes)); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("bystander block: %d %s", resp.StatusCode, b)
+	}
+	staging := h.stagingOf(tok, "blocks-then-blob", v1)
+	// The retry: a fresh Create, then a Put Blob whose body fails its
+	// MD5. The earlier blocks and the manifest naming them are gone, so
+	// Finalize answers "save again" rather than failing on missing parts.
+	retry := h.reserve(tok, "blocks-then-blob", v1)
+	resp, b := h.put(retry, "", map[string]string{"x-ms-blob-type": "BlockBlob", "Content-MD5": base64.StdEncoding.EncodeToString(make([]byte, 16))}, []byte("whole"))
+	azureErr(t, "blob with a wrong MD5", resp, b, http.StatusBadRequest, "Md5Mismatch", "MD5")
+	if left := h.st.keys(staging + "/"); len(left) != 0 {
+		t.Fatalf("earlier blocks or manifest kept: %q", left)
+	}
+	if f := h.finalize(tok, "blocks-then-blob", v1, minPartBytes); f.status != http.StatusOK || f.ok() || !strings.Contains(str(f.body["message"]), "save again") {
+		t.Fatalf("finalize after a failed Put Blob: %+v", f)
+	}
+	// Another reservation's blocks are untouched by this one's restart.
+	if left := h.st.keys(h.stagingOf(tok, "bystander", v1) + "/block/"); len(left) != 1 {
+		t.Fatalf("another upload's blocks deleted: %q", left)
+	}
+	h.putBlobOK(retry, []byte("whole"))
 	// A block list naming the dropped block finds nothing.
-	resp, b := h.put(up, "comp=blocklist", nil, blockListXML(blockID(0)))
+	resp, b = h.put(up, "comp=blocklist", nil, blockListXML(blockID(0)))
 	azureErr(t, "list of a dropped block", resp, b, http.StatusBadRequest, "InvalidBlockList", "block 0 was not uploaded")
 	if f := h.finalize(tok, "blocks-then-blob", v1, 5); !f.ok() {
 		t.Fatalf("finalize after blocks then blob: %+v", f)
@@ -280,7 +300,7 @@ func TestPutBlobAndPutBlockMix(t *testing.T) {
 	if got := h.restored(h.restore(tok, "blob-then-blocks", v1)); !bytes.Equal(got, append(a, c...)) {
 		t.Fatalf("restored %d bytes", len(got))
 	}
-	if left := h.st.keys(h.srv.lay.stagingRoot()); len(left) != 0 {
+	if left := h.st.keys(h.srv.lay.stagingRoot()); len(left) != 1 || !strings.HasPrefix(left[0], h.stagingOf(tok, "bystander", v1)+"/") {
 		t.Fatalf("staging left %q", left)
 	}
 }

@@ -167,13 +167,19 @@ func (s *Server) putBlob(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	// A Put Blob starts the upload afresh: blocks left by an earlier
 	// attempt of this reservation are deleted, so they never count beside
-	// the blob, and a later block list cannot name them.
+	// the blob, and a later block list cannot name them. The earlier
+	// manifest goes with them, so a Put Blob that then fails leaves no
+	// manifest naming deleted blocks. Without earlier blocks a manifest can
+	// only name the blob, which this request replaces under the same key.
 	var blocks []string
 	if err := s.st.list(ctx, staging+"/block/", func(o object) bool {
 		blocks = append(blocks, o.Key)
 		return true
 	}); err != nil {
 		return fmt.Errorf("list blocks: %w", err)
+	}
+	if len(blocks) > 0 {
+		blocks = append(blocks, staging+"/manifest")
 	}
 	if failed := deleteBatched(ctx, s.st, s.log, blocks); len(failed) > 0 {
 		return fmt.Errorf("delete %d earlier blocks", len(failed))
