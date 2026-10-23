@@ -141,21 +141,27 @@ type acEntry struct {
 	Permission int    `json:"Permission"`
 }
 
-// canonicalJWS reports whether raw is a compact JWS with three segments
-// that each decode under strict unpadded base64url. go-jose strips
-// whitespace and ignores trailing padding bits, so without this check one
-// signed token has many accepted spellings.
-func canonicalJWS(raw string) bool {
+// canonicalPayload returns the decoded payload of raw when raw is a compact
+// JWS with three segments that each decode under strict unpadded
+// base64url, and false otherwise. go-jose strips whitespace and ignores
+// trailing padding bits, so without this check one signed token has many
+// accepted spellings.
+func canonicalPayload(raw string) ([]byte, bool) {
 	segs := strings.Split(raw, ".")
 	if len(segs) != 3 {
-		return false
+		return nil, false
 	}
-	for _, s := range segs {
-		if _, err := base64.RawURLEncoding.Strict().DecodeString(s); err != nil {
-			return false
+	var payload []byte
+	for i, s := range segs {
+		b, err := base64.RawURLEncoding.Strict().DecodeString(s)
+		if err != nil {
+			return nil, false
+		}
+		if i == 1 {
+			payload = b
 		}
 	}
-	return true
+	return payload, true
 }
 
 // verifyToken checks a bearer token's form, signature, issuer, exp and nbf
@@ -170,7 +176,8 @@ func (v *verifier) verifyToken(ctx context.Context, authz string, wait bool) (*o
 	v.verifications.Add(1)
 	// RawURLEncoding has no '.' or whitespace, so a token passing this has
 	// exactly one spelling of its header, payload and signature bytes.
-	if !canonicalJWS(raw) {
+	payload, ok := canonicalPayload(raw)
+	if !ok {
 		return nil, "", fmt.Errorf("%w: token is not a canonical compact JWS", errUnauthenticated)
 	}
 	iv := v.ready.Load()
@@ -187,12 +194,6 @@ func (v *verifier) verifyToken(ctx context.Context, authz string, wait bool) (*o
 	tok, err := iv.Verify(ctx, raw)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", errUnauthenticated, err)
-	}
-	// Decoded after verification; canonicalJWS has already rejected any
-	// encoding that does not decode strictly.
-	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.Split(raw, ".")[1])
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: payload: %v", errUnauthenticated, err)
 	}
 	sum := sha256.Sum256(payload)
 	return tok, hex.EncodeToString(sum[:]), nil
