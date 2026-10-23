@@ -155,3 +155,41 @@ func TestCacheSigningKeys(t *testing.T) {
 		t.Fatal("empty file accepted")
 	}
 }
+
+func TestCacheTLS(t *testing.T) {
+	const pair = `"signingKeyFile": "/s", "tlsCertFile": "/c.pem", "tlsKeyFile": "/k.pem"`
+	c, err := Parse(withCache(`"signingKeyFile": "/s"`, pair))
+	if err != nil || !c.Cache.TLS() || c.Cache.TLSCertFile != "/c.pem" || c.Cache.TLSKeyFile != "/k.pem" {
+		t.Fatalf("both: %+v err=%v", c, err)
+	}
+	if c, err := Parse(withCache("", "")); err != nil || c.Cache.TLS() {
+		t.Fatalf("neither: %+v err=%v", c, err)
+	}
+	for name, edit := range map[string]string{
+		"cert only": `"signingKeyFile": "/s", "tlsCertFile": "/c.pem"`,
+		"key only":  `"signingKeyFile": "/s", "tlsKeyFile": "/k.pem"`,
+	} {
+		if _, err := Parse(withCache(`"signingKeyFile": "/s"`, edit)); err == nil || !strings.Contains(err.Error(), "must be set together") {
+			t.Errorf("%s: err=%v", name, err)
+		}
+	}
+	// Loopback http publicURL is accepted without TLS but not with it.
+	loopback := strings.Replace(string(withCache(`"signingKeyFile": "/s"`, pair)), "https://cache.example.test", "http://127.0.0.1:8090", 1)
+	if _, err := Parse([]byte(loopback)); err == nil || !strings.Contains(err.Error(), "must be https when cache.tlsCertFile is set") {
+		t.Errorf("http publicURL with TLS: err=%v", err)
+	}
+	if _, err := Parse(withCache("https://cache.example.test", "http://127.0.0.1:8090")); err != nil {
+		t.Errorf("http loopback publicURL without TLS: %v", err)
+	}
+}
+
+func TestCacheLoopbackListen(t *testing.T) {
+	for listen, want := range map[string]bool{
+		"127.0.0.1:8090": true, "[::1]:8090": true, "localhost:8090": true,
+		"10.0.0.5:8090": false, "0.0.0.0:8090": false, ":8090": false, "cache.example:8090": false,
+	} {
+		if got := (&Cache{Listen: listen}).LoopbackListen(); got != want {
+			t.Errorf("%s: %v", listen, got)
+		}
+	}
+}

@@ -63,6 +63,19 @@ type Cache struct {
 	// at least one list is required.
 	RepositoryOwnerIDs []int64 `json:"repositoryOwnerIDs"`
 	RepositoryIDs      []int64 `json:"repositoryIDs"`
+	// TLSCertFile and TLSKeyFile are PEM paths, both or neither; with them
+	// the listener serves TLS and reloads the pair when it changes.
+	TLSCertFile string `json:"tlsCertFile"`
+	TLSKeyFile  string `json:"tlsKeyFile"`
+}
+
+// TLS reports whether the cache listener serves TLS.
+func (cc *Cache) TLS() bool { return cc.TLSCertFile != "" }
+
+// LoopbackListen reports whether cache.listen binds only a loopback address.
+func (cc *Cache) LoopbackListen() bool {
+	host, _, err := net.SplitHostPort(cc.Listen)
+	return err == nil && loopbackHost(host)
 }
 
 type CacheS3 struct {
@@ -469,6 +482,11 @@ func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
 		add("cache.publicURL: %v", err)
 	} else if u, _ := url.Parse(cc.PublicURL); strings.TrimSuffix(u.Path, "/") != "" {
 		add("cache.publicURL %q must not have a path", cc.PublicURL)
+	} else if cc.TLS() && u.Scheme != "https" {
+		add("cache.publicURL %q must be https when cache.tlsCertFile is set", cc.PublicURL)
+	}
+	if (cc.TLSCertFile == "") != (cc.TLSKeyFile == "") {
+		add("cache.tlsCertFile and cache.tlsKeyFile must be set together")
 	}
 	s := &cc.S3
 	if !bucketPattern.MatchString(s.Bucket) || strings.Contains(s.Bucket, "..") {

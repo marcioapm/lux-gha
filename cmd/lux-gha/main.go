@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -196,16 +197,35 @@ func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc ch
 	// artifact transfer can take many minutes. The cache handler sets
 	// per-request read and minimum-progress deadlines instead.
 	srv := &http.Server{Handler: cs, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	warnPlainCacheListen(cc, log)
+	var certs *certReloader
+	if cc.TLS() {
+		if certs, err = newCertReloader(cc.TLSCertFile, cc.TLSKeyFile, log); err != nil {
+			return nil, nil, err
+		}
+	}
 	ln, err := net.Listen("tcp", cc.Listen)
 	if err != nil {
 		return nil, nil, err
+	}
+	if certs != nil {
+		ln = tls.NewListener(ln, certs.tlsConfig())
 	}
 	go func() { errc <- srv.Serve(ln) }()
 	reapCtx, stopReap := context.WithCancel(ctx)
 	reapDone := make(chan struct{})
 	go func() { cs.RunReaper(reapCtx); close(reapDone) }()
-	log.Info("cache serving", "listen", ln.Addr().String(), "bucket", cc.S3.Bucket, "prefix", cc.S3.Prefix)
+	log.Info("cache serving", "listen", ln.Addr().String(), "tls", cc.TLS(), "bucket", cc.S3.Bucket, "prefix", cc.S3.Prefix)
 	return srv, func() { stopReap(); <-reapDone }, nil
+}
+
+// warnPlainCacheListen: every cache request carries a job's runtime token,
+// in clear text unless the listener serves TLS.
+func warnPlainCacheListen(cc *config.Cache, log *slog.Logger) {
+	if !cc.TLS() && !cc.LoopbackListen() {
+		log.Warn("cache.listen is not a loopback address and cache.tlsCertFile is not set; runtime tokens and cache data cross the network in clear text",
+			"listen", cc.Listen)
+	}
 }
 
 // warnExposedRunnerListen: the runner listener serves plain HTTP, bearer
