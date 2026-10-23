@@ -2,7 +2,6 @@ package cache
 
 import (
 	"io"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -26,10 +25,13 @@ const (
 	defaultTwirpReadTimeout = 30 * time.Second
 	defaultProgressWindow   = 60 * time.Second
 	minProgressBytes        = 64 << 10
-	// Pass-through requests are not authenticated here. Each client
-	// address may run maxProxyPerClient at once; maxProxyRequests is a
-	// server-wide safety net. Past either the proxy answers 503.
-	maxProxyPerClient = 32
+	// Pass-through requests are limited per job: each runtime token that
+	// verifies may run maxProxyPerJob at once. Requests without a valid
+	// token are still forwarded, but all of them share maxProxyAnonymous.
+	// maxProxyRequests is a server-wide safety net. Past any of them the
+	// proxy answers 503.
+	maxProxyPerJob    = 32
+	maxProxyAnonymous = 8
 	maxProxyRequests  = 4096
 )
 
@@ -132,49 +134,46 @@ func (w *progressWriter) Flush() {
 // reach the connection.
 func (w *progressWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// proxyLimiter bounds concurrent pass-through requests per client address
-// and in total.
+// proxyLimiter bounds concurrent pass-through requests per job, for
+// requests without a valid token together, and in total.
 type proxyLimiter struct {
-	perClient, total int
+	perJob, anonymous, total int
 
-	mu      sync.Mutex
-	n       int
-	clients map[string]int
+	mu   sync.Mutex
+	n    int
+	jobs map[string]int
 }
 
-func newProxyLimiter(perClient, total int) *proxyLimiter {
-	return &proxyLimiter{perClient: perClient, total: total, clients: map[string]int{}}
+func newProxyLimiter(perJob, anonymous, total int) *proxyLimiter {
+	return &proxyLimiter{perJob: perJob, anonymous: anonymous, total: total, jobs: map[string]int{}}
 }
 
-// clientOf is the connection's peer address. Forwarded headers are not
-// trusted: any client can set them.
-func clientOf(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
+// anonymousJob is the key every request without a valid token shares; a
+// job key is a token hash, never empty.
+const anonymousJob = ""
 
-// acquire takes a slot for client; it reports which limit refused it, or
-// "" with a release function.
-func (l *proxyLimiter) acquire(client string) (release func(), refused string) {
+// acquire takes a slot for job; it reports which limit refused it ("total",
+// "job" or "anonymous"), or "" with a release function.
+func (l *proxyLimiter) acquire(job string) (release func(), refused string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.n >= l.total {
 		return nil, "total"
 	}
-	if l.clients[client] >= l.perClient {
-		return nil, "client"
+	switch {
+	case job == anonymousJob && l.jobs[job] >= l.anonymous:
+		return nil, "anonymous"
+	case job != anonymousJob && l.jobs[job] >= l.perJob:
+		return nil, "job"
 	}
 	l.n++
-	l.clients[client]++
+	l.jobs[job]++
 	return func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.n--
-		if l.clients[client]--; l.clients[client] == 0 {
-			delete(l.clients, client)
+		if l.jobs[job]--; l.jobs[job] == 0 {
+			delete(l.jobs, job)
 		}
 	}, ""
 }

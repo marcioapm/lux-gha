@@ -635,12 +635,17 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
 - **`upstreamResultsURL`**: every request that is not a cache request
   (artifacts, logs, other Results calls) is passed here unchanged, method,
   path, query, headers and body included, and the response is streamed
-  back. The upstream is fixed; no request chooses it. Each client address
-  (the TCP peer; forwarded headers are ignored) may run 32 pass-through
-  requests at once, and the listener 4096 in total; past either limit the
-  request gets `503` with `Retry-After`. Behind a load balancer or NAT that
-  hides runner addresses, every runner shares one address and so the
-  32-request limit.
+  back. The upstream is fixed; no request chooses it. Pass-through
+  requests are limited per job: the official clients send the job's
+  runtime token as `Authorization: Bearer`, and a request whose token
+  verifies (signature, issuer, `exp`, `nbf`; any repository, since
+  artifacts and logs are not limited to the cache allowlist) counts against
+  that job's 32 concurrent requests, keyed on a hash of the token. A
+  request without a token, or with one that does not verify, is still
+  forwarded, but all such requests share one bucket of 8. The listener runs
+  at most 4096 in total. Past any limit the request gets `503` with
+  `Retry-After`. Client addresses play no part, so runners behind one NAT,
+  load balancer or TLS terminator do not share a limit.
 - **Timeouts.** The cache listener has no overall body or response
   timeout, since a block upload or a proxied transfer can take minutes.
   Instead a Twirp request body must arrive within 30 s, and an upload or

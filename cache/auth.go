@@ -121,20 +121,47 @@ type acEntry struct {
 	Permission int    `json:"Permission"`
 }
 
-// verify returns the identity of a bearer token. errUnauthenticated covers
-// every token or claim defect; errIssuerDown means the keys are unknown.
-func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) {
+// verifyToken checks a bearer token's signature, issuer, exp and nbf and
+// returns the raw token with its verified form.
+func (v *verifier) verifyToken(ctx context.Context, authz string) (string, *oidc.IDToken, error) {
 	raw, ok := strings.CutPrefix(authz, "Bearer ")
 	if !ok || raw == "" {
-		return nil, fmt.Errorf("%w: missing bearer token", errUnauthenticated)
+		return "", nil, fmt.Errorf("%w: missing bearer token", errUnauthenticated)
 	}
 	iv, err := v.idTokenVerifier()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	tok, err := iv.Verify(ctx, raw)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errUnauthenticated, err)
+		return "", nil, fmt.Errorf("%w: %v", errUnauthenticated, err)
+	}
+	return raw, tok, nil
+}
+
+func tokenHash(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+// job returns the key of the job a bearer token was issued to: the
+// token's hash, since the runtime token is per job and carries no
+// documented job claim. No claim beyond the signature, issuer, exp and nbf
+// is required, and no allowlist applies.
+func (v *verifier) job(ctx context.Context, authz string) (string, error) {
+	raw, _, err := v.verifyToken(ctx, authz)
+	if err != nil {
+		return "", err
+	}
+	return tokenHash(raw), nil
+}
+
+// verify returns the identity of a bearer token. errUnauthenticated covers
+// every token or claim defect; errIssuerDown means the keys are unknown.
+func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) {
+	raw, tok, err := v.verifyToken(ctx, authz)
+	if err != nil {
+		return nil, err
 	}
 	var claims struct {
 		AC     *string `json:"ac"`
@@ -155,9 +182,7 @@ func (v *verifier) verify(ctx context.Context, authz string) (*identity, error) 
 	if err := json.Unmarshal([]byte(*claims.AC), &acl); err != nil {
 		return nil, fmt.Errorf("%w: ac claim is not a JSON array of scopes", errUnauthenticated)
 	}
-	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(claims.OwnerID)}
-	sum := sha256.Sum256([]byte(raw))
-	id.TokenHash = hex.EncodeToString(sum[:])
+	id := &identity{RepoID: *claims.RepoID, OwnerID: numericClaim(claims.OwnerID), TokenHash: tokenHash(raw)}
 	for _, e := range acl {
 		if e.Scope == "" {
 			return nil, fmt.Errorf("%w: ac entry without a scope", errUnauthenticated)

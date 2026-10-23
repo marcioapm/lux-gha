@@ -171,7 +171,7 @@ func newServer(st store, o Options) (*Server, error) {
 		public:  pub,
 		log:     o.Log,
 		logOnce: newLogLimiter(time.Minute, o.Now),
-		proxies: newProxyLimiter(maxProxyPerClient, maxProxyRequests),
+		proxies: newProxyLimiter(maxProxyPerJob, maxProxyAnonymous, maxProxyRequests),
 
 		twirpReadTimeout: defaultTwirpReadTimeout,
 		progressWindow:   defaultProgressWindow,
@@ -217,12 +217,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.serveBlob(w, r)
 	default:
-		client := clientOf(r)
-		release, refused := s.proxies.acquire(client)
+		job := s.passThroughJob(r)
+		release, refused := s.proxies.acquire(job)
 		if release == nil {
 			if s.logOnce.allow("proxy-full:" + refused) {
 				s.log.Warn("cache: too many concurrent pass-through requests; answering 503 (logged once a minute)",
-					"limit", refused, "client", client, "per_client", s.proxies.perClient, "total", s.proxies.total)
+					"limit", refused, "remote_addr", r.RemoteAddr,
+					"per_job", s.proxies.perJob, "anonymous", s.proxies.anonymous, "total", s.proxies.total)
 			}
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -237,6 +238,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.proxy.ServeHTTP(w, r)
 	}
+}
+
+// passThroughJob is the limiter key of a pass-through request: the job of
+// a runtime token that verifies (any repository's: the pass-through serves
+// every one), or anonymousJob for a request with no token, an invalid one,
+// or while the issuer is unreachable. The request is forwarded either way.
+func (s *Server) passThroughJob(r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	if authz == "" {
+		return anonymousJob
+	}
+	job, err := s.auth.job(r.Context(), authz)
+	if err != nil {
+		reason := "invalid runtime token"
+		if errors.Is(err, errIssuerDown) {
+			reason = "token issuer unavailable"
+		}
+		if s.logOnce.allow("proxy-anonymous") {
+			// The error is not logged: it may quote token content.
+			s.log.Info("cache: pass-through request counted as anonymous (logged once a minute)",
+				"reason", reason, "remote_addr", r.RemoteAddr)
+		}
+		return anonymousJob
+	}
+	return job
 }
 
 func (s *Server) serveTwirp(w http.ResponseWriter, r *http.Request, method string) {

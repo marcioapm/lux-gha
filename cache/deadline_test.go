@@ -2,14 +2,18 @@ package cache
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,18 +184,54 @@ func TestResponseProgressDeadline(t *testing.T) {
 	}
 }
 
-// serveAs runs one pass-through request from addr in the background and
-// returns its response once the handler returns.
-func serveAs(h *harness, addr, path string) <-chan *httptest.ResponseRecorder {
+// serveAs runs one pass-through request with the Authorization header
+// authz (none when empty) from 192.0.2.1 in the background and returns
+// its response once the handler returns.
+func serveAs(h *harness, authz, path string) <-chan *httptest.ResponseRecorder {
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
-		r.RemoteAddr = addr
+		r.RemoteAddr = "192.0.2.1:1000"
+		if authz != "" {
+			r.Header.Set("Authorization", authz)
+		}
 		w := httptest.NewRecorder()
 		h.srv.ServeHTTP(w, r)
 		done <- w
 	}()
 	return done
+}
+
+// recv waits for a response from serveAs; a request the limiter wrongly
+// admitted to a held upstream fails the test instead of hanging it.
+func recv(t *testing.T, ch <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case w := <-ch:
+		return w
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not finish: the limiter admitted it")
+		return nil
+	}
+}
+
+// heldUpstream answers /held only once release is called, which a test
+// cleanup also does so that a failing test strands no handler.
+func heldUpstream(t *testing.T) (url string, held *atomic.Int32, release func()) {
+	t.Helper()
+	ch := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(ch) }) }
+	held = &atomic.Int32{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/held" {
+			held.Add(1)
+			<-ch
+		}
+	}))
+	t.Cleanup(up.Close)
+	t.Cleanup(release)
+	return up.URL, held, release
 }
 
 func waitHeld(t *testing.T, held *atomic.Int32, n int32) {
@@ -205,56 +245,110 @@ func waitHeld(t *testing.T, held *atomic.Int32, n int32) {
 	}
 }
 
-// One client address at its pass-through limit gets 503 with Retry-After,
-// a second address is still served, and the server-wide ceiling applies
-// across addresses. Forwarded headers do not name the client.
+// syncBuffer collects full log records, attributes included.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// The pass-through limit is per job: two jobs behind one address are
+// limited independently, requests without a valid token (none, or a bad
+// signature) share one small bucket that does not touch the jobs' slots,
+// and the server-wide ceiling applies across all of them. No token reaches
+// the log.
 func TestProxyConcurrencyLimits(t *testing.T) {
-	release := make(chan struct{})
-	var held atomic.Int32
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/held" {
-			held.Add(1)
-			<-release
-		}
-	}))
-	defer up.Close()
-	h := newHarness(t, func(o *Options) { o.Upstream = up.URL })
-	h.srv.proxies = newProxyLimiter(2, 3)
-	a1, a2 := serveAs(h, "192.0.2.1:1000", "/held"), serveAs(h, "192.0.2.1:1001", "/held")
-	waitHeld(t, &held, 2)
+	upURL, held, release := heldUpstream(t)
+	logs := &syncBuffer{}
+	h := newHarness(t, func(o *Options) {
+		o.Upstream = upURL
+		o.Log = slog.New(slog.NewTextHandler(logs, nil))
+	})
+	// 2 per job, 1 anonymous, 5 in total.
+	h.srv.proxies = newProxyLimiter(2, 1, 5)
+	// Any repository's job counts as a job: there is no allowlist here.
+	tokA := "Bearer " + h.is.token(t, "100", writeMain())
+	tokB := "Bearer " + h.is.token(t, "999", writeMain())
+	tokC := "Bearer " + h.is.token(t, "100", writePR())
+	tokD := "Bearer " + h.is.token(t, "200", readMain())
+	forged := "Bearer " + signJWT(t, mustKey(t), h.is.kid, h.is.claims(t, "100", writeMain()))
 
-	full := <-serveAs(h, "192.0.2.1:1002", "/other")
-	if full.Code != http.StatusServiceUnavailable || full.Header().Get("Retry-After") == "" {
-		t.Fatalf("client over its limit: %d, Retry-After %q", full.Code, full.Header().Get("Retry-After"))
+	a1, a2 := serveAs(h, tokA, "/held"), serveAs(h, tokA, "/held")
+	waitHeld(t, held, 2)
+	if w := recv(t, serveAs(h, tokA, "/other")); w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("job over its limit: %d, Retry-After %q", w.Code, w.Header().Get("Retry-After"))
 	}
-	r := httptest.NewRequest(http.MethodGet, "/other", nil)
-	r.RemoteAddr = "192.0.2.1:1003"
-	r.Header.Set("X-Forwarded-For", "198.51.100.9")
-	w := httptest.NewRecorder()
-	h.srv.ServeHTTP(w, r)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("a forwarded header escaped the client limit: %d", w.Code)
-	}
-	if other := <-serveAs(h, "192.0.2.2:1000", "/other"); other.Code != http.StatusOK {
-		t.Fatalf("second client: %d", other.Code)
+	if w := recv(t, serveAs(h, tokB, "/other")); w.Code != http.StatusOK {
+		t.Fatalf("a second job behind the same address: %d", w.Code)
 	}
 
-	// The second address takes the last server-wide slot; a third is refused.
-	b := serveAs(h, "192.0.2.2:1001", "/held")
-	waitHeld(t, &held, 3)
-	if c := <-serveAs(h, "192.0.2.3:1000", "/other"); c.Code != http.StatusServiceUnavailable {
-		t.Fatalf("over the server-wide ceiling: %d", c.Code)
+	// One tokenless request fills the anonymous bucket; more tokenless or
+	// forged requests are refused, and a job is still served.
+	anon := serveAs(h, "", "/held")
+	waitHeld(t, held, 3)
+	if w := recv(t, serveAs(h, "", "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("tokenless request over the anonymous bucket: %d", w.Code)
 	}
-	close(release)
-	for _, ch := range []<-chan *httptest.ResponseRecorder{a1, a2, b} {
-		if w := <-ch; w.Code != http.StatusOK {
+	if w := recv(t, serveAs(h, forged, "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a forged token escaped the anonymous bucket: %d", w.Code)
+	}
+	if w := recv(t, serveAs(h, tokB, "/other")); w.Code != http.StatusOK {
+		t.Fatalf("a job during a tokenless flood: %d", w.Code)
+	}
+
+	// B and C take the last server-wide slots; D, under its own limit, is
+	// refused by the ceiling.
+	b, c := serveAs(h, tokB, "/held"), serveAs(h, tokC, "/held")
+	waitHeld(t, held, 5)
+	if w := recv(t, serveAs(h, tokD, "/other")); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over the server-wide ceiling: %d", w.Code)
+	}
+	release()
+	for _, ch := range []<-chan *httptest.ResponseRecorder{a1, a2, anon, b, c} {
+		if w := recv(t, ch); w.Code != http.StatusOK {
 			t.Fatalf("held request: %d", w.Code)
 		}
 	}
 	// Every slot was returned.
-	if c := <-serveAs(h, "192.0.2.1:1004", "/other"); c.Code != http.StatusOK {
-		t.Fatalf("after release: %d", c.Code)
+	for _, authz := range []string{tokA, ""} {
+		if w := recv(t, serveAs(h, authz, "/other")); w.Code != http.StatusOK {
+			t.Fatalf("after release: %d", w.Code)
+		}
 	}
+
+	out := logs.String()
+	for _, limit := range []string{"limit=job", "limit=anonymous", "limit=total"} {
+		if !strings.Contains(out, limit) {
+			t.Errorf("no 503 log line with %s in %q", limit, out)
+		}
+	}
+	for _, tok := range []string{tokA, tokB, tokC, tokD, forged} {
+		raw := strings.TrimPrefix(tok, "Bearer ")
+		sig := raw[strings.LastIndex(raw, ".")+1:]
+		if strings.Contains(out, sig) || strings.Contains(out, tokenHash(raw)) {
+			t.Fatalf("a token or its hash was logged: %q", out)
+		}
+	}
+}
+
+func mustKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }
 
 // A streamed upstream response reaches the client chunk by chunk, even
