@@ -111,15 +111,13 @@ type marshaler interface {
 }
 
 func writeTwirp(w http.ResponseWriter, c codec, m marshaler) {
-	if c == codecJSON {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(m.marshalJSON())
-		return
+	ct, body := "application/json", m.marshalJSON
+	if c == codecProto {
+		ct, body = "application/protobuf", m.marshalProto
 	}
-	w.Header().Set("Content-Type", "application/protobuf")
+	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(http.StatusOK)
-	w.Write(m.marshalProto())
+	w.Write(body())
 }
 
 func asTwirp(err error) *twirpError {
