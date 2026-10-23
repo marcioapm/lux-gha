@@ -628,13 +628,13 @@ points that route's jobs at it ([Using the cache server](#using-the-cache-server
   (TLS 1.2 or later) and `publicURL` must be `https://`; without them it is
   plain HTTP. lux-gha refuses to start if the pair does not load. The files
   are stat'ed at most every 30 s, on a new connection; when either one's
-  modification time or size changes, the pair is reloaded without a
-  restart, so a renewal only has to rewrite the files. A pair that fails to
-  load (for example a certificate written before its key) is logged once and
+  modification time, size or inode changes (an atomic rename over the path
+  included), the pair is reloaded without a restart, so a renewal only has
+  to rewrite the files. A pair that fails to load (for example a
+  certificate written before its key) is logged once and
   the previous certificate stays in service; the load is retried on every
   check until it succeeds, so a fix that changes neither file (`chmod`,
-  `chown`) is picked up too. An atomic replacement (rename over the path) is
-  seen by its new inode. The certificate's expiry is logged at load, and
+  `chown`) is picked up too. The certificate's expiry is logged at load, and
   within 7 days of it a warning is logged daily: a renewal that keeps
   failing is otherwise silent until handshakes fail.
 - **Who may write the certificate files** is the trust boundary: whoever
