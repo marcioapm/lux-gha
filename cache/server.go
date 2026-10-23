@@ -465,11 +465,7 @@ func entryID(objectKey string) int64 {
 // cleanStaging deletes a reservation's objects; the reaper removes what
 // this misses.
 func (s *Server) cleanStaging(ctx context.Context, staging string) {
-	var keys []string
-	err := s.st.list(ctx, staging+"/", func(o object) bool {
-		keys = append(keys, o.Key)
-		return true
-	})
+	keys, err := listKeys(ctx, s.st, staging+"/")
 	if err != nil {
 		s.log.Warn("cache: staging cleanup failed; the reaper retries", "error", err)
 		return

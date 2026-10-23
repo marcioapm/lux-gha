@@ -188,11 +188,7 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 	var res reapResult
 	now := rp.now()
 
-	var entries []object
-	err := rp.st.list(ctx, rp.lay.entriesRoot(), func(o object) bool {
-		entries = append(entries, o)
-		return true
-	})
+	entries, err := listAll(ctx, rp.st, rp.lay.entriesRoot())
 	entriesOK := err == nil
 	if !entriesOK {
 		// A partial listing would undercount the total; delete no entry.
@@ -205,12 +201,9 @@ func (rp *reaper) pass(ctx context.Context) (reapResult, bool) {
 		res.Bytes += o.Size
 	}
 
-	var staged []object
 	root := rp.lay.stagingRoot()
-	if err := rp.st.list(ctx, root, func(o object) bool {
-		staged = append(staged, o)
-		return true
-	}); err != nil {
+	staged, err := listAll(ctx, rp.st, root)
+	if err != nil {
 		// Without the staging listing the cap counts entries only, which
 		// can only delete fewer.
 		rp.log.Warn("cache reaper: listing staging failed", "error", err)

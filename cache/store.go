@@ -56,3 +56,23 @@ type store interface {
 	listUploads(ctx context.Context, prefix string, fn func(pendingUpload) bool) error
 	abortUpload(ctx context.Context, u pendingUpload) error
 }
+
+// listAll returns every object under prefix; on error, those listed so far.
+func listAll(ctx context.Context, st store, prefix string) ([]object, error) {
+	var objs []object
+	err := st.list(ctx, prefix, func(o object) bool {
+		objs = append(objs, o)
+		return true
+	})
+	return objs, err
+}
+
+// listKeys returns the key of every object under prefix.
+func listKeys(ctx context.Context, st store, prefix string) ([]string, error) {
+	var keys []string
+	err := st.list(ctx, prefix, func(o object) bool {
+		keys = append(keys, o.Key)
+		return true
+	})
+	return keys, err
+}

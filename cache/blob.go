@@ -171,11 +171,8 @@ func (s *Server) putBlob(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// manifest goes with them, so a Put Blob that then fails leaves no
 	// manifest naming deleted blocks. Without earlier blocks a manifest can
 	// only name the blob, which this request replaces under the same key.
-	var blocks []string
-	if err := s.st.list(ctx, staging+"/block/", func(o object) bool {
-		blocks = append(blocks, o.Key)
-		return true
-	}); err != nil {
+	blocks, err := listKeys(ctx, s.st, staging+"/block/")
+	if err != nil {
 		return fmt.Errorf("list blocks: %w", err)
 	}
 	if len(blocks) > 0 {
