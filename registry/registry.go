@@ -407,6 +407,11 @@ func (s *Server) credentials(ctx context.Context, st *runnerState, runner string
 	if st.creds != nil && s.o.Now().Add(refreshBefore).Before(*st.creds.Expiration) {
 		return st.creds, nil
 	}
+	policy, err := SessionPolicy(s.o.Config, g.owner, g.repo, g.trust)
+	if err != nil {
+		log.Warn("registry: building the session policy failed", "error", err)
+		return nil, errUpstream
+	}
 	out, err := s.o.STS.AssumeRole(ctx, &sts.AssumeRoleInput{
 		RoleArn:         aws.String(s.o.Config.RoleARN),
 		RoleSessionName: aws.String(SessionName(g.repoID, st.job.ID, st.job.RunAttempt)),
@@ -416,6 +421,7 @@ func (s *Server) credentials(ctx context.Context, st *runnerState, runner string
 			{Key: aws.String("lux-repo"), Value: aws.String(g.repo)},
 			{Key: aws.String("lux-trust"), Value: aws.String(g.trust)},
 		},
+		Policy: aws.String(policy),
 	})
 	if err != nil {
 		log.Warn("registry: assuming the registry role failed", "error", err)

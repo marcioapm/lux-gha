@@ -172,6 +172,10 @@ func TestRegistryTrustTable(t *testing.T) {
 			if len(reqs) != 1 || tagValue(reqs[0], "lux-trust") != tc.trust {
 				t.Fatalf("sts requests %d, trust tag %q", len(reqs), tagValue(reqs[0], "lux-trust"))
 			}
+			want, err := registry.SessionPolicy(l.cfg.Registry, "acme", "widgets", tc.trust)
+			if err != nil || aws.ToString(reqs[0].Policy) != want {
+				t.Fatalf("session policy %s, want %s (%v)", aws.ToString(reqs[0].Policy), want, err)
+			}
 		})
 	}
 }
@@ -396,8 +400,13 @@ func TestRegistryUpstreamDownIs503(t *testing.T) {
 	}
 }
 
-// STS gets the role, a 3600 s session, the session tags and a session
-// name; the credentials are cached per runner until five minutes before
+const untrustedWidgetsPolicy = `{"Version":"2012-10-17","Statement":[` +
+	`{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},` +
+	`{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/*"},` +
+	`{"Effect":"Allow","Action":["ecr:CompleteLayerUpload","ecr:InitiateLayerUpload","ecr:PutImage","ecr:UploadLayerPart"],"Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/pr/*"}]}`
+
+// STS gets the role, a 3600 s session, the session tags, the job's session
+// policy and a session name; the credentials are cached per runner until five minutes before
 // they expire, then minted again. Neither credentials nor tokens are logged.
 func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 	l := newListener(t)
@@ -436,7 +445,7 @@ func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 	}
 	if aws.ToString(in.RoleArn) != "arn:aws:iam::123456789012:role/lux-gha-registry" || aws.ToInt32(in.DurationSeconds) != 3600 ||
 		!maps.Equal(tags, map[string]string{"lux-owner": "acme", "lux-repo": "widgets", "lux-trust": "untrusted"}) ||
-		aws.ToString(in.RoleSessionName) != "lux-gha-1001-7-1" || in.TransitiveTagKeys != nil || in.Policy != nil {
+		aws.ToString(in.RoleSessionName) != "lux-gha-1001-7-1" || in.TransitiveTagKeys != nil || aws.ToString(in.Policy) != untrustedWidgetsPolicy {
 		t.Fatalf("AssumeRole input %+v tags %v", in, tags)
 	}
 	if first["Expiration"] != l.clock.Now().Add(time.Hour).UTC().Format(time.RFC3339) {
