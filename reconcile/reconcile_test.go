@@ -50,6 +50,8 @@ type env struct {
 	lux   *fakeLux
 	cfg   *config.Config
 	rec   *Reconciler
+	// identityKey is set when cfg has a registry.
+	identityKey []byte
 }
 
 func newEnv(t *testing.T, edits ...func(string) string) *env {
@@ -64,6 +66,9 @@ func newEnv(t *testing.T, edits ...func(string) string) *env {
 	}
 	clock := &fakeClock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
 	e := &env{t: t, clock: clock, gh: newFakeGitHub(clock), lux: newFakeLux(clock), cfg: cfg}
+	if cfg.Registry != nil {
+		e.identityKey = testIdentityKey
+	}
 	// The runner process connects once its Run starts.
 	e.lux.onCreate = func(r luxclient.Run) {
 		e.lux.setState(r.ID, "running")
@@ -75,7 +80,7 @@ func newEnv(t *testing.T, edits ...func(string) string) *env {
 
 func (e *env) newReconciler() *Reconciler {
 	r, err := New(Options{Config: e.cfg, GitHub: e.gh, Lux: e.lux, Host: "api.github.com", Now: e.clock.Now,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), IdentityKey: e.identityKey})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -1419,6 +1424,35 @@ func TestTwoRepositoriesShareTheGlobalCapAndFailIndependently(t *testing.T) {
 	}
 	if slices.ContainsFunc(e.gh.deletedNames(), func(n string) bool { return strings.HasPrefix(n, "lux-gha-t1-1001-") }) {
 		t.Fatalf("deleted widgets runners %v", e.gh.deletedNames())
+	}
+}
+
+// A pass that meets a limit ending sooner than one already recorded (the
+// registry listener's secondary limit, say) keeps the later deadline.
+func TestPassRateLimitKeepsTheLaterDeadline(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queue(7, "queued", lux3...)
+	later := e.clock.Now().Add(time.Hour)
+	sooner := e.clock.Now().Add(time.Minute)
+	e.gh.fail = func(op, _ string, _ int) error {
+		if op != opRuns {
+			return nil
+		}
+		// Recorded by the listener while the pass is running.
+		e.rec.NoteRateLimit(&githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: later})
+		return &githubapp.APIError{StatusCode: 403, RateLimited: true, RetryAt: sooner}
+	}
+	if st := e.pass(); st.Error != ErrRateLimited || st.RateLimitedUntil == nil || !st.RateLimitedUntil.Equal(later) {
+		t.Fatalf("status %+v", st)
+	}
+	if until := e.rec.RateLimitedUntil(); !until.Equal(later) {
+		t.Fatalf("shared deadline %v, want %v", until, later)
+	}
+	e.gh.fail = nil
+	e.clock.Add(2 * time.Minute)
+	calls := e.gh.callCount()
+	if st := e.pass(); st.Error != ErrRateLimited || e.gh.callCount() != calls {
+		t.Fatalf("called GitHub after the sooner deadline: %d -> %d, %+v", calls, e.gh.callCount(), st)
 	}
 }
 

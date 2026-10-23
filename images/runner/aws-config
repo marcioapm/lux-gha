@@ -1,0 +1,2 @@
+[profile lux-gha-registry]
+credential_process = /usr/local/bin/lux-gha-aws-credentials

@@ -2,7 +2,8 @@
 // configuration, credentials and Lux compatibility, then runs the reconciler
 // and serves /healthz, /status and a signed webhook endpoint whose
 // workflow_job callback only wakes the reconciler. With a cache section it
-// also serves the Actions cache on a second listener.
+// also serves the Actions cache on a second listener, and with a registry
+// block the runner listener on an address of its own.
 package main
 
 import (
@@ -19,12 +20,16 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+
 	"github.com/marcioapm/lux-gha/cache"
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
 	"github.com/marcioapm/lux-gha/internal/version"
 	"github.com/marcioapm/lux-gha/luxclient"
 	"github.com/marcioapm/lux-gha/reconcile"
+	"github.com/marcioapm/lux-gha/registry"
 )
 
 func main() {
@@ -86,7 +91,7 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	}
 	log.Info("lux compatible", "version", compat.Version, "sizes", compat.Sizes)
 
-	rec, err := reconcile.New(reconcile.Options{Config: cfg, GitHub: gh, Lux: lux, Host: u.Host, Log: log})
+	rec, err := reconcile.New(reconcile.Options{Config: cfg, GitHub: gh, Lux: lux, Host: u.Host, Log: log, IdentityKey: secrets.RegistryIdentityKey})
 	if err != nil {
 		return err
 	}
@@ -104,13 +109,28 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 2)
-	go func() { errc <- srv.Serve(ln) }()
 	servers := []*http.Server{srv}
-	if cfg.Cache != nil {
-		cacheSrv, stopCache, err := startCache(ctx, cfg.Cache, log, errc)
+	errc := make(chan error, 3)
+	if cfg.Registry != nil {
+		warnExposedRunnerListen(cfg.Registry, log)
+		runnerSrv, runnerLn, err := registryListener(ctx, cfg, gh, rec, secrets.RegistryIdentityKey, log)
 		if err != nil {
-			srv.Close()
+			ln.Close()
+			return err
+		}
+		servers = append(servers, runnerSrv)
+		go func() { errc <- runnerSrv.Serve(runnerLn) }()
+		log.Info("serving runner listener", "listen", runnerLn.Addr().String())
+	}
+	go func() { errc <- srv.Serve(ln) }()
+	var cacheSrv *http.Server
+	if cfg.Cache != nil {
+		var stopCache func()
+		cacheSrv, stopCache, err = startCache(ctx, cfg.Cache, log, errc)
+		if err != nil {
+			for _, s := range servers {
+				s.Close()
+			}
 			return err
 		}
 		defer stopCache()
@@ -132,13 +152,14 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	// Every server is shut down, whichever fails.
 	var errs []error
 	for _, s := range servers {
 		err := s.Shutdown(shutdownCtx)
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			continue
 		}
-		if s != srv && errors.Is(err, context.DeadlineExceeded) {
+		if s == cacheSrv && errors.Is(err, context.DeadlineExceeded) {
 			// Uploads and proxied transfers have no overall timeout, so a
 			// long one can outlast the drain; a stop still exits cleanly.
 			log.Warn("cache listener: transfers still running at shutdown were dropped", "after", shutdownTimeout)
@@ -185,4 +206,36 @@ func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc ch
 	go func() { cs.RunReaper(reapCtx); close(reapDone) }()
 	log.Info("cache serving", "listen", ln.Addr().String(), "bucket", cc.S3.Bucket, "prefix", cc.S3.Prefix)
 	return srv, func() { stopReap(); <-reapDone }, nil
+}
+
+// warnExposedRunnerListen: the runner listener serves plain HTTP, bearer
+// tokens and AWS credentials included, and is meant to sit behind a TLS
+// tunnel on loopback.
+func warnExposedRunnerListen(g *config.Registry, log *slog.Logger) {
+	if !g.LoopbackListen() {
+		log.Warn("registry.runnerListen is not a loopback address; the runner listener is plain HTTP and must not be exposed directly, put a TLS tunnel in front of it",
+			"runnerListen", g.RunnerListen)
+	}
+}
+
+// registryListener builds the runner listener: a server of its own, on
+// registry.runnerListen, serving only the runner routes. AWS credentials come
+// from the default chain (the instance role); none is resolved until a
+// runner asks.
+func registryListener(ctx context.Context, cfg *config.Config, gh *githubapp.Client, rec *reconcile.Reconciler, key []byte, log *slog.Logger) (*http.Server, net.Listener, error) {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Registry.Region))
+	if err != nil {
+		return nil, nil, fmt.Errorf("registry: AWS configuration: %w", err)
+	}
+	reg, err := registry.New(registry.Options{Config: cfg.Registry, InstallationID: cfg.GitHub.InstallationID, IdentityKey: key,
+		Runners: rec, GitHub: gh, STS: sts.NewFromConfig(awsCfg), Log: log})
+	if err != nil {
+		return nil, nil, err
+	}
+	ln, err := net.Listen("tcp", cfg.Registry.RunnerListen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("registry.runnerListen: %w", err)
+	}
+	return &http.Server{Handler: reg.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+		WriteTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}, ln, nil
 }

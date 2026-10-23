@@ -19,6 +19,9 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   `sudo`.
 - AWS CLI v2 2.38.1 (`aws`), installed from versioned, SHA-256-pinned archives for each architecture.
   Jobs can use it directly without downloading tools or elevating privileges at runtime.
+- `docker-credential-ecr-login` 0.12.0, checked against the release's SHA-256 for each architecture, behind
+  `docker-credential-lux-gha`, with `/etc/lux-gha/aws-config`, `/usr/local/bin/lux-gha-aws-credentials` and
+  the job-started hook `/usr/local/lib/lux-gha/job-started.sh`. See [In-region image registry](#in-region-image-registry).
 - `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
   `node` exits 127 without it. The amd64 image has it too.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
@@ -109,6 +112,44 @@ the load fails or times out, it prints one warning line to stderr, leaves docker
 without the archive. `LUXGHA_BUILDKIT_ARCHIVE` overrides the path for `entrypoint_test.sh`; set it to `none`
 in the Run's env to skip the load silently on routes that never use buildx (unset or empty means the default
 path). If no Docker engine came up, nothing is loaded.
+
+## In-region image registry
+
+Only with `LUXGHA_REGISTRY_HOST` in the Run's env, which the bridge sets when it has a `registry` block
+([README](../../README.md#in-region-image-registry)). Unset, the entrypoint does none of this.
+
+- The entrypoint merges `"credHelpers": {"<host>": "lux-gha"}` into the runner user's
+  `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) with `jq`, keeping every other key. A file that is
+  not a JSON object is left alone, with one warning line, and the hook is not set either.
+- It sets `ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/lib/lux-gha/job-started.sh`, unless the Run's env
+  already sets that variable (one warning line). The runner runs the hook before the job's first step. The
+  hook POSTs the identity token to `$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry` (curl, 3 s to connect, 10 s
+  in all), retries `409` for `LUXGHA_REGISTRY_WAIT` seconds (default 20), and on `200` appends
+  `LUX_REGISTRY` (`<host>/<owner>/<repo>`) and, when non-empty, `LUX_REGISTRY_PUSH` (the same, or
+  `…/pr` for an untrusted job) to `$GITHUB_ENV`, after checking that both are lower-case paths under the host. It prints one line, `trust=<level>` or why it continued without, and **always exits 0**.
+- `docker-credential-lux-gha` unsets every `AWS_*` variable of the job (credentials and profiles, but also
+  `AWS_ENDPOINT_URL*`, `AWS_CA_BUNDLE`, `AWS_CONTAINER_CREDENTIALS_*`, `AWS_USE_FIPS_ENDPOINT` and the like,
+  so a LocalStack setup cannot redirect it), sets `AWS_CONFIG_FILE=/etc/lux-gha/aws-config`,
+  `AWS_PROFILE=lux-gha-registry`, `AWS_ECR_DISABLE_CACHE=true` and `AWS_REGION=$LUXGHA_REGISTRY_REGION`, and
+  execs `docker-credential-ecr-login`. Only the helper's process is affected: the job's own AWS setup is
+  untouched.
+- The profile's `credential_process`, `lux-gha-aws-credentials`, POSTs the token to
+  `/runner/v1/aws-credentials` with `curl --fail` and a 10 s limit. The token reaches curl as a config on
+  stdin, never in argv.
+
+The identity token lets any step of the job obtain the job's own registry credentials, which is the
+access the job already has: the bridge decides it from GitHub's record of the job, not from the token.
+
+`entrypoint_test.sh` covers the merge (existing keys kept, a fresh file, an unparsable file, a pre-set
+`ACTIONS_RUNNER_HOOK_JOB_STARTED` kept with a warning, an absent hook file, and as root the runner user's
+config owned by uid 1000), the hook on `200` (both variables, or `LUX_REGISTRY` alone for `read-only`, names
+with `.`, `_` and `-`), on malformed answers in `read` or `push` (an injected line, another host, an
+upper-case path, an empty segment, a trailing `/`, an unknown trust level), on a token holding a quote or a
+newline, on `204`, `401`, `500`, `503`, on `409` until the wait runs out and `409` then `200`, on a refused
+connection, and without host or token, each exiting 0 and writing nothing; the wrapper's environment
+(including `AWS_ENDPOINT_URL`, `AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CA_BUNDLE`); and the
+credentials script on `200` and `503`. A fake `curl` stands in for the bridge; the token must appear in no
+output and no argument.
 
 ## Build and smoke test
 

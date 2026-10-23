@@ -18,6 +18,12 @@ func (r *Reconciler) Webhook(secret []byte) (*webhook.Handler, error) {
 	}
 	h, err := webhook.New(secret, r.cfg.GitHub.InstallationID, r.AllowsRepository, func(_ context.Context, ev webhook.WorkflowJobEvent) error {
 		r.log.Debug("workflow_job received", "delivery", ev.DeliveryID, "action", ev.Action, "repository", ev.Repository, "job", ev.JobID)
+		if ev.Action == "in_progress" && ev.RunnerName != "" {
+			r.noteInProgress(ev.Repository, ev.RunnerName, ev.JobID)
+		}
+		if ev.Action == "completed" && ev.RunnerName != "" {
+			r.noteCompleted(ev.Repository, ev.RunnerName)
+		}
 		if queuedMatching(ev) {
 			r.NoteQueued(ev.Repository, ev.JobID)
 			r.Wake()

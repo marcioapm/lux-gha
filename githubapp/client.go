@@ -222,7 +222,12 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 		return nil, errors.New("githubapp: cannot construct request")
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	sha, wantSHA := out.(*shaResponse)
+	if wantSHA {
+		req.Header.Set("Accept", "application/vnd.github.sha")
+	} else {
+		req.Header.Set("Accept", "application/vnd.github+json")
+	}
 	req.Header.Set("X-GitHub-Api-Version", APIVersion)
 	req.Header.Set("User-Agent", "lux-gha-githubapp")
 	if body != nil {
@@ -263,6 +268,13 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 		}
 		return resp.Header, e
 	}
+	if cs, ok := out.(*compareStatus); ok {
+		cs.status, err = readCompareStatus(io.LimitReader(resp.Body, maxBody))
+		if err != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return resp.Header, err
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		if ctx.Err() != nil {
@@ -273,9 +285,11 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 	if len(data) > maxBody {
 		return nil, errors.New("githubapp: response body too large")
 	}
-	if out != nil {
+	if wantSHA {
+		sha.sha = strings.TrimSpace(string(data))
+	} else if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
-			return nil, errors.New("githubapp: invalid JSON response")
+			return nil, errInvalidJSON
 		}
 	}
 	return resp.Header, nil

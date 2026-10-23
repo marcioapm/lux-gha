@@ -19,6 +19,8 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/internal/identity"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -46,6 +49,17 @@ const (
 	JITConfigPath = "/run/lux-gha/jitconfig"
 	JITConfigEnv  = "LUXGHA_JITCONFIG_FILE"
 	jitSecretName = "jitconfig"
+)
+
+// With a registry configured, each Run also gets its identity token as a
+// file secret and the env the runner image's registry hook reads.
+const (
+	IdentityPath       = "/run/lux-gha/identity"
+	IdentityEnv        = "LUXGHA_IDENTITY_FILE"
+	RunnerEndpointEnv  = "LUXGHA_RUNNER_ENDPOINT"
+	RegistryHostEnv    = "LUXGHA_REGISTRY_HOST"
+	RegistryRegionEnv  = "LUXGHA_REGISTRY_REGION"
+	identitySecretName = "identity"
 )
 
 // LiveStates are the Lux Run states in which a runner may still start or run.
@@ -93,6 +107,9 @@ type Options struct {
 	// After replaces time.After for the gap between passes.
 	After func(time.Duration) <-chan time.Time
 	Log   *slog.Logger
+	// IdentityKey signs each Run's registry identity token; required
+	// exactly when Config.Registry is set.
+	IdentityKey []byte
 }
 
 // Status is the last pass's outcome, served on GET /status. It holds counts
@@ -139,31 +156,44 @@ type Reconciler struct {
 	wake  chan struct{}
 	// passHook, set only by tests, observes Run entering and leaving a pass.
 	passHook func(enter bool)
+	// searchJoined, set only by tests, observes a caller joining a
+	// repository's search in flight.
+	searchJoined func(repoID int64)
 	// ticker starts Run's interval timer; tests replace it.
 	ticker func(time.Duration) (<-chan time.Time, func())
 
 	// Touched only by the pass goroutine.
-	repoIDs          map[string]int64
-	rateLimitedUntil time.Time
-	surplusSince     map[string]time.Time   // runner name: idle while its trigger job is not queued
-	missingSince     map[string]time.Time   // Run id: live Run whose runner is not registered
-	offlineSince     map[string]time.Time   // runner name: registered runner with no live Run
-	queuedTurn       bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
-	stopped          map[string]*stoppedRun // runner name: ended Run under an in_progress job
-	refused          map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
-	lost             map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
-	lostSeen         map[string]time.Time   // Run id: lost Run already queued, by its end
-	lostCursor       time.Time              // discoverLost lists Runs created since; zero after a start
-	lostLive         map[string]bool        // Run id: live at the last discoverLost; nil makes the next one list
-	disc             *discovery             // nil with an explicit repository list
+	repoIDs      map[string]int64
+	surplusSince map[string]time.Time   // runner name: idle while its trigger job is not queued
+	missingSince map[string]time.Time   // Run id: live Run whose runner is not registered
+	offlineSince map[string]time.Time   // runner name: registered runner with no live Run
+	queuedTurn   bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
+	stopped      map[string]*stoppedRun // runner name: ended Run under an in_progress job
+	refused      map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
+	lost         map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
+	lostSeen     map[string]time.Time   // Run id: lost Run already queued, by its end
+	lostCursor   time.Time              // discoverLost lists Runs created since; zero after a start
+	lostLive     map[string]bool        // Run id: live at the last discoverLost; nil makes the next one list
+	disc         *discovery             // nil with an explicit repository list
 
 	mu     sync.Mutex
 	status Status
+
+	identityKey []byte
+	att         *attribution // nil without a registry
+
+	// rateLimitedUntil is shared with the registry listener, which calls
+	// GitHub with the same installation token.
+	limitMu          sync.Mutex
+	rateLimitedUntil time.Time
 }
 
 func New(o Options) (*Reconciler, error) {
 	if o.Config == nil || o.GitHub == nil || o.Lux == nil || o.Host == "" {
 		return nil, errors.New("reconcile: config, GitHub, Lux and host are required")
+	}
+	if (o.Config.Registry != nil) != (len(o.IdentityKey) > 0) {
+		return nil, errors.New("reconcile: an identity key is required exactly when a registry is configured")
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -192,6 +222,10 @@ func New(o Options) (*Reconciler, error) {
 	}
 	if o.Config.DiscoverRepositories() {
 		r.disc = newDiscovery()
+	}
+	if o.Config.Registry != nil {
+		r.identityKey = slices.Clone(o.IdentityKey)
+		r.att = newAttribution()
 	}
 	return r, nil
 }
@@ -283,13 +317,12 @@ func (r *Reconciler) runPass(ctx context.Context, woken bool) Status {
 	// A pass that ends before discoverLost may have created Runs that are
 	// in no lostLive set, so the next discovery lists instead.
 	p.lostPrev, r.lostLive = r.lostLive, nil
-	if start.Before(r.rateLimitedUntil) {
+	if start.Before(r.RateLimitedUntil()) {
 		p.st.Error = ErrRateLimited
 	} else if err := p.run(); err != nil {
 		p.fail(err)
 	}
-	if start.Before(r.rateLimitedUntil) {
-		until := r.rateLimitedUntil
+	if until := r.RateLimitedUntil(); start.Before(until) {
 		p.st.RateLimitedUntil = &until
 	}
 	p.st.DurationMS = r.now().Sub(start).Milliseconds()
@@ -318,8 +351,12 @@ type repoView struct {
 	// or in_progress this pass, so not completed.
 	stuck      []githubapp.WorkflowJob
 	runRunners map[int64][]string
-	partial    map[int64]bool
-	active     map[int64]bool
+	// inProgressOn: job id: the runner of a job listed in_progress;
+	// completed: jobs listed completed. Both contradict older candidates.
+	inProgressOn map[int64]string
+	completed    map[int64]bool
+	partial      map[int64]bool
+	active       map[int64]bool
 }
 
 type pass struct {
@@ -366,7 +403,7 @@ func (p *pass) fail(err error) {
 	var apiErr *githubapp.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.RateLimited {
-			p.r.rateLimitedUntil = apiErr.RetryAt
+			p.r.NoteRateLimit(err)
 			p.st.Error = ErrRateLimited
 			p.r.log.Warn("GitHub rate limit: pausing reconciliation", "until", apiErr.RetryAt)
 			return
@@ -459,7 +496,8 @@ func (p *pass) readGitHub(repositories []string) error {
 		owner, name, _ := strings.Cut(full, "/")
 		v := &repoView{full: full, ref: githubapp.Repository{InstallationID: p.r.cfg.GitHub.InstallationID, Owner: owner, Name: name},
 			demand: map[int64]*config.Route{}, meta: map[int64]jobMeta{}, runners: map[string]githubapp.Runner{}, seen: map[int64]bool{},
-			runRunners: map[int64][]string{}, partial: map[int64]bool{}, active: map[int64]bool{}}
+			runRunners: map[int64][]string{}, partial: map[int64]bool{}, active: map[int64]bool{},
+			inProgressOn: map[int64]string{}, completed: map[int64]bool{}}
 		err := p.readRepo(v)
 		if p.rateLimited(err) {
 			return errAbort
@@ -473,6 +511,7 @@ func (p *pass) readGitHub(repositories []string) error {
 			continue
 		}
 		p.repos = append(p.repos, v)
+		p.r.att.observe(v, p.st.Time)
 		for _, route := range v.demand {
 			p.st.Demand[route.Name]++
 		}
@@ -563,6 +602,12 @@ func (p *pass) readRunJobs(v *repoView, run githubapp.WorkflowRun) error {
 		}
 		for _, j := range jobs.Jobs {
 			v.seen[j.ID] = true
+			switch {
+			case j.Status == "completed":
+				v.completed[j.ID] = true
+			case j.Status == "in_progress" && j.RunnerName != nil:
+				v.inProgressOn[j.ID] = *j.RunnerName
+			}
 			if j.RunnerName != nil && *j.RunnerName != "" {
 				v.runRunners[runID] = append(v.runRunners[runID], *j.RunnerName)
 				if j.Status == "in_progress" && p.r.managedRunner(v.id, *j.RunnerName) {
@@ -616,6 +661,7 @@ func (p *pass) readLux() error {
 		p.liveRoute[run.Labels[LabelRoute]]++
 		p.st.Live[run.Labels[LabelRoute]]++
 	}
+	p.r.att.forgetEnded(p.liveRunner, p.st.Time)
 	return nil
 }
 
@@ -910,6 +956,15 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	for _, h := range route.EgressHosts {
 		spec.Egress = append(spec.Egress, luxclient.EgressRule{Host: h})
 	}
+	if g := r.cfg.Registry; g != nil {
+		// Deterministic in the runner name, so a replayed key's spec is unchanged.
+		spec.Secrets = append(spec.Secrets, luxclient.FileSecret{Name: identitySecretName, Value: identity.Token(r.identityKey, name), Path: IdentityPath})
+		maps.Copy(spec.Env, map[string]string{IdentityEnv: IdentityPath, RunnerEndpointEnv: g.RunnerEndpoint,
+			RegistryHostEnv: g.Host, RegistryRegionEnv: g.Region})
+		if rule, ok := runnerEndpointRule(g.RunnerEndpoint); ok && !route.UnrestrictedEgress {
+			spec.Egress = append(spec.Egress, rule)
+		}
+	}
 	run, err := r.lux.Create(p.ctx, fmt.Sprintf("%s/%s/%s/%s/%d", r.host, r.cfg.Instance, repoID, job, gen), spec)
 	if run != nil && !carries(*run, owned, gen, jobPrefix) {
 		// A replayed key answered with a Run this submission did not describe.
@@ -943,6 +998,18 @@ func (p *pass) createRun(j provisionable) (*luxclient.Run, error) {
 	}
 	log.Info("provisioned runner", "runner", name, "gen", gen, "run", run.ID)
 	return run, nil
+}
+
+// runnerEndpointRule is the host rule that lets a default-deny Run reach the
+// runner endpoint's tunnel hostname. An IP endpoint gets no rule: the
+// documented deployment is a public hostname, and the bridge does not open
+// a Run's egress to an address.
+func runnerEndpointRule(endpoint string) (luxclient.EgressRule, bool) {
+	u, _ := url.Parse(endpoint) // validated by config
+	if _, err := netip.ParseAddr(u.Hostname()); err == nil {
+		return luxclient.EgressRule{}, false
+	}
+	return luxclient.EgressRule{Host: u.Hostname()}, true
 }
 
 // routeResources is a size route's size, or a raw route's cpus, memory and disk.
@@ -1148,8 +1215,11 @@ func (p *pass) cleanUp() error {
 	return nil
 }
 
+// instancePrefix starts every runner name of this instance.
+func (r *Reconciler) instancePrefix() string { return "lux-gha-" + r.cfg.Instance + "-" }
+
 func (r *Reconciler) runnerPrefix(repoID int64) string {
-	return "lux-gha-" + r.cfg.Instance + "-" + strconv.FormatInt(repoID, 10) + "-"
+	return r.instancePrefix() + strconv.FormatInt(repoID, 10) + "-"
 }
 
 // parseRunnerName parses lux-gha-<instance>-<repo id>-<job id>-<gen>. Only

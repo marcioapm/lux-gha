@@ -338,3 +338,126 @@ func TestLoadSecretsTrimsNewlineAndRedacts(t *testing.T) {
 		t.Fatalf("expected empty-file error naming field, got %v", err)
 	}
 }
+
+const registryBlock = `"registry": {"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
+    "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "127.0.0.1:8081",
+    "runnerEndpoint": "https://gha.example.com/", "identityKeyFile": "/i"},
+  "repositories"`
+
+func withRegistry(old, new string) []byte {
+	return []byte(strings.Replace(strings.Replace(validConfig, `"repositories"`, registryBlock, 1), old, new, 1))
+}
+
+func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil || c.Registry != nil {
+		t.Fatalf("absent block: %+v err=%v", c.Registry, err)
+	}
+	c, err = Parse(withRegistry("", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := c.Registry
+	if !slices.Equal(g.TrustedRefs, []string{"refs/heads/release/*", "refs/tags/v*"}) ||
+		g.RunnerEndpoint != "https://gha.example.com" {
+		t.Fatalf("defaults: %+v", g)
+	}
+	c, err = Parse(withRegistry(`"region"`, `"trustedRefs": ["refs/heads/main"], "region"`))
+	if err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/main"}) {
+		t.Fatalf("overrides: %+v err=%v", c.Registry, err)
+	}
+	contract := `"trustedRefs": ["refs/heads/release/*", "refs/tags/v*"], "region"`
+	if c, err = Parse(withRegistry(`"region"`, contract)); err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/release/*", "refs/tags/v*"}) {
+		t.Fatalf("contract list: %+v err=%v", c.Registry, err)
+	}
+	for _, loop := range []string{"http://127.0.0.1:8081", "http://localhost:8081", "http://[::1]:8081"} {
+		if c, err = Parse(withRegistry(`"https://gha.example.com/"`, `"`+loop+`"`)); err != nil || c.Registry.RunnerEndpoint != loop {
+			t.Fatalf("loopback http %s: %+v err=%v", loop, c.Registry, err)
+		}
+	}
+}
+
+func TestRegistryValidation(t *testing.T) {
+	for name, tc := range map[string]struct{ old, new, want string }{
+		"bad role":          {`role/lux-gha-registry`, `user/x`, "registry.roleArn"},
+		"bad region":        {`"region": "eu-west-1"`, `"region": "Europe"`, "registry.region"},
+		"non-AWS region":    {`"region": "eu-west-1"`, `"region": "auto"`, "registry.region"},
+		"host other region": {`dkr.ecr.eu-west-1`, `dkr.ecr.us-east-1`, "registry.host"},
+		"host with scheme":  {`"host": "`, `"host": "https://`, "registry.host"},
+		"removed prefix":    {`"region"`, `"repositoryPrefix": "gha", "region"`, `unknown field "repositoryPrefix"`},
+		"bad ref":           {`"region"`, `"trustedRefs": ["main"], "region"`, "registry.trustedRefs"},
+		"sentinel removed":  {`"region"`, `"trustedRefs": ["<default branch>"], "region"`, "registry.trustedRefs"},
+		"bad glob":          {`"region"`, `"trustedRefs": ["refs/heads/[x"], "region"`, "registry.trustedRefs"},
+		"bad listen":        {`"127.0.0.1:8081",`, `"127.0.0.1",`, "registry.runnerListen"},
+		"same listen":       {`"127.0.0.1:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},
+		"endpoint path":     {`example.com/"`, `example.com/runner"`, "registry.runnerEndpoint"},
+		"endpoint scheme":   {`"https://gha`, `"ftp://gha`, "registry.runnerEndpoint"},
+		"plain http":        {`"https://gha`, `"http://gha`, "must be https unless its host is loopback"},
+		"plain http to ip":  {`"https://gha.example.com/"`, `"http://192.0.2.10:8081"`, "must be https unless its host is loopback"},
+		"no key file":       {`"identityKeyFile": "/i"`, `"identityKeyFile": ""`, "registry.identityKeyFile"},
+		"unknown field":     {`"region"`, `"identityKey": "x", "region"`, "unknown field"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse(withRegistry(tc.old, tc.new))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegistryIdentityKeyIsLoadedOnlyWithTheBlock(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, v string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	c, _ := Parse([]byte(validConfig))
+	c.GitHub.PrivateKeyFile, c.GitHub.WebhookSecretFile, c.Lux.APIKeyFile = write("k", "k"), write("w", "w"), write("l", "l")
+	s, err := c.LoadSecrets()
+	if err != nil || s.RegistryIdentityKey != nil {
+		t.Fatalf("without registry: %v err=%v", s.RegistryIdentityKey != nil, err)
+	}
+	r, err := Parse(withRegistry("", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.GitHub, r.Lux = c.GitHub, c.Lux
+	key := strings.Repeat("k", 32)
+	r.Registry.IdentityKeyFile = write("id", key+"\n")
+	s, err = r.LoadSecrets()
+	if err != nil || string(s.RegistryIdentityKey) != key || strings.Contains(fmt.Sprintf("%+v %#v", s, s), key) {
+		t.Fatalf("identity key: err=%v", err)
+	}
+	r.Registry.IdentityKeyFile = write("short", strings.Repeat("k", 31))
+	if _, err := r.LoadSecrets(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("short key: %v", err)
+	}
+	r.Registry.IdentityKeyFile = filepath.Join(dir, "absent")
+	if _, err := r.LoadSecrets(); err == nil || !strings.Contains(err.Error(), "registry.identityKeyFile") {
+		t.Fatalf("missing key: %v", err)
+	}
+}
+
+// The cache and registry blocks parse side by side, each with its own
+// defaults, and an error in each is reported under its own prefix.
+func TestCacheAndRegistryTogether(t *testing.T) {
+	both := strings.Replace(string(withRegistry("", "")), `"listen"`, cacheConfig, 1)
+	c, err := Parse([]byte(both))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Cache == nil || c.Cache.TTL.Duration != 7*24*time.Hour || c.Cache.S3.Region != "eu-west-1" ||
+		c.Registry == nil || c.Registry.RunnerEndpoint != "https://gha.example.com" ||
+		!slices.Equal(c.Registry.TrustedRefs, DefaultTrustedRefs) {
+		t.Fatalf("cache %+v registry %+v", c.Cache, c.Registry)
+	}
+	bad := strings.Replace(strings.Replace(both, `"bucket": "cache-bucket"`, `"bucket": "X"`, 1), `"region": "eu-west-1",`, `"region": "Europe",`, 1)
+	_, err = Parse([]byte(bad))
+	if err == nil || !strings.Contains(err.Error(), "cache.s3.bucket") || !strings.Contains(err.Error(), "registry.region") {
+		t.Fatalf("err = %v", err)
+	}
+}

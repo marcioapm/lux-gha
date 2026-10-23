@@ -15,6 +15,10 @@
 # docker-container builder does not pull moby/buildkit. A failed load only
 # warns: the builder then pulls as it would without the archive.
 # LUXGHA_BUILDKIT_ARCHIVE=none skips it; unset or empty means the default.
+#
+# With LUXGHA_REGISTRY_HOST set, it then merges a credHelpers entry for that
+# host into the runner user's Docker config and points the runner's
+# job-started hook at job-started.sh: see setup_registry.
 set -eu
 
 RUNNER_DIR=${RUNNER_DIR:-/home/runner/actions-runner}
@@ -93,6 +97,44 @@ load_buildkit() {
 }
 
 if $docker_up; then load_buildkit; fi
+
+# With LUXGHA_REGISTRY_HOST (set by the bridge when it has a registry), the
+# runner user's Docker config names docker-credential-lux-gha for that host,
+# which covers the runner's own services:/container: pulls too, and the
+# job-started hook exports the job's registry paths. Neither step can stop
+# the runner: the registry is an optimisation and jobs fall back without it.
+setup_registry() {
+	host=${LUXGHA_REGISTRY_HOST:-}
+	[ -n "$host" ] || return 0
+	home=$HOME
+	if [ "$(id -u)" -eq 0 ]; then
+		home=$(getent passwd "$RUNNER_USER" | cut -d: -f6) || home=
+	fi
+	dir=${DOCKER_CONFIG:-$home/.docker}
+	cfg=$dir/config.json
+	if [ -z "$home" ] || ! command -v jq >/dev/null; then
+		echo "lux-gha-runner: warning: cannot set up the registry credential helper; jobs run without LUX_REGISTRY" >&2
+		return 0
+	fi
+	mkdir -p "$dir"
+	[ -s "$cfg" ] || echo '{}' >"$cfg"
+	if jq --arg h "$host" '.credHelpers = ((.credHelpers // {}) + {($h): "lux-gha"})' "$cfg" >"$cfg.tmp" 2>/dev/null; then
+		mv "$cfg.tmp" "$cfg"
+	else
+		rm -f "$cfg.tmp"
+		echo "lux-gha-runner: warning: $cfg is not a JSON object; left unchanged, jobs run without LUX_REGISTRY" >&2
+		return 0
+	fi
+	if [ "$(id -u)" -eq 0 ]; then chown -R "$RUNNER_USER:" "$dir"; fi
+	hook=${LUXGHA_JOB_STARTED_HOOK:-/usr/local/lib/lux-gha/job-started.sh}
+	if [ -n "${ACTIONS_RUNNER_HOOK_JOB_STARTED:-}" ]; then
+		echo "lux-gha-runner: warning: ACTIONS_RUNNER_HOOK_JOB_STARTED is already set; LUX_REGISTRY is not exported" >&2
+	elif [ -f "$hook" ]; then
+		export ACTIONS_RUNNER_HOOK_JOB_STARTED="$hook"
+	fi
+}
+
+setup_registry || echo "lux-gha-runner: warning: registry setup failed; jobs run without LUX_REGISTRY" >&2
 cd "$RUNNER_DIR"
 # run.sh forwards SIGTERM to the listener as SIGINT only with this set; the
 # listener then cancels the running job and uploads its logs before exiting.

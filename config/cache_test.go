@@ -80,6 +80,10 @@ func TestCacheRejectsInvalid(t *testing.T) {
 	if _, err := Parse(withCache(`"region": "eu-west-1"`, `"region": "eu-west-1", "prefix": "ci/gha-cache", "endpoint": "http://127.0.0.1:59240"`)); err != nil {
 		t.Errorf("prefix and loopback endpoint: %v", err)
 	}
+	// An S3-compatible store names its own region; the cache takes it, the registry (AWS only) does not.
+	if _, err := Parse(withCache(`"region": "eu-west-1"`, `"region": "auto"`)); err != nil {
+		t.Errorf("non-AWS region: %v", err)
+	}
 }
 
 func TestCacheMaxEntryBytesFollowsMaxBytes(t *testing.T) {

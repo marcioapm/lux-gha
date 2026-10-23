@@ -165,6 +165,7 @@ func (p *pass) refreshRepositories() error {
 	for _, repo := range repos {
 		members[strings.ToLower(repo.full)] = true
 		r.repoIDs[repo.full] = repo.id
+		r.att.observeName(repo.id, repo.full)
 	}
 	d.repos, d.refreshed = repos, now
 	d.mu.Lock()

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -34,6 +35,9 @@ type Config struct {
 	Routes       []Route  `json:"routes"`
 	// Cache is nil when absent: the cache server is off.
 	Cache *Cache `json:"cache"`
+	// Registry is nil when the block is absent: no runner listener, no
+	// identity secret and no registry env in Runs.
+	Registry *Registry `json:"registry,omitempty"`
 }
 
 // Cache configures the GitHub Actions cache server, served on its own
@@ -81,6 +85,25 @@ var (
 	regionPattern      = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 	cachePrefixPattern = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$`)
 )
+
+// Registry configures the in-region image registry credentials that the
+// runner listener hands to Runs.
+type Registry struct {
+	RoleARN         string   `json:"roleArn"`
+	Region          string   `json:"region"`
+	Host            string   `json:"host"`
+	TrustedRefs     []string `json:"trustedRefs"`
+	RunnerListen    string   `json:"runnerListen"`
+	RunnerEndpoint  string   `json:"runnerEndpoint"`
+	IdentityKeyFile string   `json:"identityKeyFile"`
+}
+
+// DefaultTrustedRefs apply when trustedRefs is absent. The repository's
+// default branch is always trusted in addition, whatever the list holds.
+var DefaultTrustedRefs = []string{"refs/heads/release/*", "refs/tags/v*"}
+
+// MinIdentityKeyBytes is the shortest accepted registry identity key.
+const MinIdentityKeyBytes = 32
 
 // Reconcile tunes the reconciler; zero fields take the defaults below.
 type Reconcile struct {
@@ -201,6 +224,8 @@ type Secrets struct {
 	AppPrivateKey []byte
 	WebhookSecret []byte
 	LuxAPIKey     string
+	// RegistryIdentityKey is nil without a registry block.
+	RegistryIdentityKey []byte
 }
 
 func (Secrets) String() string   { return "config.Secrets{redacted}" }
@@ -212,9 +237,13 @@ var (
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$`)
 	// Runner names are lux-gha-<instance>-<repo id>-<job id>-<gen>; 20
 	// characters keeps them well inside GitHub's runner name limit.
-	instancePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$`)
-	namePattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	labelPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+	instancePattern  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$`)
+	namePattern      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	labelPattern     = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+	roleARNPattern   = regexp.MustCompile(`^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
+	awsRegionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
+	// ecrHostPattern's second group is the region, compared to Region.
+	ecrHostPattern = regexp.MustCompile(`^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?$`)
 )
 
 func Load(path string) (*Config, error) {
@@ -413,6 +442,9 @@ func (c *Config) validate() error {
 	if c.Cache != nil {
 		c.Cache.validate(c.Listen, add)
 	}
+	if c.Registry != nil {
+		errs = append(errs, c.Registry.validate(c.Listen)...)
+	}
 	return errors.Join(errs...)
 }
 
@@ -531,6 +563,65 @@ func (cc *Cache) LoadSigningKeys() ([][]byte, error) {
 	return keys, nil
 }
 
+func (g *Registry) validate(listen string) []error {
+	var errs []error
+	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf("registry."+format, a...)) }
+	if !roleARNPattern.MatchString(g.RoleARN) {
+		add("roleArn %q is not an IAM role ARN", g.RoleARN)
+	}
+	if !awsRegionPattern.MatchString(g.Region) {
+		add("region %q is not an AWS region name", g.Region)
+	}
+	// docker-credential-ecr-login serves only ECR registry hosts, and the
+	// credentials are minted for Region.
+	if m := ecrHostPattern.FindStringSubmatch(g.Host); m == nil || m[1] != g.Region {
+		add("host %q must be <account>.dkr.ecr.%s.amazonaws.com", g.Host, g.Region)
+	}
+	if g.TrustedRefs == nil {
+		g.TrustedRefs = slices.Clone(DefaultTrustedRefs)
+	}
+	for _, p := range g.TrustedRefs {
+		if _, err := path.Match(p, ""); err != nil ||
+			(!strings.HasPrefix(p, "refs/heads/") && !strings.HasPrefix(p, "refs/tags/")) {
+			add("trustedRefs: %q must be a refs/heads/ or refs/tags/ glob (the default branch is always trusted)", p)
+		}
+	}
+	if _, port, err := net.SplitHostPort(g.RunnerListen); err != nil {
+		add("runnerListen: %q is not host:port", g.RunnerListen)
+	} else if g.RunnerListen == listen && port != "0" {
+		add("runnerListen must differ from listen")
+	}
+	u, err := url.Parse(g.RunnerEndpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		add("runnerEndpoint %q must be an http(s) URL with no path, credentials, query or fragment", g.RunnerEndpoint)
+	} else if u.Scheme == "http" && !loopbackHost(u.Hostname()) {
+		// Bearer tokens and AWS secret keys cross this hop.
+		add("runnerEndpoint %q must be https unless its host is loopback", g.RunnerEndpoint)
+	} else {
+		g.RunnerEndpoint = strings.TrimSuffix(g.RunnerEndpoint, "/")
+	}
+	if g.IdentityKeyFile == "" {
+		add("identityKeyFile is required")
+	}
+	return errs
+}
+
+// LoopbackListen reports whether runnerListen binds only a loopback
+// address. An empty host binds every interface.
+func (g *Registry) LoopbackListen() bool {
+	host, _, err := net.SplitHostPort(g.RunnerListen)
+	if err != nil {
+		return false
+	}
+	return loopbackHost(host)
+}
+
+func loopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return host == "localhost" || (ip != nil && ip.IsLoopback())
+}
+
 // DiscoverRepositories reports whether the repository set comes from the
 // installation rather than from Repositories.
 func (c *Config) DiscoverRepositories() bool { return c.Repositories == nil }
@@ -592,6 +683,14 @@ func (c *Config) LoadSecrets() (Secrets, error) {
 		return Secrets{}, err
 	}
 	s.LuxAPIKey = string(key)
+	if c.Registry != nil {
+		if s.RegistryIdentityKey, err = readSecret("registry.identityKeyFile", c.Registry.IdentityKeyFile); err != nil {
+			return Secrets{}, err
+		}
+		if len(s.RegistryIdentityKey) < MinIdentityKeyBytes {
+			return Secrets{}, fmt.Errorf("config: registry.identityKeyFile: key must be at least %d bytes", MinIdentityKeyBytes)
+		}
+	}
 	return s, nil
 }
 

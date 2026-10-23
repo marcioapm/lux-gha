@@ -149,6 +149,23 @@ RUN case "$TARGETARCH" in \
     /tmp/awscli/aws/install; \
     rm -rf /tmp/awscliv2.zip /tmp/awscli
 
+# docker-credential-ecr-login, behind docker-credential-lux-gha, for the
+# in-region registry. SHA-256 from the release's per-binary .sha256 files
+# (resolved 2026-10-23).
+ARG ECR_LOGIN_VERSION=0.12.0
+ARG ECR_LOGIN_SHA256_AMD64=a22ab6d59dbac777b8fb31984709461da00a4c778b6ae14c8d3729e8d5ded1a6
+ARG ECR_LOGIN_SHA256_ARM64=5bdd30fb6c7a92462f5b454cce1aa906ca7926a6c2e39efad9613a7bf7661fac
+RUN case "$TARGETARCH" in \
+      arm64) sha=$ECR_LOGIN_SHA256_ARM64 ;; \
+      amd64) sha=$ECR_LOGIN_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 --retry-all-errors -o /tmp/docker-credential-ecr-login \
+      "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/${ECR_LOGIN_VERSION}/linux-${TARGETARCH}/docker-credential-ecr-login"; \
+    echo "${sha}  /tmp/docker-credential-ecr-login" | sha256sum -c -; \
+    install -m 0755 /tmp/docker-credential-ecr-login /usr/local/bin/docker-credential-ecr-login; \
+    rm /tmp/docker-credential-ecr-login
+
 # The base image's "ubuntu" user holds uid 1000.
 RUN userdel -r ubuntu; \
     useradd -m -u 1000 -U -s /bin/bash runner; \
@@ -282,6 +299,13 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} +; \
 RUN install -d -m 0755 /usr/share/lux-gha
 COPY --chmod=644 LICENSE /usr/share/lux-gha/LICENSE
 COPY --chmod=755 entrypoint.sh /usr/local/bin/lux-gha-runner
+# The in-region registry: credential helper, its AWS profile and
+# credential_process, and the job-started hook (README "In-region image registry").
+RUN install -d -m 0755 /etc/lux-gha /usr/local/lib/lux-gha
+COPY --chmod=755 docker-credential-lux-gha.sh /usr/local/bin/docker-credential-lux-gha
+COPY --chmod=755 lux-gha-aws-credentials.sh /usr/local/bin/lux-gha-aws-credentials
+COPY --chmod=755 job-started.sh /usr/local/lib/lux-gha/job-started.sh
+COPY --chmod=644 aws-config /etc/lux-gha/aws-config
 
 # Declared here, not at the top of the stage, so that a BuildKit bump
 # rebuilds only the layers from here on.

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -515,5 +516,244 @@ func TestRunServesHealthAndSignedWebhookThenShutsDown(t *testing.T) {
 	}
 	if _, err := client.Get(base + "/healthz"); err == nil {
 		t.Fatal("still serving after shutdown")
+	}
+}
+
+// listeners records the address of every "serving*" record by message.
+type listeners struct{ addrs chan [2]string }
+
+func (h listeners) Enabled(context.Context, slog.Level) bool { return true }
+func (h listeners) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h listeners) WithGroup(string) slog.Handler            { return h }
+func (h listeners) Handle(_ context.Context, r slog.Record) error {
+	if !strings.HasPrefix(r.Message, "serving") {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "listen" {
+			h.addrs <- [2]string{r.Message, a.Value.String()}
+		}
+		return true
+	})
+	return nil
+}
+
+// runUntilServing starts run and returns the addresses it logged by message
+// once the main listener serves, and a stop function.
+func runUntilServing(t *testing.T, path string) (map[string]string, func()) {
+	t.Helper()
+	// No AWS profile of the host's user is read; nothing calls AWS.
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	h := listeners{addrs: make(chan [2]string, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, path, slog.New(h)) }()
+	got := map[string]string{}
+	for got["serving"] == "" {
+		select {
+		case a := <-h.addrs:
+			got[a[0]] = a[1]
+		case err := <-done:
+			t.Fatalf("run returned before serving: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("run did not start serving")
+		}
+	}
+	return got, func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("shutdown err=%v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("run did not return after cancellation")
+		}
+	}
+}
+
+func withRegistry(dir string) func(map[string]any) {
+	return func(c map[string]any) {
+		c["registry"] = map[string]any{
+			"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
+			"host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "127.0.0.1:0",
+			"runnerEndpoint": "https://gha.example.com", "identityKeyFile": filepath.Join(dir, "identity-key"),
+		}
+	}
+}
+
+// With a registry block the runner listener is a server of its own that
+// serves only the runner routes; the main listener does not serve them.
+func TestRunServesTheRunnerListenerOnlyWithARegistry(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "identity-key"), []byte(strings.Repeat("k", 32)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addrs, stop := runUntilServing(t, writeConfig(t, fakeLux(t, "v0.1.14"), closedGitHub, withRegistry(dir)))
+	defer stop()
+	runner := addrs["serving runner listener"]
+	if runner == "" || runner == addrs["serving"] {
+		t.Fatalf("listeners %v", addrs)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, tc := range []struct {
+		method, base, path string
+		want               int
+	}{
+		{"POST", runner, "/runner/v1/registry", http.StatusUnauthorized},
+		{"POST", runner, "/runner/v1/aws-credentials", http.StatusUnauthorized},
+		{"GET", runner, "/healthz", http.StatusNotFound},
+		{"GET", runner, "/status", http.StatusNotFound},
+		{"POST", runner, "/webhook", http.StatusNotFound},
+		{"POST", addrs["serving"], "/runner/v1/registry", http.StatusNotFound},
+		{"GET", addrs["serving"], "/healthz", http.StatusOK},
+	} {
+		req, _ := http.NewRequest(tc.method, "http://"+tc.base+tc.path, nil)
+		req.Header.Set("Authorization", "Bearer v1.lux-gha-test-1001-7-0.AAAA")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s %s%s: %d, want %d", tc.method, tc.base, tc.path, resp.StatusCode, tc.want)
+		}
+	}
+}
+
+// listenAll records the address of every record with a listen attribute.
+type listenAll struct{ addrs chan [2]string }
+
+func (h listenAll) Enabled(context.Context, slog.Level) bool { return true }
+func (h listenAll) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h listenAll) WithGroup(string) slog.Handler            { return h }
+func (h listenAll) Handle(_ context.Context, r slog.Record) error {
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "listen" {
+			h.addrs <- [2]string{r.Message, a.Value.String()}
+		}
+		return true
+	})
+	return nil
+}
+
+// With both a cache and a registry block, run serves three listeners, each
+// with only its own routes, and a stop shuts all three down without error.
+func TestRunServesCacheAndRunnerListenersTogether(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	dir := t.TempDir()
+	for _, f := range []string{"identity-key", "cache-signing-key"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(strings.Repeat("k", 32)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "upstream") }))
+	defer upstream.Close()
+	path := writeConfig(t, fakeLux(t, "v0.1.14"), closedGitHub, withRegistry(dir), func(c map[string]any) {
+		c["cache"] = map[string]any{
+			"listen": "127.0.0.1:0", "publicURL": "http://127.0.0.1:1",
+			"s3":             map[string]any{"bucket": "cache-bucket", "region": "us-east-1", "endpoint": "http://127.0.0.1:1"},
+			"signingKeyFile": filepath.Join(dir, "cache-signing-key"), "issuer": "http://127.0.0.1:1",
+			"upstreamResultsURL": upstream.URL, "repositoryIDs": []int64{100},
+		}
+	})
+	h := listenAll{addrs: make(chan [2]string, 8)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, path, slog.New(h)) }()
+	got := map[string]string{}
+	for len(got) < 3 {
+		select {
+		case a := <-h.addrs:
+			got[a[0]] = "http://" + a[1]
+		case err := <-done:
+			t.Fatalf("run returned before serving: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("listeners %v", got)
+		}
+	}
+	main, runner, cacheBase := got["serving"], got["serving runner listener"], got["cache serving"]
+	if main == "" || runner == "" || cacheBase == "" || main == runner || main == cacheBase || runner == cacheBase {
+		t.Fatalf("listeners %v", got)
+	}
+	cachePath := "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, tc := range []struct {
+		method, base, path string
+		want               int
+	}{
+		{"GET", main, "/healthz", http.StatusOK},
+		{"POST", main, "/runner/v1/registry", http.StatusNotFound},
+		{"POST", main, cachePath, http.StatusNotFound},
+		{"POST", runner, "/runner/v1/registry", http.StatusUnauthorized},
+		{"POST", runner, cachePath, http.StatusNotFound},
+		{"POST", cacheBase, cachePath, http.StatusUnauthorized},
+	} {
+		req, _ := http.NewRequest(tc.method, tc.base+tc.path, strings.NewReader("{}"))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s %s%s: %d, want %d", tc.method, tc.base, tc.path, resp.StatusCode, tc.want)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown err=%v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after cancellation")
+	}
+	for _, base := range []string{main, runner, cacheBase} {
+		if _, err := client.Get(base + "/healthz"); err == nil {
+			t.Errorf("%s still serving after shutdown", base)
+		}
+	}
+}
+
+func TestRunWithoutRegistryHasNoRunnerListener(t *testing.T) {
+	addrs, stop := runUntilServing(t, writeConfig(t, fakeLux(t, "v0.1.14"), closedGitHub))
+	stop()
+	if len(addrs) != 1 {
+		t.Fatalf("listeners %v", addrs)
+	}
+}
+
+func TestRunRefusesARegistryWithoutItsIdentityKey(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, fakeLux(t, "v0.1.14"), closedGitHub, withRegistry(dir))
+	err := run(context.Background(), path, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "registry.identityKeyFile") {
+		t.Fatalf("err=%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "identity-key"), []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), path, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("short key err=%v", err)
+	}
+}
+
+// Only a loopback runnerListen starts without the plain-HTTP warning.
+func TestExposedRunnerListenIsWarnedAbout(t *testing.T) {
+	for listen, warned := range map[string]bool{
+		"127.0.0.1:8081": false, "[::1]:8081": false, "localhost:8081": false, "127.0.0.2:0": false,
+		"10.0.0.5:8081": true, "0.0.0.0:8081": true, ":8081": true, "[::]:8081": true, "bridge.example:8081": true,
+	} {
+		var buf strings.Builder
+		warnExposedRunnerListen(&config.Registry{RunnerListen: listen}, slog.New(slog.NewTextHandler(&buf, nil)))
+		if got := strings.Contains(buf.String(), "level=WARN") && strings.Contains(buf.String(), "must not be exposed directly"); got != warned {
+			t.Errorf("%s: warned=%v, log %q", listen, got, buf.String())
+		}
 	}
 }

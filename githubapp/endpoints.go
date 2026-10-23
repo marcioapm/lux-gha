@@ -2,8 +2,10 @@ package githubapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -163,8 +165,9 @@ func (c *Client) GenerateRepoJITConfig(ctx context.Context, repo Repository, req
 
 // RepositoryInfo is the subset of GET /repos/{owner}/{repo} the bridge reads.
 type RepositoryInfo struct {
-	ID       int64  `json:"id"`
-	FullName string `json:"full_name"`
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 // GetRepository resolves the numeric repository ID, which unlike owner/name
@@ -319,6 +322,135 @@ func (c *Client) ListInstallationRepositories(ctx context.Context, installationI
 		}
 	}
 	return out, nil
+}
+
+// TagCommit returns the commit SHA tag name points at, peeling an annotated
+// tag (GET /repos/{o}/{r}/commits/refs/tags/{name} as application/vnd.github.sha).
+// found is false when no such tag exists.
+func (c *Client) TagCommit(ctx context.Context, repo Repository, name string) (sha string, found bool, err error) {
+	path, err := refPath(repo, "/commits/refs/tags/", name)
+	if err != nil {
+		return "", false, err
+	}
+	var out shaResponse
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path, nil, http.StatusOK, &out)
+	switch {
+	case missingRef(err):
+		return "", false, nil
+	case err != nil:
+		return "", false, err
+	case !isSHA(out.sha):
+		return "", false, errors.New("githubapp: invalid commit SHA response")
+	}
+	return out.sha, true, nil
+}
+
+// BranchContains reports whether branch name exists and sha is its tip or
+// one of its ancestors: GET /repos/{o}/{r}/compare/{sha}...refs/heads/{name}
+// answers status identical or ahead. A missing branch or commit (404), an
+// unrelated history (422), behind and diverged are false; any other answer
+// is an error.
+func (c *Client) BranchContains(ctx context.Context, repo Repository, name, sha string) (bool, error) {
+	if !isSHA(sha) {
+		return false, errors.New("githubapp: invalid commit SHA")
+	}
+	// git refuses ".." in a ref name; here it would also split the range.
+	if strings.Contains(name, "..") {
+		return false, errInvalidRef
+	}
+	path, err := refPath(repo, "/compare/"+sha+"...refs/heads/", name)
+	if err != nil {
+		return false, err
+	}
+	// One commit per page: only the status is read.
+	var out compareStatus
+	_, err = c.installationRequest(ctx, repo.InstallationID, http.MethodGet, path+"?per_page=1", nil, http.StatusOK, &out)
+	if missingRef(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch out.status {
+	case "identical", "ahead":
+		return true, nil
+	case "behind", "diverged":
+		return false, nil
+	}
+	return false, errors.New("githubapp: invalid compare response")
+}
+
+// missingRef: GitHub answers 404, or 422 ("No commit found", "No common
+// ancestor"), for a ref or commit that does not exist.
+func missingRef(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusUnprocessableEntity)
+}
+
+var (
+	errInvalidJSON = errors.New("githubapp: invalid JSON response")
+	errInvalidRef  = errors.New("githubapp: invalid ref name")
+)
+
+// compareStatus, as request's out, receives the top-level "status" of a
+// compare response. The response also carries up to 300 changed files, so
+// it is scanned for that one key rather than decoded whole.
+type compareStatus struct{ status string }
+
+func readCompareStatus(r io.Reader) (string, error) {
+	dec := json.NewDecoder(r)
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return "", errInvalidJSON
+	}
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return "", errInvalidJSON
+		}
+		if t == "status" {
+			var s string
+			if err := dec.Decode(&s); err != nil {
+				return "", errInvalidJSON
+			}
+			return s, nil
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return "", errInvalidJSON
+		}
+	}
+	return "", errors.New("githubapp: compare response has no status")
+}
+
+// shaResponse, as request's out, asks for application/vnd.github.sha and
+// receives the plain-text SHA.
+type shaResponse struct{ sha string }
+
+// isSHA accepts a lower-case SHA-1 or SHA-256 commit id.
+func isSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// refPath is repo's API path for prefix followed by a ref name, each
+// '/'-separated segment escaped. Names git refuses (empty segments, "." or
+// "..") are rejected.
+func refPath(repo Repository, prefix, name string) (string, error) {
+	segs := strings.Split(name, "/")
+	for i, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return "", errInvalidRef
+		}
+		segs[i] = url.PathEscape(s)
+	}
+	return repo.path(prefix + strings.Join(segs, "/"))
 }
 
 func (o PageOptions) query() (url.Values, error) {
