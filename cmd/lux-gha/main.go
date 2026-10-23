@@ -1,7 +1,8 @@
 // Command lux-gha is the GitHub Actions to Lux bridge. It verifies
 // configuration, credentials and Lux compatibility, then runs the reconciler
 // and serves /healthz, /status and a signed webhook endpoint whose
-// workflow_job callback only wakes the reconciler.
+// workflow_job callback only wakes the reconciler. With a cache section it
+// also serves the Actions cache on a second listener.
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/marcioapm/lux-gha/cache"
 	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/githubapp"
 	"github.com/marcioapm/lux-gha/internal/version"
@@ -102,8 +104,18 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 1)
+	errc := make(chan error, 2)
 	go func() { errc <- srv.Serve(ln) }()
+	servers := []*http.Server{srv}
+	if cfg.Cache != nil {
+		cacheSrv, stopCache, err := startCache(ctx, cfg.Cache, log, errc)
+		if err != nil {
+			srv.Close()
+			return err
+		}
+		defer stopCache()
+		servers = append(servers, cacheSrv)
+	}
 	recCtx, stopRec := context.WithCancel(ctx)
 	recDone := make(chan struct{})
 	go func() { rec.Run(recCtx); close(recDone) }()
@@ -112,13 +124,65 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	log.Info("serving", "listen", ln.Addr().String())
 	select {
 	case err := <-errc:
+		for _, s := range servers {
+			s.Close()
+		}
 		return err
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	var errs []error
+	for _, s := range servers {
+		err := s.Shutdown(shutdownCtx)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			continue
+		}
+		if s != srv && errors.Is(err, context.DeadlineExceeded) {
+			// Uploads and proxied transfers have no overall timeout, so a
+			// long one can outlast the drain; a stop still exits cleanly.
+			log.Warn("cache listener: transfers still running at shutdown were dropped", "after", shutdownTimeout)
+			s.Close()
+			continue
+		}
+		errs = append(errs, err)
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+// shutdownTimeout bounds the drain of in-flight requests on stop.
+var shutdownTimeout = 10 * time.Second
+
+// startCache serves the cache on its own listener and starts its reaper;
+// stop ends the reaper and waits for it. Serve errors are sent on errc.
+func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc chan<- error) (_ *http.Server, stop func(), _ error) {
+	keys, err := cc.LoadSigningKeys()
+	if err != nil {
+		return nil, nil, err
+	}
+	cs, err := cache.New(ctx,
+		cache.S3Options{Bucket: cc.S3.Bucket, Region: cc.S3.Region, Endpoint: cc.S3.Endpoint},
+		cache.Options{
+			PublicURL: cc.PublicURL, Issuer: cc.Issuer, Upstream: cc.UpstreamResultsURL, SigningKeys: keys,
+			RepositoryOwnerIDs: cc.RepositoryOwnerIDs, RepositoryIDs: cc.RepositoryIDs,
+			Prefix: cc.S3.Prefix, DownloadURLTTL: cc.DownloadURLTTL.Duration, TTL: cc.TTL.Duration,
+			MaxBytes: cc.MaxBytes, MaxEntryBytes: cc.MaxEntryBytes, ReapInterval: cc.ReapInterval.Duration, Log: log,
+		})
+	if err != nil {
+		return nil, nil, err
+	}
+	// No server-wide body or write timeout: an upload block or a proxied
+	// artifact transfer can take many minutes. The cache handler sets
+	// per-request read and minimum-progress deadlines instead.
+	srv := &http.Server{Handler: cs, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	ln, err := net.Listen("tcp", cc.Listen)
+	if err != nil {
+		return nil, nil, err
+	}
+	go func() { errc <- srv.Serve(ln) }()
+	reapCtx, stopReap := context.WithCancel(ctx)
+	reapDone := make(chan struct{})
+	go func() { cs.RunReaper(reapCtx); close(reapDone) }()
+	log.Info("cache serving", "listen", ln.Addr().String(), "bucket", cc.S3.Bucket, "prefix", cc.S3.Prefix)
+	return srv, func() { stopReap(); <-reapDone }, nil
 }

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marcioapm/lux-gha/cache"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -31,7 +32,55 @@ type Config struct {
 	// then discovered from the installation.
 	Repositories []string `json:"repositories"`
 	Routes       []Route  `json:"routes"`
+	// Cache is nil when absent: the cache server is off.
+	Cache *Cache `json:"cache"`
 }
+
+// Cache configures the GitHub Actions cache server, served on its own
+// listener. Zero optional fields take the defaults below.
+type Cache struct {
+	Listen string `json:"listen"`
+	// PublicURL is the base URL runners use as ACTIONS_RESULTS_URL.
+	PublicURL          string   `json:"publicURL"`
+	S3                 CacheS3  `json:"s3"`
+	SigningKeyFile     string   `json:"signingKeyFile"`
+	Issuer             string   `json:"issuer"`
+	UpstreamResultsURL string   `json:"upstreamResultsURL"`
+	DownloadURLTTL     Duration `json:"downloadURLTTL"`
+	TTL                Duration `json:"ttl"`
+	// MaxBytes caps entries (90 %) and uploads in progress (10 %)
+	// together; 0 is no cap.
+	MaxBytes      int64    `json:"maxBytes"`
+	MaxEntryBytes int64    `json:"maxEntryBytes"`
+	ReapInterval  Duration `json:"reapInterval"`
+	// A runtime token is served only when its repository_id is in
+	// RepositoryIDs or its repository owner ID is in RepositoryOwnerIDs;
+	// at least one list is required.
+	RepositoryOwnerIDs []int64 `json:"repositoryOwnerIDs"`
+	RepositoryIDs      []int64 `json:"repositoryIDs"`
+}
+
+type CacheS3 struct {
+	Bucket string `json:"bucket"`
+	Region string `json:"region"`
+	Prefix string `json:"prefix"`
+	// Endpoint is an S3-compatible server, addressed path-style.
+	Endpoint string `json:"endpoint"`
+}
+
+// The cache defaults are the cache package's own.
+const (
+	// A presigned S3 URL lives at most 7 days.
+	MaxCacheDownloadURLTTL = 7 * 24 * time.Hour
+	// S3's object size limit.
+	MaxCacheEntryBytes = 5 << 40
+)
+
+var (
+	bucketPattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+	regionPattern      = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+	cachePrefixPattern = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$`)
+)
 
 // Reconcile tunes the reconciler; zero fields take the defaults below.
 type Reconcile struct {
@@ -361,7 +410,125 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	if c.Cache != nil {
+		c.Cache.validate(c.Listen, add)
+	}
 	return errors.Join(errs...)
+}
+
+func (cc *Cache) validate(webhookListen string, add func(string, ...any)) {
+	if _, _, err := net.SplitHostPort(cc.Listen); err != nil {
+		add("cache.listen: %q is not host:port", cc.Listen)
+	} else if cc.Listen == webhookListen && !strings.HasSuffix(cc.Listen, ":0") {
+		add("cache.listen must differ from listen")
+	}
+	if err := checkURL(cc.PublicURL); err != nil {
+		add("cache.publicURL: %v", err)
+	} else if u, _ := url.Parse(cc.PublicURL); strings.TrimSuffix(u.Path, "/") != "" {
+		add("cache.publicURL %q must not have a path", cc.PublicURL)
+	}
+	s := &cc.S3
+	if !bucketPattern.MatchString(s.Bucket) || strings.Contains(s.Bucket, "..") {
+		add("cache.s3.bucket %q is not an S3 bucket name", s.Bucket)
+	}
+	if !regionPattern.MatchString(s.Region) {
+		add("cache.s3.region %q is required, e.g. eu-west-1", s.Region)
+	}
+	if s.Prefix != "" {
+		if !cachePrefixPattern.MatchString(s.Prefix) || len(s.Prefix) > 200 {
+			add("cache.s3.prefix %q must be /-separated segments of A-Z, a-z, 0-9, '.', '_' and '-', none starting with '.', at most 200 characters", s.Prefix)
+		}
+	}
+	if s.Endpoint != "" {
+		if err := checkURL(s.Endpoint); err != nil {
+			add("cache.s3.endpoint: %v", err)
+		}
+	}
+	if cc.SigningKeyFile == "" {
+		add("cache.signingKeyFile is required")
+	}
+	if cc.Issuer == "" {
+		cc.Issuer = cache.DefaultIssuer
+	}
+	if err := checkURL(cc.Issuer); err != nil {
+		add("cache.issuer: %v", err)
+	}
+	if cc.UpstreamResultsURL == "" {
+		cc.UpstreamResultsURL = cache.DefaultUpstreamResultsURL
+	}
+	if err := checkURL(cc.UpstreamResultsURL); err != nil {
+		add("cache.upstreamResultsURL: %v", err)
+	}
+	if cc.DownloadURLTTL.Duration == 0 {
+		cc.DownloadURLTTL.Duration = cache.DefaultDownloadURLTTL
+	}
+	if d := cc.DownloadURLTTL.Duration; d < time.Minute || d > MaxCacheDownloadURLTTL {
+		add("cache.downloadURLTTL %s must be between 1m and %s", d, MaxCacheDownloadURLTTL)
+	}
+	if cc.TTL.Duration == 0 {
+		cc.TTL.Duration = cache.DefaultTTL
+	}
+	if cc.TTL.Duration < time.Hour {
+		add("cache.ttl %s must be at least 1h", cc.TTL.Duration)
+	}
+	if cc.MaxBytes < 0 {
+		add("cache.maxBytes must not be negative")
+	}
+	if cc.MaxEntryBytes == 0 && cc.MaxBytes >= 0 {
+		cc.MaxEntryBytes = cache.DefaultMaxEntryBytesFor(cc.MaxBytes)
+	}
+	if cc.MaxEntryBytes <= 0 || cc.MaxEntryBytes > MaxCacheEntryBytes {
+		add("cache.maxEntryBytes must be between 1 and %d (default %d, 10 GiB, or 90 %% of cache.maxBytes if smaller)",
+			int64(MaxCacheEntryBytes), int64(cache.DefaultMaxEntryBytes))
+	}
+	// Entries are trimmed to the entry budget, 90 % of maxBytes; a larger
+	// entry would be deleted by the first capped pass after it is saved.
+	if cc.MaxBytes > 0 && cc.MaxEntryBytes > cache.MaxEntryBytesFor(cc.MaxBytes) {
+		add("cache.maxEntryBytes %d must not exceed 90 %% of cache.maxBytes (%d); omit it for the default, 10 GiB or 90 %% of cache.maxBytes if smaller",
+			cc.MaxEntryBytes, cache.MaxEntryBytesFor(cc.MaxBytes))
+	}
+	if cc.ReapInterval.Duration == 0 {
+		cc.ReapInterval.Duration = cache.DefaultReapInterval
+	}
+	if cc.ReapInterval.Duration < time.Minute {
+		add("cache.reapInterval %s must be at least 1m", cc.ReapInterval.Duration)
+	}
+	if len(cc.RepositoryOwnerIDs) == 0 && len(cc.RepositoryIDs) == 0 {
+		add("cache: list the served repositories in cache.repositoryIDs or their owners in cache.repositoryOwnerIDs (numeric GitHub IDs)")
+	}
+	for _, id := range cc.RepositoryOwnerIDs {
+		if id <= 0 {
+			add("cache.repositoryOwnerIDs: %d is not a positive GitHub ID", id)
+		}
+	}
+	for _, id := range cc.RepositoryIDs {
+		if id <= 0 {
+			add("cache.repositoryIDs: %d is not a positive GitHub ID", id)
+		}
+	}
+}
+
+// LoadSigningKeys reads cache.signingKeyFile: one key per line, each at
+// least 32 bytes. The first signs new upload URLs; every key verifies, so
+// a new key is rotated in by adding it as the first line and the old one
+// removed once its URLs have expired.
+func (cc *Cache) LoadSigningKeys() ([][]byte, error) {
+	b, err := readSecret("cache.signingKeyFile", cc.SigningKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	var keys [][]byte
+	for i, line := range bytes.Split(b, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 {
+			continue
+		}
+		if len(line) < 32 {
+			return nil, fmt.Errorf("config: cache.signingKeyFile: key on line %d is shorter than 32 bytes", i+1)
+		}
+		keys = append(keys, line)
+	}
+	return keys, nil
 }
 
 // DiscoverRepositories reports whether the repository set comes from the

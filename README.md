@@ -21,7 +21,8 @@ process.
   - a startup compatibility check
 - `webhook`: signed `workflow_job` ingress that calls an injected function, and optionally `installation` and `installation_repositories` ingress.
 - `reconcile`: the single reconciler that provisions and removes runners.
-- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
+- `cache`: an optional GitHub Actions cache server (cache service v2) backed by S3, on its own listener ([Actions cache](#actions-cache)).
+- `cmd/lux-gha`: loads config and secrets, checks Lux compatibility, starts the reconciler, then serves `GET /healthz`, `GET /status` and `POST /webhook`, and, with a `cache` section, the Actions cache on a second listener. `lux-gha --version` prints the version (`dev` unless set at build time) and exits; it is also logged at startup.
 
 The runner image is in `images/runner` (see its [README](images/runner/README.md) and the [Runner entrypoint contract](#runner-entrypoint-contract)). Besides the runner and rootless Docker, it ships `moby/buildkit` for its own architecture, pinned by digest. The entrypoint loads it into each Run's Docker store, so that `docker/setup-buildx-action`'s default `docker-container` builder does not pull BuildKit from Docker Hub on every job. Workflows should pin `driver-opts: image=moby/buildkit:<version>` to the version the image carries (its `io.github.marcioapm.lux-gha.buildkit` label). With `buildx-stable-1`, buildx downloads a newer BuildKit once that tag moves ([BuildKit driver](images/runner/README.md#buildkit-driver)).
 
@@ -582,6 +583,188 @@ image's BuildKit archive into it (a failed load only warns).
 - **Routing**: a job is routed only when **every** label it requests is in exactly one route's label set. Label comparison is case-insensitive. Configuration is rejected if one route's label set contains another's, because a job could then match both.
 - **Repositories**: runners are registered per repository. Organisation-level runners are not supported. `repositories` is optional. Omitted, as in the example, every repository of the installation is served ([Repository discovery](#repository-discovery)). Given, as `"repositories": ["acme/widgets"]`, only those are served and each is read every pass; an empty list is rejected.
 - **Secrets**: these are read from the three files named above. A trailing newline is stripped. Secrets are never logged and are never part of the config value. Unknown config fields are rejected, so secrets can't be inlined by mistake.
+- **`cache`**: optional; absent, nothing below runs ([Actions cache](#actions-cache)).
+
+### Actions cache
+
+```json
+"cache": {
+  "listen": "0.0.0.0:8090",
+  "publicURL": "https://gha-cache.example.com",
+  "s3": {"bucket": "cache-bucket", "region": "eu-west-1", "prefix": "gha-cache"},
+  "signingKeyFile": "/etc/lux-gha/cache-signing-keys",
+  "repositoryIDs": [123456789], "repositoryOwnerIDs": [],
+  "issuer": "https://token.actions.githubusercontent.com",
+  "upstreamResultsURL": "https://results-receiver.actions.githubusercontent.com",
+  "downloadURLTTL": "10m", "ttl": "168h", "maxBytes": 0, "maxEntryBytes": 10737418240,
+  "reapInterval": "1h"
+}
+```
+
+With `cache` present, lux-gha serves the GitHub Actions cache service (v2,
+the API `@actions/cache` 4 and later and `actions/cache@v4` use) on a second
+listener; the webhook listener is unchanged. Runners use `publicURL` as
+`ACTIONS_RESULTS_URL` (pointing runners at it is not part of lux-gha).
+
+- **`listen`**, **`publicURL`**, **`s3.bucket`**, **`s3.region`** and
+  **`signingKeyFile`** are required. `publicURL` is a scheme and host with no
+  path, HTTPS except on loopback; signed upload URLs are built from it.
+  `listen` must differ from the top-level `listen`.
+- **`repositoryIDs`**, **`repositoryOwnerIDs`**: numeric GitHub IDs (JSON
+  numbers) of the repositories served, or of their owners; at least one list
+  must be non-empty. The issuer signs runtime tokens for every repository on
+  GitHub, so without this any workflow anywhere could use the cache. A token
+  is served when its `repository_id` is in `repositoryIDs`, or its
+  `repository_owner_id` claim is present and in `repositoryOwnerIDs`; a token
+  without that claim matches only by `repositoryIDs`. Every other token gets
+  `403` (`permission_denied`), logged at most once a minute per repository.
+  `repository_owner_id` is a claim of GitHub's OIDC tokens; it has not yet
+  been confirmed in a runtime token (`ACTIONS_RUNTIME_TOKEN`). Decode one
+  real runtime token and check the claim before relying on
+  `repositoryOwnerIDs`; `repositoryIDs` does not depend on it.
+- **`s3`**: credentials come only from the AWS default chain (an instance
+  role, the environment, shared config); there is no key field. `prefix`
+  (optional) holds every object. `endpoint` (optional) names an
+  S3-compatible server, addressed path-style; HTTPS except on loopback.
+- **`signingKeyFile`**: one key per line, each at least 32 bytes, used to
+  HMAC-sign upload URLs. The first line signs; every line verifies. To rotate,
+  add the new key as the first line and restart, then remove the old one
+  after 6 hours (the upload URL lifetime).
+- **`issuer`**: the runtime token issuer, discovered through
+  `/.well-known/openid-configuration`; the default is GitHub's.
+- **`upstreamResultsURL`**: every request that is not a cache request
+  (artifacts, logs, other Results calls) is passed here unchanged, method,
+  path, query, headers and body included, and the response is streamed
+  back. The upstream is fixed; no request chooses it. Pass-through
+  requests are limited in two ways. A request whose
+  `Authorization: Bearer` token verifies (signature, issuer, `exp`, `nbf`),
+  is a runtime token (`ac` and a numeric `repository_id`, as for cache
+  calls) and names a repository this server serves counts against that
+  job's 32 concurrent requests, keyed on a hash of the token's decoded
+  payload. A token with whitespace inside it or non-canonical base64url
+  never verifies, here or on cache calls, so one token is one job. Every
+  other request (no token, one that does not verify, one longer than
+  8 KiB, an OIDC ID token, another repository's token, or any token before
+  the issuer has first been discovered) is still forwarded, but counts
+  against the 32 concurrent requests of its TCP peer address;
+  forwarded-for headers are ignored. The
+  listener runs at most 4096 in total. Past any limit the request gets
+  `503` with `Retry-After`. Jobs of served repositories behind one NAT,
+  load balancer or TLS terminator are limited separately; everything else
+  behind it shares that address's 32. Make the cache listener reachable
+  only from the runners' network, not from the public internet: the
+  address limits are per source address, so a client with many addresses
+  gets many buckets, up to the 4096 ceiling that every runner shares.
+- **Timeouts.** The cache listener has no overall body or response
+  timeout, since a block upload or a proxied transfer can take minutes.
+  Instead a Twirp request body must arrive within 30 s, and an upload or
+  proxied body, and every response, must move at least 64 KiB (or finish)
+  in each 60 s spent waiting on the client, or the connection is closed.
+- **`downloadURLTTL`** (1 m to 7 d): lifetime of a presigned S3 download URL.
+- **`ttl`** (at least 1 h): entries are deleted this long after they were
+  saved.
+- **`maxBytes`** (0: no cap): the total for entries and uploads in
+  progress, split into two budgets the reaper enforces separately (see
+  Expiry): 10 % for uploads in progress, 90 % for entries. Size it so that
+  the upload budget is at least the number of saves you expect at once
+  times a typical archive size; saves beyond it fail when a pass runs
+  during them (a 10 % budget of a 100 GiB cap holds one 10 GiB upload, or
+  ten 1 GiB ones).
+- **`maxEntryBytes`** (1 B to 5 TiB): the largest archive accepted; default
+  10 GiB, or 90 % of `maxBytes` if that is smaller. It may never exceed
+  90 % of `maxBytes` (the entry budget), so the cap never deletes an entry
+  just saved. It may exceed the upload budget: the newest upload is never
+  trimmed, so it always completes.
+- **`reapInterval`** (at least 1 m): how often the reaper runs.
+
+**Authentication.** Every cache call carries the job's runtime token
+(`ACTIONS_RUNTIME_TOKEN`), a JWT the issuer signs. Its signature (RS256,
+against the issuer's JWKS), exact issuer, `exp` and `nbf` are checked; there
+is no setting that turns this off. The audience is not checked: the runtime
+token's audience names GitHub's service and the run, not this server, so no
+stable value exists to require. Two claims are used. `repository_id`
+partitions every entry, so a job never reads or writes another repository's
+cache. `ac` is a JSON string holding `[{"Scope": "<ref>", "Permission": n}]`,
+read 1 and write 2: a job saves only to its one writable scope (its own ref)
+and restores from its readable scopes, its own first and then the others in
+token order (for a pull request, the base branch). A missing or malformed
+claim is `401`. A save with no writable scope gets `ok: false` with a
+message starting `cache write denied:`, and a restore with no readable scope
+a `403` starting `cache read denied:`; the client reports either as a
+warning and carries on.
+
+**Matching.** Within each scope in that order: the exact key, then the
+newest entry whose key starts with the key, then the same for each restore
+key in order. Only entries of the requested version (the client's hash of
+paths and compression) match. A miss is `ok: false`, not an error.
+
+**Saving.** `CreateCacheEntry` returns `ok: false` when the key and version
+already exist in the job's scope, and otherwise a signed upload URL on this
+server, bound by HMAC to the repository, scope, key, version and runtime
+token, valid for 6 hours. The client uploads to it with the Azure Blob SDK;
+lux-gha implements the three requests that client sends: one `Put Blob` up
+to 128 MiB, or `Put Block` per 64 MiB block followed by `Put Block List`.
+Every block but the last must be at least 5 MiB, S3's multipart minimum;
+`@actions/cache` meets that, but BuildKit's `type=gha` cache, which uploads
+1 MiB blocks, is not supported. A `Put Blob` is at most 5000 MiB and a
+block at most 4000 MiB (Azure's limits, and never above `maxEntryBytes`),
+and an upload holds at most 10,000 blocks (`400 BlockCountExceedsLimit`).
+A job that saves the same key again reuses its upload: a `Put Blob`
+discards blocks an earlier attempt staged, and a blob an earlier attempt
+staged counts with the blocks toward `maxEntryBytes`. Blocks are streamed
+to S3, never held in memory.
+`FinalizeCacheEntryUpload` checks the uploaded size against `size_bytes`
+and only then makes the entry visible, as one server-side multipart copy
+completed with `If-None-Match: *`. A finalize after another job's entry of
+the same key and version exists gets `ok: false`. Of two finalizes in
+flight together, exactly one wins only on a store that serialises
+conditional completes, which AWS S3 documents and which has not been
+verified here; a store that does not (versitygw v1.7.0) lets the last one
+win. Either way a reader sees one whole archive.
+
+**Restoring.** `GetCacheEntryDownloadURL` returns a presigned S3 `GET` URL;
+the client downloads it with plain HTTP, so runners need egress to the S3
+endpoint as well as to `publicURL`.
+
+**Storage.** S3 is the only state; there is no database. Under `prefix`:
+
+| Objects | Holds |
+|---|---|
+| `v1/<repository_id>/<sha256(scope)>/<version>/<key>` | finalized entries. The key is escaped (bytes outside `A-Za-z0-9._-`, and a leading `.`, as `%XX`) so that a key prefix is an S3 listing prefix. |
+| `staging/<reservation>/…` | uploads not yet finalized; never read by a restore. |
+
+**Expiry.** The reaper runs at start and every `reapInterval`, one pass at a
+time and each bounded by `reapInterval`, and logs one `cache reaper pass`
+line with the entry count and bytes, the staging bytes, and what it deleted.
+It deletes entries older than `ttl`, staging uploads untouched for 24 hours,
+and multipart uploads under `prefix` started more than 24 hours ago (without
+a `prefix`, every multipart upload in the bucket: give the cache its own
+bucket or a prefix). With `maxBytes` set it then enforces two budgets
+separately:
+
+- **Uploads in progress** (staging), 10 % of `maxBytes`: while staging
+  exceeds it, whole staging uploads are deleted, ordered by their first
+  write, oldest first, including uploads still running, but never the one
+  started last; writing to an upload again does not move it in this order.
+  A deleted upload's `FinalizeCacheEntryUpload` gets `ok: false` ("… the
+  uploaded data has expired; save again"), and a block upload deleted
+  before its `Put Block List` fails there (`400 InvalidBlockList`); the
+  client reports either as a failed save.
+- **Entries**, the other 90 %: while entries exceed it, the oldest are
+  deleted. Staging never counts here, so uploads in progress never push out
+  an entry, and since `maxEntryBytes` is at most this budget, an entry just
+  saved is never deleted for the cap.
+
+Every entry and every staging object (each block, blob and manifest)
+counts as at least 1 MiB, so after a pass the reaper lists and holds about
+`maxBytes` / 1 MiB objects, plus the newest upload's blocks (at most
+10,000). A failed delete is
+retried next pass. As a backstop, give the bucket a lifecycle rule that
+aborts incomplete multipart uploads after a day or more.
+
+**Bucket permissions.** `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`,
+`s3:ListBucket`, `s3:ListBucketMultipartUploads` and
+`s3:AbortMultipartUpload` on the bucket and `prefix`.
 
 ### Sizes
 
@@ -712,6 +895,40 @@ make entrypoint-test   # images/runner/entrypoint_test.sh as uid 1000 in the run
 make image             # the runner image for the host's architecture, as lux-gha-runner:dev (IMAGE_TAG=..., PLATFORM=linux/amd64)
 make dist VERSION=vX.Y.Z  # release tarballs in dist/ (below); needs GNU tar (gtar on macOS)
 ```
+
+The cache's S3 and end-to-end tests are left out of `make test`. They build
+with `-tags s3integration` and need an S3-compatible server, and for the
+end-to-end tests `node`, `zstd` and GNU tar plus a directory holding
+`@actions/cache` 6 (`npm --prefix <dir> install @actions/cache@6`):
+
+```sh
+docker run -d --name cache-s3 -p 127.0.0.1:59240:7070 -e ROOT_ACCESS_KEY=testuser -e ROOT_SECRET_KEY=testsecret \
+  versity/versitygw:v1.7.0 --port :7070 --iam-dir /tmp posix /tmp
+LUXGHA_CACHE_S3_ENDPOINT=http://127.0.0.1:59240 LUXGHA_CACHE_S3_BUCKET=cache-bucket \
+  AWS_ACCESS_KEY_ID=testuser AWS_SECRET_ACCESS_KEY=testsecret AWS_REGION=us-east-1 \
+  LUXGHA_CACHE_NODE_DIR=<dir> LUXGHA_CACHE_S3_CONDITIONAL=1 \
+  go test -tags s3integration -count=1 ./cache/
+```
+
+`LUXGHA_CACHE_S3_CONDITIONAL=1` fails the run unless the server refuses
+`CompleteMultipartUpload` with `If-None-Match: *` against an object that
+already exists. versitygw v1.7.0 does, so a finalize that comes after
+another job's finalized entry gets `ok: false` there.
+
+versitygw v1.7.0 does not serialise two such completes in flight together:
+both succeed, and the last to finish is the entry. The command above
+therefore does not assert that exactly one of several concurrent saves
+wins; it asserts that at least one does and that every restore sees one
+whole archive, which holds on any server. The concurrent first-writer-wins
+guarantee is targeted at AWS S3, which documents conditional writes as
+admitting one of concurrent writers; it has not been run against AWS here.
+To assert it against a server that should enforce it, add
+`LUXGHA_CACHE_S3_CONCURRENT_CONDITIONAL=1`; against versitygw that run
+fails intermittently.
+
+`make test` covers the S3 requests themselves (conditional complete, part
+order, copy-source escaping, error mapping, abort and cancellation) against
+an in-process fake S3 (`cache/s3store_test.go`).
 
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`: `make lint`, one
 `go test -race -v` run that fails if any test skipped, and `make dist VERSION=v0.0.0`; `shellcheck`, `sh -n`
