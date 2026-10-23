@@ -869,11 +869,11 @@ runner image therefore ships `images/runner/patch-worker.sh`:
   only after installing the hook and checking the URL, and unsets it (with a
   warning) when the image already names another job-started hook or sets
   `BASH_ENV`, the hook or `pre-listener.sh` is missing, or the URL is not one
-  the hook can write. If the Worker
-  cannot be patched (a runner version the script does not recognise), the
-  `pre-listener.sh` warns and the listener starts anyway; the hook then writes
-  nothing and the job log gets a `::warning::` that the job uses GitHub's
-  cache service. Caching falls back, jobs do not fail.
+  the hook can write. If the Worker cannot be patched (a runner version the
+  script does not recognise), `pre-listener.sh` warns and the listener starts
+  anyway; the hook then writes nothing and the job log gets a `::warning::`
+  that the job uses GitHub's cache service. Caching falls back, jobs do not
+  fail.
 
 Artifacts go through the same variable, so they reach GitHub through the
 cache server's pass-through ([Actions cache](#actions-cache)). The Run must be
