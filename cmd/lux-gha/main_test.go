@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marcioapm/lux-gha/config"
 	"github.com/marcioapm/lux-gha/luxclient"
 )
 
@@ -577,7 +578,7 @@ func withRegistry(dir string) func(map[string]any) {
 		c["registry"] = map[string]any{
 			"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
 			"host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "127.0.0.1:0",
-			"runnerEndpoint": "http://10.0.0.5:8081", "identityKeyFile": filepath.Join(dir, "identity-key"),
+			"runnerEndpoint": "https://gha.example.com", "identityKeyFile": filepath.Join(dir, "identity-key"),
 		}
 	}
 }
@@ -641,5 +642,19 @@ func TestRunRefusesARegistryWithoutItsIdentityKey(t *testing.T) {
 	}
 	if err := run(context.Background(), path, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
 		t.Fatalf("short key err=%v", err)
+	}
+}
+
+// Only a loopback runnerListen starts without the plain-HTTP warning.
+func TestExposedRunnerListenIsWarnedAbout(t *testing.T) {
+	for listen, warned := range map[string]bool{
+		"127.0.0.1:8081": false, "[::1]:8081": false, "localhost:8081": false, "127.0.0.2:0": false,
+		"10.0.0.5:8081": true, "0.0.0.0:8081": true, ":8081": true, "[::]:8081": true, "bridge.example:8081": true,
+	} {
+		var buf strings.Builder
+		warnExposedRunnerListen(&config.Registry{RunnerListen: listen}, slog.New(slog.NewTextHandler(&buf, nil)))
+		if got := strings.Contains(buf.String(), "level=WARN") && strings.Contains(buf.String(), "must not be exposed directly"); got != warned {
+			t.Errorf("%s: warned=%v, log %q", listen, got, buf.String())
+		}
 	}
 }

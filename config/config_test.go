@@ -340,8 +340,8 @@ func TestLoadSecretsTrimsNewlineAndRedacts(t *testing.T) {
 }
 
 const registryBlock = `"registry": {"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
-    "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "10.0.0.5:8081",
-    "runnerEndpoint": "http://10.0.0.5:8081/", "identityKeyFile": "/i"},
+    "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "127.0.0.1:8081",
+    "runnerEndpoint": "https://gha.example.com/", "identityKeyFile": "/i"},
   "repositories"`
 
 func withRegistry(old, new string) []byte {
@@ -359,7 +359,7 @@ func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
 	}
 	g := c.Registry
 	if !slices.Equal(g.TrustedRefs, []string{"<default branch>", "refs/heads/release/*", "refs/tags/v*"}) ||
-		g.RunnerEndpoint != "http://10.0.0.5:8081" {
+		g.RunnerEndpoint != "https://gha.example.com" {
 		t.Fatalf("defaults: %+v", g)
 	}
 	c, err = Parse(withRegistry(`"region"`, `"trustedRefs": ["refs/heads/main"], "region"`))
@@ -377,10 +377,10 @@ func TestRegistryValidation(t *testing.T) {
 		"removed prefix":    {`"region"`, `"repositoryPrefix": "gha", "region"`, `unknown field "repositoryPrefix"`},
 		"bad ref":           {`"region"`, `"trustedRefs": ["main"], "region"`, "registry.trustedRefs"},
 		"bad glob":          {`"region"`, `"trustedRefs": ["refs/heads/[x"], "region"`, "registry.trustedRefs"},
-		"bad listen":        {`"10.0.0.5:8081",`, `"10.0.0.5",`, "registry.runnerListen"},
-		"same listen":       {`"10.0.0.5:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},
-		"endpoint path":     {`8081/"`, `8081/runner"`, "registry.runnerEndpoint"},
-		"endpoint scheme":   {`"http://10`, `"ftp://10`, "registry.runnerEndpoint"},
+		"bad listen":        {`"127.0.0.1:8081",`, `"127.0.0.1",`, "registry.runnerListen"},
+		"same listen":       {`"127.0.0.1:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},
+		"endpoint path":     {`example.com/"`, `example.com/runner"`, "registry.runnerEndpoint"},
+		"endpoint scheme":   {`"https://gha`, `"ftp://gha`, "registry.runnerEndpoint"},
 		"no key file":       {`"identityKeyFile": "/i"`, `"identityKeyFile": ""`, "registry.identityKeyFile"},
 		"unknown field":     {`"region"`, `"identityKey": "x", "region"`, "unknown field"},
 	} {

@@ -112,6 +112,7 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	servers := []*http.Server{srv}
 	errc := make(chan error, 3)
 	if cfg.Registry != nil {
+		warnExposedRunnerListen(cfg.Registry, log)
 		runnerSrv, runnerLn, err := registryListener(ctx, cfg, gh, rec, secrets.RegistryIdentityKey, log)
 		if err != nil {
 			ln.Close()
@@ -205,6 +206,16 @@ func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc ch
 	go func() { cs.RunReaper(reapCtx); close(reapDone) }()
 	log.Info("cache serving", "listen", ln.Addr().String(), "bucket", cc.S3.Bucket, "prefix", cc.S3.Prefix)
 	return srv, func() { stopReap(); <-reapDone }, nil
+}
+
+// warnExposedRunnerListen: the runner listener serves plain HTTP, bearer
+// tokens and AWS credentials included, and is meant to sit behind a TLS
+// tunnel on loopback.
+func warnExposedRunnerListen(g *config.Registry, log *slog.Logger) {
+	if !g.LoopbackListen() {
+		log.Warn("registry.runnerListen is not a loopback address; the runner listener is plain HTTP and must not be exposed directly, put a TLS tunnel in front of it",
+			"runnerListen", g.RunnerListen)
+	}
 }
 
 // registryListener builds the runner listener: a server of its own, on

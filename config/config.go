@@ -605,6 +605,17 @@ func (g *Registry) validate(listen string) []error {
 	return errs
 }
 
+// LoopbackListen reports whether runnerListen binds only a loopback
+// address. An empty host binds every interface.
+func (g *Registry) LoopbackListen() bool {
+	host, _, err := net.SplitHostPort(g.RunnerListen)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return host == "localhost" || (ip != nil && ip.IsLoopback())
+}
+
 // DiscoverRepositories reports whether the repository set comes from the
 // installation rather than from Repositories.
 func (c *Config) DiscoverRepositories() bool { return c.Repositories == nil }

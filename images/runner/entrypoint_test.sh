@@ -403,7 +403,7 @@ run_hook() {
 	start=$(date +%s)
 	rc=0
 	env -i PATH="$root/bin:/usr/bin:/bin" HOME="$d" FAKE_CASE_DIR="$d" GITHUB_ENV="$d/github_env" \
-		LUXGHA_REGISTRY_HOST="$reg" LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 LUXGHA_IDENTITY_FILE="$d/identity" \
+		LUXGHA_REGISTRY_HOST="$reg" LUXGHA_RUNNER_ENDPOINT=https://gha.example.com LUXGHA_IDENTITY_FILE="$d/identity" \
 		LUXGHA_REGISTRY_WAIT=2 "$@" \
 		timeout -k 2 30 bash --noprofile --norc -e -o pipefail "$hook" >"$d/out" 2>"$d/err" || rc=$?
 	elapsed=$(($(date +%s) - start))
@@ -418,7 +418,7 @@ check "GITHUB_ENV gets LUX_REGISTRY and LUX_REGISTRY_PUSH" \
 	'[ "$(cat "$d/github_env")" = "$(printf "LUX_REGISTRY=%s\nLUX_REGISTRY_PUSH=%s" "$reg/acme/widgets" "$reg/acme/widgets/pr")" ]'
 check "one line naming the trust level" '[ "$(cat "$d/out")" = "lux-gha registry: trust=untrusted" ] && [ ! -s "$d/err" ]'
 check "POST to the registry route with the token in a curl config on stdin" \
-	'grep -qx -- "-X" "$d/curl.args" && grep -qx "POST" "$d/curl.args" && grep -qx "http://10.0.0.5:8081/runner/v1/registry" "$d/curl.args" &&
+	'grep -qx -- "-X" "$d/curl.args" && grep -qx "POST" "$d/curl.args" && grep -qx "https://gha.example.com/runner/v1/registry" "$d/curl.args" &&
 	 [ "$(cat "$d/curl.stdin")" = "header = \"Authorization: Bearer $token\"" ]'
 check_no_token
 
@@ -519,11 +519,11 @@ d=$root/$name
 mkdir -p "$d"
 printf '%s' "$token" >"$d/identity"
 rc=0
-env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=200 FAKE_BODY='{"Version":1}' LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 \
+env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=200 FAKE_BODY='{"Version":1}' LUXGHA_RUNNER_ENDPOINT=https://gha.example.com \
 	LUXGHA_IDENTITY_FILE="$d/identity" sh "$creds" >"$d/out" 2>"$d/err" || rc=$?
 check "exits 0" '[ "$rc" = 0 ]'
 check "POST to the credentials route with --fail and a timeout" \
-	'grep -qx "http://10.0.0.5:8081/runner/v1/aws-credentials" "$d/curl.args" && grep -qx -- "--fail" "$d/curl.args" && grep -qx -- "--max-time" "$d/curl.args" && grep -qx POST "$d/curl.args"'
+	'grep -qx "https://gha.example.com/runner/v1/aws-credentials" "$d/curl.args" && grep -qx -- "--fail" "$d/curl.args" && grep -qx -- "--max-time" "$d/curl.args" && grep -qx POST "$d/curl.args"'
 check "token only in the curl config on stdin" '[ "$(cat "$d/curl.stdin")" = "header = \"Authorization: Bearer $token\"" ]'
 check "prints the body for credential_process" '[ "$(cat "$d/out")" = "{\"Version\":1}" ]'
 check_no_token
@@ -533,7 +533,7 @@ d=$root/$name
 mkdir -p "$d"
 printf '%s' "$token" >"$d/identity"
 rc=0
-env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=503 LUXGHA_RUNNER_ENDPOINT=http://10.0.0.5:8081 \
+env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" FAKE_CURL=503 LUXGHA_RUNNER_ENDPOINT=https://gha.example.com \
 	LUXGHA_IDENTITY_FILE="$d/identity" sh "$creds" >"$d/out" 2>"$d/err" || rc=$?
 check "fails on an HTTP error, printing no credentials" '[ "$rc" != 0 ] && [ ! -s "$d/out" ]'
 

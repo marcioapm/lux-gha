@@ -17,7 +17,7 @@ var testIdentityKey = []byte("test-identity-key-0123456789abcdef")
 
 const registryBlock = `"registry": {"roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry", "region": "eu-west-1",
     "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com", "runnerListen": "127.0.0.1:0",
-    "runnerEndpoint": "http://10.0.0.5:8081", "identityKeyFile": "/i"},
+    "runnerEndpoint": "https://gha.example.com", "identityKeyFile": "/i"},
   "repositories"`
 
 func newRegistryEnv(t *testing.T) *env {
@@ -52,7 +52,7 @@ func TestRegistryRunCarriesIdentitySecretAndEnv(t *testing.T) {
 	}
 	wantEnv := map[string]string{
 		"LUXGHA_JITCONFIG_FILE": "/run/lux-gha/jitconfig", "LUXGHA_IDENTITY_FILE": "/run/lux-gha/identity",
-		"LUXGHA_RUNNER_ENDPOINT": "http://10.0.0.5:8081", "LUXGHA_REGISTRY_HOST": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
+		"LUXGHA_RUNNER_ENDPOINT": "https://gha.example.com", "LUXGHA_REGISTRY_HOST": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
 		"LUXGHA_REGISTRY_REGION": "eu-west-1",
 	}
 	if !maps.Equal(r.spec.Env, wantEnv) {
@@ -166,9 +166,10 @@ func webhookEvent(action, runner string, jobID int64) webhook.WorkflowJobEvent {
 		Status: action, Labels: lux3, RunnerName: runner}
 }
 
-// A default-deny route's Runs can reach the runner listener: the bridge adds
-// one egress rule for runnerEndpoint, a /32 for an IP; an unrestricted route
-// needs none. Without a registry the route's egress is as configured.
+// A default-deny route's Runs can reach the runner endpoint: the bridge
+// adds one host rule for runnerEndpoint's hostname, the tunnel in front of
+// the runner listener; an unrestricted route needs none. An IP endpoint
+// gets no rule.
 func TestRegistryRunsMayReachTheRunnerEndpoint(t *testing.T) {
 	e := newRegistryEnv(t)
 	e.gh.queue(7, "queued", "self-hosted", "lux")
@@ -178,26 +179,33 @@ func TestRegistryRunsMayReachTheRunnerEndpoint(t *testing.T) {
 	for _, r := range e.lux.all() {
 		egress[r.run.Labels[LabelRoute]] = r.spec.Egress
 	}
-	want := []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {CIDR: "10.0.0.5/32"}}
-	if !slices.Equal(egress["default"], want) || !slices.Equal(egress["big"], []luxclient.EgressRule{{CIDR: "10.0.0.5/32"}}) {
+	want := []luxclient.EgressRule{{Host: "github.com"}, {Host: "*.actions.githubusercontent.com"}, {Host: "gha.example.com"}}
+	if !slices.Equal(egress["default"], want) || !slices.Equal(egress["big"], []luxclient.EgressRule{{Host: "gha.example.com"}}) {
 		t.Fatalf("egress %v", egress)
 	}
 
-	named := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "http://10.0.0.5:8081", "https://bridge.internal.example:8443", 1)),
+	open := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "https://gha.example.com", "https://gha.example.com:8443", 1)),
 		replace(`"egressHosts": ["github.com", "*.actions.githubusercontent.com"]`, `"unrestrictedEgress": true`))
-	named.gh.queue(7, "queued", "self-hosted", "lux")
-	named.gh.queue(8, "queued", "lux-big")
-	named.pass()
-	for _, r := range named.lux.all() {
+	open.gh.queue(7, "queued", "self-hosted", "lux")
+	open.gh.queue(8, "queued", "lux-big")
+	open.pass()
+	for _, r := range open.lux.all() {
 		switch r.run.Labels[LabelRoute] {
 		case "default":
 			if len(r.spec.Egress) != 0 || !r.spec.UnrestrictedEgress {
 				t.Fatalf("unrestricted route egress %v", r.spec.Egress)
 			}
 		case "big":
-			if !slices.Equal(r.spec.Egress, []luxclient.EgressRule{{Host: "bridge.internal.example"}}) {
-				t.Fatalf("named endpoint egress %v", r.spec.Egress)
+			if !slices.Equal(r.spec.Egress, []luxclient.EgressRule{{Host: "gha.example.com"}}) {
+				t.Fatalf("endpoint with a port: egress %v", r.spec.Egress)
 			}
 		}
+	}
+
+	ip := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "https://gha.example.com", "http://192.0.2.10:8081", 1)))
+	ip.gh.queue(8, "queued", "lux-big")
+	ip.pass()
+	if r := ip.lux.all(); len(r) != 1 || len(r[0].spec.Egress) != 0 {
+		t.Fatalf("IP endpoint egress %+v", r)
 	}
 }
