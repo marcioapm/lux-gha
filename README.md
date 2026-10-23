@@ -635,13 +635,17 @@ listener; the webhook listener is unchanged. Runners use `publicURL` as
 - **`upstreamResultsURL`**: every request that is not a cache request
   (artifacts, logs, other Results calls) is passed here unchanged, method,
   path, query, headers and body included, and the response is streamed
-  back. The upstream is fixed; no request chooses it. At most 256
-  pass-through requests run at once; more get `503`.
+  back. The upstream is fixed; no request chooses it. Each client address
+  (the TCP peer; forwarded headers are ignored) may run 32 pass-through
+  requests at once, and the listener 4096 in total; past either limit the
+  request gets `503` with `Retry-After`. Behind a load balancer or NAT that
+  hides runner addresses, every runner shares one address and so the
+  32-request limit.
 - **Timeouts.** The cache listener has no overall body or response
   timeout, since a block upload or a proxied transfer can take minutes.
   Instead a Twirp request body must arrive within 30 s, and an upload or
-  proxied body, and every response, must make progress at least every
-  60 s, or the connection is closed.
+  proxied body, and every response, must move at least 64 KiB (or finish)
+  in each 60 s spent waiting on the client, or the connection is closed.
 - **`downloadURLTTL`** (1 m to 7 d): lifetime of a presigned S3 download URL.
 - **`ttl`** (at least 1 h): entries are deleted this long after they were
   saved. **`maxBytes`** (0: no cap): when entries exceed it, the oldest are

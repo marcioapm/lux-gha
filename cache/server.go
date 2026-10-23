@@ -91,14 +91,16 @@ type Server struct {
 	sign    signer
 	public  *url.URL
 	proxy   *httputil.ReverseProxy
-	proxies chan struct{}
+	proxies *proxyLimiter
 	log     *slog.Logger
 	logOnce *logLimiter
 	reaper  reaper
-	// twirpReadTimeout bounds reading a Twirp request; idleTimeout bounds
-	// the time without progress on an upload or proxied body.
+	// twirpReadTimeout bounds reading a Twirp request; progressWindow and
+	// progressBytes are the minimum-progress rule of upload and proxied
+	// bodies and of responses (see limits.go).
 	twirpReadTimeout time.Duration
-	idleTimeout      time.Duration
+	progressWindow   time.Duration
+	progressBytes    int64
 }
 
 func newServer(st store, o Options) (*Server, error) {
@@ -156,10 +158,11 @@ func newServer(st store, o Options) (*Server, error) {
 		public:  pub,
 		log:     o.Log,
 		logOnce: newLogLimiter(time.Minute, o.Now),
-		proxies: make(chan struct{}, maxProxyRequests),
+		proxies: newProxyLimiter(maxProxyPerClient, maxProxyRequests),
 
 		twirpReadTimeout: defaultTwirpReadTimeout,
-		idleTimeout:      defaultIdleTimeout,
+		progressWindow:   defaultProgressWindow,
+		progressBytes:    minProgressBytes,
 	}
 	s.proxy = newProxy(up, s.log)
 	s.reaper = reaper{st: st, lay: s.lay, ttl: o.TTL, maxBytes: o.MaxBytes, timeout: o.ReapInterval, now: o.Now, log: s.log}
@@ -176,45 +179,48 @@ const blobPath = "/_azblob/cache/archive"
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	// A keep-alive connection carries the previous response's write
-	// deadline; deadlineWriter sets a fresh one before every write, and the
+	// deadline; progressWriter sets a fresh one before every write, and the
 	// server's own final flush after the handler gets one too.
 	_ = rc.SetWriteDeadline(time.Time{})
-	defer func() { _ = rc.SetWriteDeadline(time.Now().Add(s.idleTimeout)) }()
-	w = &deadlineWriter{ResponseWriter: w, rc: rc, idle: s.idleTimeout}
+	defer func() { _ = rc.SetWriteDeadline(time.Now().Add(s.progressWindow)) }()
+	w = newProgressWriter(w, rc, s.progressWindow, s.progressBytes)
 	// A read deadline left set after the body is consumed would cancel the
 	// request's context (net/http's background read fails), so it is set
-	// only for a non-empty body, and deadlineBody clears it at the end.
+	// only for a non-empty body, and progressBody clears it at the end.
 	hasBody := r.ContentLength != 0
 	switch {
 	case strings.HasPrefix(r.URL.Path, twirpPrefix):
 		if hasBody {
 			// Also bounds the drain of an unread body after a rejection.
 			_ = rc.SetReadDeadline(time.Now().Add(s.twirpReadTimeout))
-			r.Body = &deadlineBody{ReadCloser: r.Body, rc: rc, remaining: r.ContentLength}
+			r.Body = newProgressBody(r, rc, 0, 0)
 		}
 		s.serveTwirp(w, r, strings.TrimPrefix(r.URL.Path, twirpPrefix))
 	case r.URL.Path == blobPath:
 		if hasBody {
-			_ = rc.SetReadDeadline(time.Now().Add(s.idleTimeout))
-			r.Body = &deadlineBody{ReadCloser: r.Body, rc: rc, idle: s.idleTimeout, remaining: r.ContentLength}
+			// Also bounds the drain of a body left unread by a rejection.
+			_ = rc.SetReadDeadline(time.Now().Add(s.progressWindow))
+			r.Body = newProgressBody(r, rc, s.progressWindow, s.progressBytes)
 		}
 		s.serveBlob(w, r)
 	default:
-		select {
-		case s.proxies <- struct{}{}:
-			defer func() { <-s.proxies }()
-		default:
-			if s.logOnce.allow("proxy-full") {
-				s.log.Warn("cache: too many concurrent pass-through requests; answering 503 (logged once a minute)", "limit", cap(s.proxies))
+		client := clientOf(r)
+		release, refused := s.proxies.acquire(client)
+		if release == nil {
+			if s.logOnce.allow("proxy-full:" + refused) {
+				s.log.Warn("cache: too many concurrent pass-through requests; answering 503 (logged once a minute)",
+					"limit", refused, "client", client, "per_client", s.proxies.perClient, "total", s.proxies.total)
 			}
+			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		defer release()
 		// A request without a body keeps http.NoBody, which ReverseProxy
 		// recognises.
 		if hasBody {
-			_ = rc.SetReadDeadline(time.Now().Add(s.idleTimeout))
-			r.Body = &deadlineBody{ReadCloser: r.Body, rc: rc, idle: s.idleTimeout, remaining: r.ContentLength}
+			_ = rc.SetReadDeadline(time.Now().Add(s.progressWindow))
+			r.Body = newProgressBody(r, rc, s.progressWindow, s.progressBytes)
 		}
 		s.proxy.ServeHTTP(w, r)
 	}

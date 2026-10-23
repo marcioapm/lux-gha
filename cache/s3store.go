@@ -38,7 +38,7 @@ type s3Store struct {
 	// manifest GET, DeleteObjects, multipart create and abort); copyTimeout
 	// bounds one part copy and the multipart complete, which move or
 	// stitch up to gigabytes server-side. A PutObject has no timeout of
-	// its own: it streams a client's body, which has an idle deadline.
+	// its own: it streams a client's body, which has a minimum-progress deadline.
 	controlTimeout time.Duration
 	copyTimeout    time.Duration
 }

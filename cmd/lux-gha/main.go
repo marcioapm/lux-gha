@@ -173,7 +173,7 @@ func startCache(ctx context.Context, cc *config.Cache, log *slog.Logger, errc ch
 	}
 	// No server-wide body or write timeout: an upload block or a proxied
 	// artifact transfer can take many minutes. The cache handler sets
-	// per-request read and idle-progress deadlines instead.
+	// per-request read and minimum-progress deadlines instead.
 	srv := &http.Server{Handler: cs, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	ln, err := net.Listen("tcp", cc.Listen)
 	if err != nil {
