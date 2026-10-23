@@ -128,13 +128,23 @@ func (r *Reconciler) noteInProgress(repository string, runner string, jobID int6
 
 // noteCompleted records a signed completed delivery naming one of this
 // instance's runners. A JIT runner executes one job, so the runner is done.
-func (r *Reconciler) noteCompleted(runner string) {
-	if r.att == nil || !strings.HasPrefix(runner, r.instancePrefix()) {
+// The delivery must come from the runner's own repository: another
+// repository of the installation can register a runner of any name and
+// have GitHub sign a delivery for it.
+func (r *Reconciler) noteCompleted(repository, runner string) {
+	if r.att == nil {
+		return
+	}
+	repoID, ok := r.ParseRunner(runner)
+	if !ok {
 		return
 	}
 	now := r.now()
 	r.att.mu.Lock()
 	defer r.att.mu.Unlock()
+	if full, known := r.att.names[repoID]; !known || !strings.EqualFold(full, repository) {
+		return
+	}
 	for name, at := range r.att.completed {
 		if now.Sub(at) > completedTTL {
 			delete(r.att.completed, name)

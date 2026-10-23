@@ -554,6 +554,43 @@ func TestRegistryRefusesAfterTheJobOrRunEnds(t *testing.T) {
 	}
 }
 
+// A signed completed delivery from another repository of the installation
+// that names this repository's runner (its admin registered a runner of
+// that name) leaves the runner's credentials working.
+func TestRegistryIgnoresACompletedDeliveryFromAnotherRepository(t *testing.T) {
+	l := newListener(t)
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	token := identity.Token(testIdentityKey, runner)
+	if rec := l.post(registry.CredentialsPath, token); rec.Code != http.StatusOK {
+		t.Fatalf("before: %d", rec.Code)
+	}
+	hook, err := l.rec.Webhook([]byte("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := webhookEvent("completed", runner, 7)
+	ev.Repository = "acme/gadgets"
+	if err := hook.OnWorkflowJob(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if l.rec.RunnerCompleted(runner) {
+		t.Fatal("another repository's delivery recorded the runner completed")
+	}
+	for _, path := range []string{registry.CredentialsPath, registry.RegistryPath} {
+		if rec := l.post(path, token); rec.Code != http.StatusOK {
+			t.Fatalf("%s after the other repository's delivery: %d", path, rec.Code)
+		}
+	}
+	// The same delivery from the runner's repository, in another case, ends it.
+	ev.Repository = "ACME/Widgets"
+	if err := hook.OnWorkflowJob(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if rec := l.post(registry.CredentialsPath, token); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("after its own repository's delivery: %d", rec.Code)
+	}
+}
+
 func TestRegistryUpstreamDownIs503(t *testing.T) {
 	for down, logged := range map[string]string{
 		"lux":               "registry: reading the runner's Lux Run failed",

@@ -22,7 +22,7 @@ func (r *Reconciler) Webhook(secret []byte) (*webhook.Handler, error) {
 			r.noteInProgress(ev.Repository, ev.RunnerName, ev.JobID)
 		}
 		if ev.Action == "completed" && ev.RunnerName != "" {
-			r.noteCompleted(ev.RunnerName)
+			r.noteCompleted(ev.Repository, ev.RunnerName)
 		}
 		if queuedMatching(ev) {
 			r.NoteQueued(ev.Repository, ev.JobID)
