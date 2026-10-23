@@ -183,6 +183,8 @@ func TestRegistryTrustTable(t *testing.T) {
 		{"same-repo pull_request from release/x", run("pull_request", "release/x", same), nil, "untrusted", read + "/pr"},
 		{"same-repo pull_request_target", run("pull_request_target", "main", same), nil, "untrusted", read + "/pr"},
 		{"merge_group", run("merge_group", "gh-readonly-queue/main/pr-1-abc", same), nil, "untrusted", read + "/pr"},
+		{"merge_group reporting main", run("merge_group", "main", same), nil, "untrusted", read + "/pr"},
+		{"push with an empty head_branch", run("push", "", same), nil, "untrusted", read + "/pr"},
 		{"issue_comment on main", run("issue_comment", "main", same), nil, "untrusted", read + "/pr"},
 		{"push on feature branch", run("push", "feature", same), nil, "untrusted", read + "/pr"},
 		{"push on releasex", run("push", "releasex/1", same), nil, "untrusted", read + "/pr"},
@@ -1004,5 +1006,69 @@ func TestRegistryConcurrentRequestsForOneRunner(t *testing.T) {
 	}
 	if calls := l.ghCalls(); calls[opGetRun] != 1 || len(l.sts.requests()) != 1 {
 		t.Fatalf("github %v, sts %d", calls, len(l.sts.requests()))
+	}
+}
+
+// GitHub moving the job to another runner ends this runner at the next
+// re-read, once jobTTL (60 s) has passed.
+func TestRegistryRefusesWhenTheJobMovesToAnotherRunner(t *testing.T) {
+	l := newListener(t)
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	if code, _ := l.registry(runner); code != http.StatusOK {
+		t.Fatalf("before: %d", code)
+	}
+	l.gh.editJob(7, func(j *fakeJob) { j.runner = "lux-gha-t1-1001-8-0" })
+	l.clock.Add(time.Minute)
+	if code, _ := l.registry(runner); code != http.StatusUnauthorized {
+		t.Fatalf("after the move: %d", code)
+	}
+}
+
+// gatedSTS blocks the first AssumeRole until release is closed and reports
+// each call on entered.
+type gatedSTS struct {
+	*fakeSTS
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedSTS) AssumeRole(ctx context.Context, in *sts.AssumeRoleInput, opts ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	g.entered <- struct{}{}
+	<-g.release
+	return g.fakeSTS.AssumeRole(ctx, in, opts...)
+}
+
+// While one request for a runner waits on STS, a second request for the
+// same runner waits for it instead of calling STS itself. The 200 ms wait
+// only bounds how long the test looks for a second call; with the
+// per-runner lock there is none, however long it looks.
+func TestRegistrySerialisesUpstreamCallsPerRunner(t *testing.T) {
+	l := newListener(t)
+	gate := &gatedSTS{fakeSTS: l.sts, entered: make(chan struct{}, 4), release: make(chan struct{})}
+	srv, err := registry.New(registry.Options{Config: l.cfg.Registry, InstallationID: l.cfg.GitHub.InstallationID, IdentityKey: testIdentityKey,
+		Runners: l.rec, GitHub: l.gh, STS: gate, Now: l.clock.Now, Log: slog.New(slog.NewTextHandler(l.logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.srv = srv
+	runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
+	token := identity.Token(testIdentityKey, runner)
+	codes := make(chan int, 2)
+	go func() { codes <- l.post(registry.RegistryPath, token).Code }()
+	<-gate.entered
+	go func() { codes <- l.post(registry.CredentialsPath, token).Code }()
+	select {
+	case <-gate.entered:
+		t.Error("a second request for the runner called STS while the first was in it")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(gate.release)
+	for range 2 {
+		if c := <-codes; c != http.StatusOK {
+			t.Fatalf("status %d", c)
+		}
+	}
+	if n := len(l.sts.requests()); n != 1 {
+		t.Fatalf("sts calls %d", n)
 	}
 }

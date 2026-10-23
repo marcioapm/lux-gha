@@ -177,6 +177,9 @@ func (f *fakeGitHub) TagCommit(_ context.Context, repo githubapp.Repository, nam
 	if err != nil {
 		return "", false, err
 	}
+	if name == "" {
+		return "", false, errors.New("fake: invalid ref name") // as githubapp's refSuffix
+	}
 	sha, ok := r.tags[name]
 	return sha, ok, nil
 }
@@ -187,6 +190,9 @@ func (f *fakeGitHub) BranchExists(_ context.Context, repo githubapp.Repository, 
 	r, err := f.gate(opBranch, repo, 0)
 	if err != nil {
 		return false, err
+	}
+	if name == "" {
+		return false, errors.New("fake: invalid ref name")
 	}
 	return r.branches[name], nil
 }
