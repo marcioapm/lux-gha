@@ -41,6 +41,9 @@ type Runners interface {
 	// CandidateJob returns the job a pass or a signed delivery last put on
 	// the runner; it is confirmed against GitHub before use.
 	CandidateJob(runner string) (repository string, jobID int64, ok bool)
+	// RunnerCompleted reports whether a signed workflow_job completed
+	// delivery named the runner.
+	RunnerCompleted(runner string) bool
 	// RepositoryName returns owner/name for a repository id.
 	RepositoryName(id int64) (string, bool)
 	// FindRunnerJob searches the repository's in_progress runs for the
@@ -79,8 +82,9 @@ const (
 )
 
 const (
-	// SessionDuration is the role-chaining maximum.
-	SessionDuration = time.Hour
+	// SessionDuration is STS's minimum. A session outlives its job by at
+	// most this long; the credential helper asks again when it expires.
+	SessionDuration = 15 * time.Minute
 	// refreshBefore: cached credentials are minted again this long before expiry.
 	refreshBefore = 5 * time.Minute
 	// liveTTL and jobTTL bound how long a positive Lux liveness check and an
@@ -298,6 +302,12 @@ func (s *Server) take(runner string) (*runnerState, bool) {
 // and that job's trust level. The caller holds st.mu.
 func (s *Server) resolve(ctx context.Context, st *runnerState, runner string, repoID int64, log *slog.Logger) (grant, error) {
 	if st.finished {
+		return grant{}, errUnauthorized
+	}
+	// A completed delivery ends the runner at once, inside the job re-read's
+	// jobTTL and the liveness check's liveTTL.
+	if s.o.Runners.RunnerCompleted(runner) {
+		st.finished, st.creds = true, nil
 		return grant{}, errUnauthorized
 	}
 	now := s.o.Now()

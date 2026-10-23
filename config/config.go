@@ -594,6 +594,9 @@ func (g *Registry) validate(listen string) []error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
 		u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		add("runnerEndpoint %q must be an http(s) URL with no path, credentials, query or fragment", g.RunnerEndpoint)
+	} else if u.Scheme == "http" && !loopbackHost(u.Hostname()) {
+		// Bearer tokens and AWS secret keys cross this hop.
+		add("runnerEndpoint %q must be https unless its host is loopback", g.RunnerEndpoint)
 	} else {
 		g.RunnerEndpoint = strings.TrimSuffix(g.RunnerEndpoint, "/")
 	}
@@ -610,6 +613,10 @@ func (g *Registry) LoopbackListen() bool {
 	if err != nil {
 		return false
 	}
+	return loopbackHost(host)
+}
+
+func loopbackHost(host string) bool {
 	ip := net.ParseIP(host)
 	return host == "localhost" || (ip != nil && ip.IsLoopback())
 }

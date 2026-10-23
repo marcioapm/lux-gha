@@ -46,3 +46,17 @@ func TestVerifyRejectsForgedAndMalformedTokens(t *testing.T) {
 		}
 	}
 }
+
+// The 43-character MAC carries 2 unused bits in its last character; a
+// token that differs only there decodes to the same MAC and is refused.
+func TestVerifyRejectsNonCanonicalMACEncoding(t *testing.T) {
+	good := Token(key, "lux-gha-prod-1001-7-0")
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	last := strings.IndexByte(alphabet, good[len(good)-1])
+	for bits := 1; bits <= 3; bits++ {
+		tok := good[:len(good)-1] + string(alphabet[last^bits])
+		if _, err := Verify(key, tok); err != ErrInvalid {
+			t.Errorf("trailing bits %d: err=%v", bits, err)
+		}
+	}
+}

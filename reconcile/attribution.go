@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/marcioapm/lux-gha/githubapp"
 )
@@ -23,13 +24,14 @@ type Assignment struct {
 // and of repository names. Passes and webhook goroutines write it; listener
 // goroutines read it.
 type attribution struct {
-	mu       sync.Mutex
-	byRunner map[string]Assignment
-	names    map[int64]string // repo id: owner/name
+	mu        sync.Mutex
+	byRunner  map[string]Assignment
+	names     map[int64]string     // repo id: owner/name
+	completed map[string]time.Time // runner name: when a completed delivery named it
 }
 
 func newAttribution() *attribution {
-	return &attribution{byRunner: map[string]Assignment{}, names: map[int64]string{}}
+	return &attribution{byRunner: map[string]Assignment{}, names: map[int64]string{}, completed: map[string]time.Time{}}
 }
 
 // observe replaces the assignments a repository read this pass holds with
@@ -72,6 +74,39 @@ func (r *Reconciler) noteInProgress(repository string, runner string, jobID, run
 	r.att.mu.Lock()
 	r.att.byRunner[runner] = Assignment{Repository: repository, JobID: jobID, RunID: runID}
 	r.att.mu.Unlock()
+}
+
+// completedTTL bounds how long a completed delivery is remembered; the
+// registry listener keeps its own refusal for the runner after reading it.
+const completedTTL = 2 * time.Hour
+
+// noteCompleted records a signed completed delivery naming one of this
+// instance's runners. A JIT runner executes one job, so the runner is done.
+func (r *Reconciler) noteCompleted(runner string) {
+	if r.att == nil || !strings.HasPrefix(runner, "lux-gha-"+r.cfg.Instance+"-") {
+		return
+	}
+	now := r.now()
+	r.att.mu.Lock()
+	defer r.att.mu.Unlock()
+	for name, at := range r.att.completed {
+		if now.Sub(at) > completedTTL {
+			delete(r.att.completed, name)
+		}
+	}
+	r.att.completed[runner] = now
+	delete(r.att.byRunner, runner)
+}
+
+// RunnerCompleted reports whether a signed completed delivery named runner.
+func (r *Reconciler) RunnerCompleted(runner string) bool {
+	if r.att == nil {
+		return false
+	}
+	r.att.mu.Lock()
+	defer r.att.mu.Unlock()
+	_, ok := r.att.completed[runner]
+	return ok
 }
 
 // RunnerAssignment returns the last job a pass or delivery put on runner.

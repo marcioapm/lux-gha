@@ -37,7 +37,9 @@ func Verify(key []byte, token string) (string, error) {
 	if len(parts) != 3 || parts[0] != version || !runnerNameRe.MatchString(parts[1]) {
 		return "", ErrInvalid
 	}
-	got, err := base64.RawURLEncoding.DecodeString(parts[2])
+	// Strict: a MAC string with non-zero trailing bits does not decode, so
+	// each runner has exactly one valid token.
+	got, err := base64.RawURLEncoding.Strict().DecodeString(parts[2])
 	if err != nil || !hmac.Equal(got, mac(key, parts[1])) {
 		return "", ErrInvalid
 	}

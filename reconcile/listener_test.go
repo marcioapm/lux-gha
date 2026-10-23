@@ -432,9 +432,10 @@ func TestRegistryRefusesWhatItCannotAttribute(t *testing.T) {
 }
 
 // Once the job completes, or the Run ends, both routes refuse, cached
-// credentials included.
+// credentials included. A signed completed delivery naming the runner
+// refuses at once, inside the job re-read's TTL.
 func TestRegistryRefusesAfterTheJobOrRunEnds(t *testing.T) {
-	for _, end := range []string{"job completes", "run ends"} {
+	for _, end := range []string{"job completes", "run ends", "completed delivery"} {
 		t.Run(end, func(t *testing.T) {
 			l := newListener(t)
 			runner := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("main"), HeadRepository: headRepo(1001)})
@@ -447,8 +448,24 @@ func TestRegistryRefusesAfterTheJobOrRunEnds(t *testing.T) {
 				l.gh.editJob(7, func(j *fakeJob) { j.status, j.conclusion = "completed", "success" })
 			case "run ends":
 				l.lux.end(l.runID("7"), "succeeded; resumePolicy never")
+			case "completed delivery":
+				hook, err := l.rec.Webhook([]byte("s"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				// A delivery naming another instance's runner is ignored.
+				for _, name := range []string{"lux-gha-t2-1001-7-0", runner} {
+					if err := hook.OnWorkflowJob(context.Background(), webhookEvent("completed", name, 7)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !l.rec.RunnerCompleted(runner) || l.rec.RunnerCompleted("lux-gha-t2-1001-7-0") {
+					t.Fatal("completed delivery not recorded for this instance's runner only")
+				}
 			}
-			l.clock.Add(time.Minute)
+			if end != "completed delivery" {
+				l.clock.Add(time.Minute)
+			}
 			for _, path := range []string{registry.CredentialsPath, registry.RegistryPath} {
 				if rec := l.post(path, token); rec.Code != http.StatusUnauthorized {
 					t.Fatalf("%s after the end: %d", path, rec.Code)
@@ -500,7 +517,7 @@ const untrustedWidgetsPolicy = `{"Version":"2012-10-17","Statement":[` +
 	`{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/*"},` +
 	`{"Effect":"Allow","Action":["ecr:CompleteLayerUpload","ecr:InitiateLayerUpload","ecr:PutImage","ecr:UploadLayerPart"],"Resource":"arn:aws:ecr:eu-west-1:123456789012:repository/acme/widgets/pr/*"}]}`
 
-// STS gets the role, a 3600 s session, the session tags, the job's session
+// STS gets the role, a 900 s session, the session tags, the job's session
 // policy and a session name; the credentials are cached per runner until five minutes before
 // they expire, then minted again. Neither credentials nor tokens are logged.
 func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
@@ -538,17 +555,17 @@ func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 	for _, tag := range in.Tags {
 		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
 	}
-	if aws.ToString(in.RoleArn) != "arn:aws:iam::123456789012:role/lux-gha-registry" || aws.ToInt32(in.DurationSeconds) != 3600 ||
+	if aws.ToString(in.RoleArn) != "arn:aws:iam::123456789012:role/lux-gha-registry" || aws.ToInt32(in.DurationSeconds) != 900 ||
 		!maps.Equal(tags, map[string]string{"lux-owner": "acme", "lux-repo": "widgets", "lux-trust": "untrusted"}) ||
 		aws.ToString(in.RoleSessionName) != "lux-gha-1001-7-1" || in.TransitiveTagKeys != nil || aws.ToString(in.Policy) != untrustedWidgetsPolicy {
 		t.Fatalf("AssumeRole input %+v tags %v", in, tags)
 	}
-	if first["Expiration"] != l.clock.Now().Add(time.Hour).UTC().Format(time.RFC3339) {
+	if first["Expiration"] != l.clock.Now().Add(15*time.Minute).UTC().Format(time.RFC3339) {
 		t.Fatalf("expiration %q", first["Expiration"])
 	}
 
 	// Cached across both routes until 5 minutes before expiry.
-	l.clock.Add(54 * time.Minute)
+	l.clock.Add(9 * time.Minute)
 	if again := creds(); again["AccessKeyId"] != first["AccessKeyId"] || len(l.sts.requests()) != 1 {
 		t.Fatalf("not cached: %v, %d calls", again["AccessKeyId"], len(l.sts.requests()))
 	}
@@ -558,7 +575,7 @@ func TestRegistryCredentialsAreTaggedCachedAndRefreshed(t *testing.T) {
 	l.clock.Add(time.Minute + time.Second)
 	refreshed := creds()
 	if refreshed["AccessKeyId"] == first["AccessKeyId"] || len(l.sts.requests()) != 2 ||
-		refreshed["Expiration"] != l.clock.Now().Add(time.Hour).UTC().Format(time.RFC3339) {
+		refreshed["Expiration"] != l.clock.Now().Add(15*time.Minute).UTC().Format(time.RFC3339) {
 		t.Fatalf("not refreshed: %v, %d calls", refreshed, len(l.sts.requests()))
 	}
 	for _, secret := range []string{first["SecretAccessKey"], first["SessionToken"], refreshed["SecretAccessKey"], token} {

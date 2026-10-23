@@ -370,6 +370,11 @@ func TestRegistryIsOptionalAndDefaulted(t *testing.T) {
 	if c, err = Parse(withRegistry(`"region"`, contract)); err != nil || !slices.Equal(c.Registry.TrustedRefs, []string{"refs/heads/release/*", "refs/tags/v*"}) {
 		t.Fatalf("contract list: %+v err=%v", c.Registry, err)
 	}
+	for _, loop := range []string{"http://127.0.0.1:8081", "http://localhost:8081", "http://[::1]:8081"} {
+		if c, err = Parse(withRegistry(`"https://gha.example.com/"`, `"`+loop+`"`)); err != nil || c.Registry.RunnerEndpoint != loop {
+			t.Fatalf("loopback http %s: %+v err=%v", loop, c.Registry, err)
+		}
+	}
 }
 
 func TestRegistryValidation(t *testing.T) {
@@ -386,6 +391,8 @@ func TestRegistryValidation(t *testing.T) {
 		"same listen":       {`"127.0.0.1:8081",`, `"127.0.0.1:8080",`, "registry.runnerListen must differ"},
 		"endpoint path":     {`example.com/"`, `example.com/runner"`, "registry.runnerEndpoint"},
 		"endpoint scheme":   {`"https://gha`, `"ftp://gha`, "registry.runnerEndpoint"},
+		"plain http":        {`"https://gha`, `"http://gha`, "must be https unless its host is loopback"},
+		"plain http to ip":  {`"https://gha.example.com/"`, `"http://192.0.2.10:8081"`, "must be https unless its host is loopback"},
 		"no key file":       {`"identityKeyFile": "/i"`, `"identityKeyFile": ""`, "registry.identityKeyFile"},
 		"unknown field":     {`"region"`, `"identityKey": "x", "region"`, "unknown field"},
 	} {

@@ -202,7 +202,7 @@ func TestRegistryRunsMayReachTheRunnerEndpoint(t *testing.T) {
 		}
 	}
 
-	ip := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "https://gha.example.com", "http://192.0.2.10:8081", 1)))
+	ip := newEnv(t, replace(`"repositories"`, strings.Replace(registryBlock, "https://gha.example.com", "https://192.0.2.10:8443", 1)))
 	ip.gh.queue(8, "queued", "lux-big")
 	ip.pass()
 	if r := ip.lux.all(); len(r) != 1 || len(r[0].spec.Egress) != 0 {

@@ -500,6 +500,9 @@ echo "$reg" | env -i PATH="$root/bin:/usr/bin:/bin" FAKE_CASE_DIR="$d" LUXGHA_RE
 	AWS_ACCESS_KEY_ID=job-key AWS_SECRET_ACCESS_KEY=job-secret AWS_SESSION_TOKEN=job-token AWS_PROFILE=job \
 	AWS_ROLE_ARN=arn:aws:iam::123456789012:role/job AWS_WEB_IDENTITY_TOKEN_FILE=/job/token AWS_CONFIG_FILE=/job/config \
 	AWS_SHARED_CREDENTIALS_FILE=/job/credentials AWS_DEFAULT_PROFILE=job AWS_REGION=us-east-1 \
+	AWS_ENDPOINT_URL=http://localhost:4566 AWS_ENDPOINT_URL_ECR=http://localhost:4566 \
+	AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.2/job AWS_CONTAINER_AUTHORIZATION_TOKEN=job \
+	AWS_CA_BUNDLE=/job/ca.pem AWS_USE_FIPS_ENDPOINT=true AWS_DEFAULT_REGION=us-east-1 \
 	sh "$wrapper" get >"$d/out" 2>"$d/err" || rc=$?
 check "exits with the helper's status" '[ "$rc" = 0 ]'
 check "the helper sees exactly the registry profile's AWS env" '[ "$(cat "$d/helper.env")" = "$(printf "%s\n" AWS_CONFIG_FILE=/etc/lux-gha/aws-config AWS_ECR_DISABLE_CACHE=true AWS_PROFILE=lux-gha-registry AWS_REGION=eu-west-1)" ]'
