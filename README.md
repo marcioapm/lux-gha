@@ -845,7 +845,7 @@ are unset.
   "roleArn": "arn:aws:iam::123456789012:role/lux-gha-registry",
   "region": "eu-west-1",
   "host": "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
-  "trustedRefs": ["<default branch>", "refs/heads/release/*", "refs/tags/v*"],
+  "trustedRefs": ["refs/heads/release/*", "refs/tags/v*"],
   "runnerListen": "127.0.0.1:8081",
   "runnerEndpoint": "https://gha.example.com",
   "identityKeyFile": "/etc/lux-gha/registry-identity-key"
@@ -854,13 +854,15 @@ are unset.
 
 - **`roleArn`**, **`region`**, **`host`**: the registry role the bridge assumes, and the registry
   (`<account>.dkr.ecr.<region>.amazonaws.com`, in `region`).
-- **`trustedRefs`** (default as shown): `<default branch>` is the repository's default branch, read from
-  GitHub; the other entries are `refs/heads/` or `refs/tags/` globs (`path.Match`; `*` does not cross `/`).
+- **`trustedRefs`** (default as shown): `refs/heads/` or `refs/tags/` globs (`path.Match`; `*` does not
+  cross `/`). The repository's default branch, read from GitHub, is always trusted in addition, whatever the
+  list holds (`[]` trusts the default branch only).
 - **`runnerListen`**: the address of the **runner listener**, a plain-HTTP server separate from `listen` that
   serves only the two runner routes below. Keep it on loopback: the bridge logs a warning at startup when it is
   not, because the listener carries bearer tokens and AWS credentials in clear text.
 - **`runnerEndpoint`**: the URL Runs use to reach the listener (scheme, host and port only). Normally an
-  `https://` public hostname served by a tunnel to `runnerListen` ([Network](#network)).
+  `https://` public hostname served by a tunnel to `runnerListen` ([Network](#network)). It must be `https`
+  unless its host is loopback: the token and the returned AWS secret key cross it.
 - **`identityKeyFile`**: at least 32 random bytes (`head -c 32 /dev/urandom | base64 > …`), read like the
   other secret files; a trailing newline is stripped. There is no environment variable for it. Changing it
   invalidates the tokens of Runs already submitted.
@@ -887,8 +889,13 @@ Both take `Authorization: Bearer <token>` and answer only after these checks, ea
 from the request: the HMAC (constant time) → a live Lux Run of this instance with that runner name → the job
 GitHub shows `in_progress` on that runner ([Runner attribution](#runner-attribution); the jobs a pass
 already lists, a signed `in_progress` delivery naming the runner, or a search of the repository's
-`in_progress` runs at most every 5 s per runner, each confirmed with
-`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) → its workflow run → the trust level below.
+`in_progress` runs, each confirmed with `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) → its workflow
+run → the trust level below. The search runs at most every 5 s per repository, shared by every runner
+waiting on it, reads at most 20 pages of runs and jobs, and publishes every `in_progress` job it sees on
+this instance's runners, so a sibling runner then needs one job read. A delivery's candidate is kept until a
+pass lists its job completed or on another runner, the runner's Run ends, or 10 minutes pass. While GitHub
+rate-limits the installation, the listener answers `503` without calling it; a rate limit it meets also
+pauses the reconciler's passes, and the other way round.
 
 - `POST /runner/v1/registry` → `200 {"registry", "read", "push", "trust", "expiresAt"}`: `read` is
   `<host>/<owner>/<repo>`; `push` is the same for `trusted`, `<host>/<owner>/<repo>/pr` for `untrusted` and
@@ -903,33 +910,46 @@ already lists, a signed `in_progress` delivery naming the runner, or a search of
 |---|---|
 | `401` | Missing or bad token, a runner name of another instance, no live Run, the job has completed, or the repository's name is not a registry path |
 | `409` | The Run is live but GitHub does not show a job `in_progress` on the runner yet |
-| `503` | Lux, GitHub or STS failed, or the token exceeded its rate limit (a bucket of 30, refilled at one request per 2 s) |
+| `503` | Lux, GitHub or STS failed, GitHub is rate-limiting the installation, or the token exceeded its rate limit (a bucket of 30, refilled at one request per 2 s, charged only by a request that calls Lux, GitHub or STS; answers from the runner's cache are free) |
 | `204` | Reserved for a registry that is not configured; the listener does not run then |
 
-The resolved job is kept per runner (a JIT runner runs one job) and re-read at most once a minute, so a
-completed job is refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with
-`DurationSeconds` 3600, session tags `lux-owner=<owner>`, `lux-repo=<repo>` and `lux-trust=<level>`, the
+The resolved job is kept per runner (a JIT runner runs one job) and re-read at most once a minute. A signed
+`workflow_job` `completed` delivery naming the runner refuses it at once; without one, a completed job is
+refused within a minute. Credentials are an STS `AssumeRole` of `roleArn` with `DurationSeconds` 900 (15
+minutes, STS's minimum), session tags `lux-owner=<owner>`, `lux-repo=<repo>` and `lux-trust=<level>`, the
 [session policy](#session-policy) below and session name `lux-gha-<repo id>-<job id>-<attempt>` (at most 64
-characters of `[\w+=,.@-]`), cached per runner until 5 minutes before they expire. They are never logged;
-each resolution and mint logs one line with the runner, job, event and trust level.
+characters of `[\w+=,.@-]`), cached per runner until 5 minutes before they expire; the credential helper asks
+again on demand. They are never logged; each resolution and mint logs one line with the runner, job, event
+and trust level.
+
+**Lifetime after the job.** Refusing the runner stops new credentials, not ones already handed out. A
+process a step leaves running can keep using the last STS session for up to 15 minutes. An ECR
+authorization token that `docker-credential-ecr-login` obtained with it (`ecr:GetAuthorizationToken`) is
+valid for 12 hours, whatever the session's lifetime, and is held by whatever logged in with it; ECR offers
+no way to revoke it.
 
 ### Trust levels
 
 Decided for the job the runner is executing, from its workflow run's `event`, `head_branch`,
 `head_sha` and `head_repository`; the first row that matches wins.
 
-| Level | Workflow run | Pull `<owner>/<repo>/*` | Push |
-|---|---|---|---|
-| `read-only` | `pull_request`, `pull_request_review`, `pull_request_review_comment` from a fork (`head_repository.id` ≠ the repository's) | yes | nothing |
-| `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<owner>/<repo>/*` |
-| `untrusted` | anything else: a same-repository pull request, `pull_request_target`, `merge_group`, a push or dispatch on another branch | yes | `<owner>/<repo>/pr/*` |
-| none (`401`/`409`/`503`) | the job cannot be resolved, the Run is not live, the job is not `in_progress` on this runner, or an upstream is down | | |
+| # | Level | Workflow run | Pull `<owner>/<repo>/*` | Push |
+|---|---|---|---|---|
+| 1 | `read-only` | any event whose `head_repository` is missing or is another repository (`head_repository.id` ≠ the repository's): a pull request, review or review comment from a fork, `pull_request_target` from a fork, a `workflow_run` triggered from a fork | yes | nothing |
+| 2 | `untrusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` whose `head_branch` is both a tag at `head_sha` and a branch, or neither | yes | `<owner>/<repo>/pr/*` |
+| 3 | `trusted` | `push`, `workflow_dispatch`, `schedule`, `release` or `workflow_run` on `refs/heads/<default branch>` (always) or on a ref matching `trustedRefs` | yes, except `…/pr/*` | `<owner>/<repo>/*` |
+| 4 | `untrusted` | anything else: a same-repository pull request (from any branch, `release/*` included), same-repository `pull_request_target`, `merge_group`, `issue_comment`, a push or dispatch on another branch, a tag named like a trusted branch | yes | `<owner>/<repo>/pr/*` |
+| | none (`401`/`409`/`503`) | the job cannot be resolved, the Run is not live, the job is not `in_progress` on this runner, or an upstream is down | | |
 
-The API reports a tag push by the tag's name in `head_branch`. A name a trusted `refs/tags/` pattern could
-match is taken as a tag only if the repository's tag of that name (`GET /repos/{owner}/{repo}/tags`, up to
-10 pages) points at the run's `head_sha`; otherwise it is a branch. A reusable workflow's jobs report the
-caller's event. "Trusted" relies on branch and tag protection for the trusted refs: anyone who can push a
-`release/*` branch gets trusted credentials.
+The API reports a tag push, a release or a dispatch on a tag by the tag's name in `head_branch`, like a
+branch. For the events of rows 2 and 3 the bridge resolves the name with
+`GET /repos/{owner}/{repo}/commits/refs/tags/{name}` (which peels an annotated tag): a tag of that name at
+the run's `head_sha` makes the ref `refs/tags/<name>`. `GET /repos/{owner}/{repo}/git/ref/heads/{name}`
+confirms a branch. A name that is both is untrusted, and so is one that is neither (a deleted branch). A
+tag named `main` therefore resolves to `refs/tags/main`, which no trusted pattern matches. The answer is
+cached per repository, name and commit for 10 minutes. A reusable workflow's jobs report the caller's
+event. "Trusted" relies on branch and tag protection for the trusted refs: anyone who can push a
+`release/*` branch or a `v*` tag gets trusted credentials.
 
 ### IAM the operator provides
 
@@ -938,8 +958,8 @@ Only repositories of the GitHub App installation get runners, so only they get c
 - **Bridge principal** (the instance role): `sts:AssumeRole` and `sts:TagSession` on the registry role.
 - **Registry role trust policy**: allow the bridge principal `sts:AssumeRole` and `sts:TagSession`, requiring
   `aws:RequestTag/lux-owner`, `aws:RequestTag/lux-repo`, `aws:RequestTag/lux-trust` in `trusted`,
-  `untrusted`, `read-only`, and `sts:RoleSessionName` like `lux-gha-*`. Session chaining caps the session at
-  1 hour.
+  `untrusted`, `read-only`, and `sts:RoleSessionName` like `lux-gha-*`. The bridge asks for 15-minute
+  sessions; role chaining would cap them at 1 hour.
 - **Registry role permissions**, on `repository/${aws:PrincipalTag/lux-owner}/${aws:PrincipalTag/lux-repo}/*`
   and keyed on `aws:PrincipalTag/lux-trust`:
   - `ecr:GetAuthorizationToken` on `*`;
@@ -953,9 +973,15 @@ Only repositories of the GitHub App installation get runners, so only they get c
 - **Repositories are created on push by ECR repository creation templates**, one per owner prefix (a
   template's prefix `acme` covers `acme/…`), applied for `CREATE_ON_PUSH`. Without a template for its owner,
   a push to a repository that does not exist fails. The template carries the lifecycle policy, by tag:
-  untagged images expire after 1 day; every tag except `v*`, `release-*` and `latest` (pull-request, cache
-  and content-hash tags) after 14 days; `v*` and `release-*` are kept. Templates apply only when ECR
-  creates a repository, so existing repositories keep their own settings.
+  untagged images expire after 1 day; every other tag except `v*` and `release-*` expires 14 days after it
+  was pushed: pull-request, cache and content-hash tags, and `latest` too, so a `latest` not pushed again
+  within 14 days goes; `v*` and `release-*` are kept. Templates apply only when ECR creates a repository, so
+  existing repositories keep their own settings.
+- **A rename frees the old path.** Paths are the repository's current owner/name, not its id. After a
+  rename or transfer, the repository's new jobs use the new path (within the 10-minute name cache), and the
+  images under the old path stay. Another installed repository that later takes the old owner/name gets
+  that path, with the images left there, including any that the old repository's trusted jobs pushed.
+  Delete or move the old path's images when a repository is renamed and its name may be reused.
 
 ### Session policy
 
