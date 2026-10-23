@@ -320,16 +320,71 @@ func TestRegistryRefResolutionIsCachedAndFailsClosed(t *testing.T) {
 	}
 	l.pass()
 	for _, op := range []string{opTags, opBranch} {
-		l.gh.fail = func(o, _ string, _ int) error {
-			return map[bool]error{true: &githubapp.APIError{StatusCode: http.StatusBadGateway}}[o == op]
-		}
-		if code, _ := l.registry(c); code != http.StatusServiceUnavailable {
-			t.Fatalf("%s down: %d", op, code)
+		for _, status := range []int{http.StatusBadGateway, http.StatusForbidden, http.StatusBadRequest} {
+			l.gh.fail = func(o, _ string, _ int) error {
+				return map[bool]error{true: &githubapp.APIError{StatusCode: status}}[o == op]
+			}
+			if code, _ := l.registry(c); code != http.StatusServiceUnavailable {
+				t.Fatalf("%s answering %d: %d", op, status, code)
+			}
 		}
 	}
 	l.gh.fail = nil
 	if code, got := l.registry(c); code != http.StatusOK || got.Trust != "trusted" {
 		t.Fatalf("after recovery: %d %+v", code, got)
+	}
+}
+
+// A cached ref answer holds for one commit: a run of another commit on the
+// same name, inside the TTL, is resolved afresh.
+func TestRegistryRefCacheIsPerCommit(t *testing.T) {
+	l := newListener(t)
+	l.gh.tag("v1", fakeSHA(70))
+	a := l.provisionAndRun(7, githubapp.WorkflowRun{Event: "push", HeadBranch: str("v1"), HeadRepository: headRepo(1001)})
+	if _, got := l.registry(a); got.Trust != "trusted" {
+		t.Fatalf("tag push: %+v", got)
+	}
+	l.gh.branch(true, "v1")
+	l.clock.Add(searchGap)
+	// Run 80, head fakeSHA(80): on branch v1; tag v1 is at another commit.
+	b := l.provisionAndRun(8, githubapp.WorkflowRun{Event: "push", HeadBranch: str("v1"), HeadRepository: headRepo(1001)})
+	if code, got := l.registry(b); code != http.StatusOK || got.Trust != "untrusted" {
+		t.Fatalf("branch v1 at another commit within the TTL: %d %+v", code, got)
+	}
+}
+
+// A ref answer is reused for less than repositoryTTL (10 min) whether or
+// not the once-a-minute prune has dropped it: a name that becomes
+// ambiguous at the same commit keeps its answer inside the TTL and loses it
+// after.
+func TestRegistryRefCacheExpires(t *testing.T) {
+	l := newListener(t)
+	l.gh.tag("v1", fakeSHA(70))
+	a := l.provisionAndRun(7, githubapp.WorkflowRun{ID: 70, Event: "push", HeadBranch: str("v1"), HeadRepository: headRepo(1001)})
+	if _, got := l.registry(a); got.Trust != "trusted" {
+		t.Fatalf("tag push: %+v", got)
+	}
+	l.gh.branch(true, "v1")
+	job := func(id int64) string {
+		t.Helper()
+		l.gh.queueIn(widgets, 70, id, "queued", "self-hosted", "lux")
+		l.pass()
+		name := "lux-gha-t1-1001-" + strconv.FormatInt(id, 10) + "-0"
+		if err := l.gh.pick(name, id); err != nil {
+			t.Fatal(err)
+		}
+		l.pass()
+		return name
+	}
+	// This request also prunes, keeping the 9.5-minute-old answer.
+	l.clock.Add(9*time.Minute + 30*time.Second)
+	if _, got := l.registry(job(8)); got.Trust != "trusted" {
+		t.Fatalf("inside the TTL: %+v", got)
+	}
+	// 40 s after that prune, so no prune: the TTL alone decides.
+	l.clock.Add(40 * time.Second)
+	if code, got := l.registry(job(9)); code != http.StatusOK || got.Trust != "untrusted" {
+		t.Fatalf("after the TTL, v1 both a tag at the head and a branch: %d %+v", code, got)
 	}
 }
 
