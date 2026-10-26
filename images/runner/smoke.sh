@@ -106,8 +106,9 @@ run -e WANT_RUNNER="$runner_version" -e WANT_GH="$(containerfile_arg GH_VERSION)
 	# gh for the image architecture, at the pinned version.
 	m=$(od -An -tx1 -j18 -N1 /usr/local/bin/gh | tr -d " ")
 	[ "$m" = "$WANT_ELF" ] || { echo "gh ELF machine $m, want $WANT_ELF" >&2; exit 1; }
-	gh --version | grep -q "^gh version $WANT_GH " || { echo "gh is $(gh --version | head -1), pinned $WANT_GH" >&2; exit 1; }
-	gh --version | head -1
+	v=$(gh --version | head -1)
+	echo "$v"
+	echo "$v" | grep -q "^gh version $WANT_GH " || { echo "gh is $v, pinned $WANT_GH" >&2; exit 1; }
 	for f in /usr/local/bin/docker-credential-lux-gha /usr/local/bin/lux-gha-aws-credentials /usr/local/lib/lux-gha/job-started.sh; do
 		[ "$(stat -c "%U %a" "$f")" = "root 755" ] || { echo "$f is $(stat -c "%U %a" "$f"), want root 755" >&2; exit 1; }
 	done
