@@ -80,7 +80,7 @@ echo "image $got"
 
 echo "== tools"
 # shellcheck disable=SC2016 # the script expands inside the container
-run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_machine" --entrypoint sh "$TAG" -euc '
+run -e WANT_RUNNER="$runner_version" -e WANT_GH="$(containerfile_arg GH_VERSION)" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_machine" --entrypoint sh "$TAG" -euc '
 	[ "$(dpkg --print-architecture)" = "$WANT_ARCH" ] || { echo "dpkg architecture $(dpkg --print-architecture), want $WANT_ARCH" >&2; exit 1; }
 	# e_machine (low byte, offset 18): b7 aarch64, 3e x86_64. Under binfmt
 	# emulation a runner tarball of the wrong architecture would still run.
@@ -103,6 +103,13 @@ run -e WANT_RUNNER="$runner_version" -e WANT_ARCH="$arch" -e WANT_ELF="$elf_mach
 	m=$(od -An -tx1 -j18 -N1 /usr/local/bin/docker-credential-ecr-login | tr -d " ")
 	[ "$m" = "$WANT_ELF" ] || { echo "docker-credential-ecr-login ELF machine $m, want $WANT_ELF" >&2; exit 1; }
 	docker-credential-ecr-login -v
+	# gh for the image architecture, at the pinned version.
+	m=$(od -An -tx1 -j18 -N1 /usr/local/bin/gh | tr -d " ")
+	[ "$m" = "$WANT_ELF" ] || { echo "gh ELF machine $m, want $WANT_ELF" >&2; exit 1; }
+	gh --version | grep -q "^gh version $WANT_GH " || { echo "gh is $(gh --version | head -1), pinned $WANT_GH" >&2; exit 1; }
+	gh --version | head -1
+	# getcap/setcap (libcap2-bin), which jobs use to inspect or set file capabilities.
+	command -v setcap >/dev/null || { echo "setcap is missing" >&2; exit 1; }
 	for f in /usr/local/bin/docker-credential-lux-gha /usr/local/bin/lux-gha-aws-credentials /usr/local/lib/lux-gha/job-started.sh; do
 		[ "$(stat -c "%U %a" "$f")" = "root 755" ] || { echo "$f is $(stat -c "%U %a" "$f"), want root 755" >&2; exit 1; }
 	done
