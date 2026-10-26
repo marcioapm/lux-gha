@@ -13,7 +13,10 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 - Docker Engine 29.9.0 from Docker's apt repository: `docker-ce`, `docker-ce-cli`, `docker-ce-rootless-extras`,
   `containerd.io`, buildx 0.38.0, compose 5.6.0. Also `uidmap` (`newuidmap`/`newgidmap` with file
   capabilities only), `fuse-overlayfs`, `slirp4netns`, `iptables` and `iproute2`.
-- `git`, `curl`, `ca-certificates`, `jq`, `unzip`, `xz-utils`, `python3`. uv is not baked in: `astral-sh/setup-uv` installs it.
+- `git`, `curl`, `ca-certificates`, `jq`, `unzip`, `xz-utils`, `python3`, and `getcap`/`setcap` (`libcap2-bin`).
+  uv is not baked in: `astral-sh/setup-uv` installs it.
+- GitHub CLI 2.103.3 (`gh`) in `/usr/local/bin`, from the release tarball checked against its published SHA-256
+  for each architecture. Hosted runners ship it, and jobs call it without a setup action.
 - `socat` and the AWS Session Manager plugin 1.2.896.0 (`session-manager-plugin`, checked against a pinned
   SHA-256 per architecture), for `aws ssm start-session` port forwarding, which jobs otherwise install with
   `sudo`.
