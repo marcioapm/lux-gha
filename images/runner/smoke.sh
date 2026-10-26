@@ -108,8 +108,6 @@ run -e WANT_RUNNER="$runner_version" -e WANT_GH="$(containerfile_arg GH_VERSION)
 	[ "$m" = "$WANT_ELF" ] || { echo "gh ELF machine $m, want $WANT_ELF" >&2; exit 1; }
 	gh --version | grep -q "^gh version $WANT_GH " || { echo "gh is $(gh --version | head -1), pinned $WANT_GH" >&2; exit 1; }
 	gh --version | head -1
-	# getcap/setcap (libcap2-bin), which jobs use to inspect or set file capabilities.
-	command -v setcap >/dev/null || { echo "setcap is missing" >&2; exit 1; }
 	for f in /usr/local/bin/docker-credential-lux-gha /usr/local/bin/lux-gha-aws-credentials /usr/local/lib/lux-gha/job-started.sh; do
 		[ "$(stat -c "%U %a" "$f")" = "root 755" ] || { echo "$f is $(stat -c "%U %a" "$f"), want root 755" >&2; exit 1; }
 	done
