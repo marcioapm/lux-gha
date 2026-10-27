@@ -94,7 +94,25 @@ build.
 - Node: set `NODE_VERSION` and `NODE_SHA256_ARM64`/`_AMD64` from `nodejs.org/dist/v<version>/SHASUMS256.txt`
   (`node-v<version>-linux-<arm64|x64>.tar.xz`).
 
-A workflow that pins a different version still works: its setup action downloads that version as before.
+Other Node and Java versions are downloaded by their setup actions as before. For Python,
+`actions/setup-python` downloads an uncached version only if `actions/python-versions` publishes an
+Ubuntu **26.04** asset for that version and architecture; it does not fall back to a 24.04 build.
+For example, 3.11.17 has 26.04 assets, while 3.11.14 and 3.12.12 do not (manifest checked 2026-10-27).
+Update an exact pin to a release with 26.04 assets, or keep a 24.04 image/use another Python provider
+for unsupported versions. Do not silently substitute a different Python version.
+
+### Migrating jobs from Ubuntu 24.04
+
+The default PATH uses Ubuntu's **system Python 3.14**, not the cached CPython 3.11.17. Jobs invoking
+`python3` without a setup action therefore move from 3.12 to 3.14. In Python 3.14,
+`asyncio.get_event_loop()` raises `RuntimeError` if no event loop has been set, and the default
+multiprocessing start method on Linux changes from `fork` to `forkserver`; scripts relying on
+implicit loops or inherited fork state need adjustment. Select the intended interpreter with
+`actions/setup-python` (subject to the asset constraint above), or explicitly update the script.
+Native smoke asserts Ubuntu 26.04 and system Python 3.14 separately from the cached-Python tests.
+
+See the [Python 3.14 changes](https://docs.python.org/3/whatsnew/3.14.html) and the
+[available setup-python builds](https://github.com/actions/python-versions/blob/main/versions-manifest.json).
 
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is
