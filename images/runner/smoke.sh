@@ -94,7 +94,11 @@ run -e WANT_RUNNER="$runner_version" -e WANT_GH="$(containerfile_arg GH_VERSION)
 	docker --version
 	docker buildx version
 	docker compose version
+	. /etc/os-release
+	[ "$ID" = ubuntu ] && [ "$VERSION_ID" = 26.04 ] || { echo "want Ubuntu 26.04, got $PRETTY_NAME" >&2; exit 1; }
+	echo "$PRETTY_NAME"
 	python3 --version
+	python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
 	socat -V
 	session-manager-plugin --version
 	aws --version

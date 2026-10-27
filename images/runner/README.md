@@ -6,7 +6,7 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 
 ## Contents
 
-- `ubuntu:24.04`, pinned by its multi-arch index digest. Built and smoke-tested for `linux/arm64` and
+- `ubuntu:26.04`, pinned by its multi-arch index digest. Built and smoke-tested for `linux/arm64` and
   `linux/amd64`; the Containerfile selects the runner tarball and its hash by `TARGETARCH`.
 - [actions/runner](https://github.com/actions/runner) 2.338.0 in `/home/runner/actions-runner`. The
   tarball is checked against its published SHA-256, and `bin/installdependencies.sh` runs at build time.
@@ -56,7 +56,7 @@ setup-java v5.7.0 and v6.1.0, and setup-node v7.1.0. The cache is skipped when t
 `current`), which resolve the version remotely first. setup-java v6 names arm64 `aarch64` and v4/v5 name it
 `arm64`, hence the symlink, which has its own `.complete` marker.
 
-- Python is the `linux-24.04` build from `actions/python-versions`, installed by its own `setup.sh` as
+- Python is the `linux-26.04` build from `actions/python-versions`, installed by its own `setup.sh` as
   setup-python does, so its RUNPATH `/opt/hostedtoolcache/Python/3.11.17/<arch>/lib` holds.
 - The JDK directory name is not the JDK's version. setup-java takes the Adoptium API's `version_data.semver`
   (`25.0.4+101.0.LTS` for the release `jdk-25.0.4.1+1`) and replaces its first `+` with `-`. Any other name is a
@@ -84,7 +84,7 @@ build.
 
 - Python: take the newest stable `3.11.x` entry from `actions/python-versions`' `versions-manifest.json`.
   Set `PYTHON_VERSION`, set `PYTHON_RELEASE` to the release tag in its `download_url` (`<version>-<run id>`), and
-  set `PYTHON_SHA256_ARM64`/`_AMD64` to the `digest` of the `python-<v>-linux-24.04-<arm64|x64>.tar.gz` assets in
+  set `PYTHON_SHA256_ARM64`/`_AMD64` to the `digest` of the `python-<v>-linux-26.04-<arm64|x64>.tar.gz` assets in
   `api.github.com/repos/actions/python-versions/releases/tags/<tag>`.
 - JDK: query `api.adoptium.net/v3/assets/feature_releases/25/ga?os=linux&image_type=jdk&jvm_impl=hotspot&architecture=<aarch64|x64>`.
   Set `JAVA_RELEASE` to `release_name`, `JAVA_TOOLCACHE_VERSION` to `version_data.semver` with its first `+`
@@ -94,7 +94,25 @@ build.
 - Node: set `NODE_VERSION` and `NODE_SHA256_ARM64`/`_AMD64` from `nodejs.org/dist/v<version>/SHASUMS256.txt`
   (`node-v<version>-linux-<arm64|x64>.tar.xz`).
 
-A workflow that pins a different version still works: its setup action downloads that version as before.
+Other Node and Java versions are downloaded by their setup actions as before. For Python,
+`actions/setup-python` downloads an uncached version only if `actions/python-versions` publishes an
+Ubuntu **26.04** asset for that version and architecture; it does not fall back to a 24.04 build.
+For example, 3.11.17 has 26.04 assets, while 3.11.14 and 3.12.12 do not (manifest checked 2026-10-27).
+Update an exact pin to a release with 26.04 assets, or keep a 24.04 image/use another Python provider
+for unsupported versions. Do not silently substitute a different Python version.
+
+### Migrating jobs from Ubuntu 24.04
+
+The default PATH uses Ubuntu's **system Python 3.14**, not the cached CPython 3.11.17. Jobs invoking
+`python3` without a setup action therefore move from 3.12 to 3.14. In Python 3.14,
+`asyncio.get_event_loop()` raises `RuntimeError` if no event loop has been set, and the default
+multiprocessing start method on Linux changes from `fork` to `forkserver`; scripts relying on
+implicit loops or inherited fork state need adjustment. Select the intended interpreter with
+`actions/setup-python` (subject to the asset constraint above), or explicitly update the script.
+Native smoke asserts Ubuntu 26.04 and system Python 3.14 separately from the cached-Python tests.
+
+See the [Python 3.14 changes](https://docs.python.org/3/whatsnew/3.14.html) and the
+[available setup-python builds](https://github.com/actions/python-versions/blob/main/versions-manifest.json).
 
 The entrypoint follows the [runner entrypoint contract](../../README.md#runner-entrypoint-contract).
 If `dockerd-rootless.sh` is present and `DOCKER_HOST` is a `unix://` socket (the image default is

@@ -4,8 +4,8 @@
 # rootless dockerd and BuildKit preload checks (smoke.sh --privileged) have
 # run natively on arm64, and on amd64 only in CI's native image job.
 
-# ubuntu:24.04, multi-arch index digest (resolved 2026-10-10).
-ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+# ubuntu:26.04, multi-arch index digest (resolved 2026-10-27).
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:19fcd1bf268f02b60aca3bd30bd8a6d9a11759a430e32921833e65f16d87348a
 
 # moby/buildkit for setup-buildx-action's docker-container builder, shipped
 # as an OCI archive that the entrypoint loads into the per-Run Docker store.
@@ -85,12 +85,12 @@ ARG RUNNER_RESULTS_URL_LITERALS=1
 # release notes (also the asset digests the GitHub releases API reports).
 ARG RUNNER_SHA256_ARM64=628b4a7258487b80c1d3c221095a7ded349f5ae0175fd3dfab708d07428f041b
 ARG RUNNER_SHA256_AMD64=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
-# Versions from download.docker.com/linux/ubuntu noble stable, present for
+# Versions from download.docker.com/linux/ubuntu resolute stable, present for
 # both arm64 and amd64.
-ARG DOCKER_VERSION=5:29.9.0-1~ubuntu.24.04~noble
-ARG CONTAINERD_VERSION=2.4.1-2~ubuntu.24.04~noble
-ARG BUILDX_VERSION=0.38.0-1~ubuntu.24.04~noble
-ARG COMPOSE_VERSION=5.6.0-1~ubuntu.24.04~noble
+ARG DOCKER_VERSION=5:29.9.0-1~ubuntu.26.04~resolute
+ARG CONTAINERD_VERSION=2.4.1-2~ubuntu.26.04~resolute
+ARG BUILDX_VERSION=0.38.0-1~ubuntu.26.04~resolute
+ARG COMPOSE_VERSION=5.6.0-1~ubuntu.26.04~resolute
 # Docker Release (CE deb) <docker@docker.com>
 ARG DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 # AWS Session Manager plugin, for `aws ssm start-session` port forwarding. AWS
@@ -120,7 +120,7 @@ RUN apt-get update; \
     [ "$fpr" = "$DOCKER_GPG_FINGERPRINT" ]; \
     gpg --batch --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.asc; \
     rm /tmp/docker.asc; \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu resolute stable" \
       > /etc/apt/sources.list.d/docker.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -213,14 +213,14 @@ RUN case "$TARGETARCH" in \
 # SHA-256 are the release asset digests the GitHub releases API reports.
 ARG PYTHON_VERSION=3.11.17
 ARG PYTHON_RELEASE=3.11.17-36876195594
-ARG PYTHON_SHA256_ARM64=a7a7bb9e6b50483f393d1c44c87aa87677a0464a9e3b07f33ee5b31ce155c6ef
-ARG PYTHON_SHA256_AMD64=ae713815fe406a06f1691856f697a0b1e58b3e986f44e62f0cd0bca2424f1aac
+ARG PYTHON_SHA256_ARM64=17290ecfb46c01d83c5c0880e86fb90396c2ab37de68d396bc064e80cf96e270
+ARG PYTHON_SHA256_AMD64=5caeb9860a7a46c6bc79f923ae22a581b13dc78c9bf76b8d04212949d39d78bb
 RUN case "$TARGETARCH" in \
       arm64) arch=arm64 sha=$PYTHON_SHA256_ARM64 ;; \
       amd64) arch=x64 sha=$PYTHON_SHA256_AMD64 ;; \
       *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    f=python-${PYTHON_VERSION}-linux-24.04-${arch}.tar.gz; \
+    f=python-${PYTHON_VERSION}-linux-26.04-${arch}.tar.gz; \
     curl -fsSL --retry 3 --retry-all-errors -o "/tmp/$f" \
       "https://github.com/actions/python-versions/releases/download/${PYTHON_RELEASE}/$f"; \
     echo "${sha}  /tmp/$f" | sha256sum -c -; \
