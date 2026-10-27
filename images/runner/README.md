@@ -6,7 +6,7 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 
 ## Contents
 
-- `ubuntu:24.04`, pinned by its multi-arch index digest. Built and smoke-tested for `linux/arm64` and
+- `ubuntu:26.04`, pinned by its multi-arch index digest. Built and smoke-tested for `linux/arm64` and
   `linux/amd64`; the Containerfile selects the runner tarball and its hash by `TARGETARCH`.
 - [actions/runner](https://github.com/actions/runner) 2.338.0 in `/home/runner/actions-runner`. The
   tarball is checked against its published SHA-256, and `bin/installdependencies.sh` runs at build time.
@@ -56,7 +56,7 @@ setup-java v5.7.0 and v6.1.0, and setup-node v7.1.0. The cache is skipped when t
 `current`), which resolve the version remotely first. setup-java v6 names arm64 `aarch64` and v4/v5 name it
 `arm64`, hence the symlink, which has its own `.complete` marker.
 
-- Python is the `linux-24.04` build from `actions/python-versions`, installed by its own `setup.sh` as
+- Python is the `linux-26.04` build from `actions/python-versions`, installed by its own `setup.sh` as
   setup-python does, so its RUNPATH `/opt/hostedtoolcache/Python/3.11.17/<arch>/lib` holds.
 - The JDK directory name is not the JDK's version. setup-java takes the Adoptium API's `version_data.semver`
   (`25.0.4+101.0.LTS` for the release `jdk-25.0.4.1+1`) and replaces its first `+` with `-`. Any other name is a
@@ -84,7 +84,7 @@ build.
 
 - Python: take the newest stable `3.11.x` entry from `actions/python-versions`' `versions-manifest.json`.
   Set `PYTHON_VERSION`, set `PYTHON_RELEASE` to the release tag in its `download_url` (`<version>-<run id>`), and
-  set `PYTHON_SHA256_ARM64`/`_AMD64` to the `digest` of the `python-<v>-linux-24.04-<arm64|x64>.tar.gz` assets in
+  set `PYTHON_SHA256_ARM64`/`_AMD64` to the `digest` of the `python-<v>-linux-26.04-<arm64|x64>.tar.gz` assets in
   `api.github.com/repos/actions/python-versions/releases/tags/<tag>`.
 - JDK: query `api.adoptium.net/v3/assets/feature_releases/25/ga?os=linux&image_type=jdk&jvm_impl=hotspot&architecture=<aarch64|x64>`.
   Set `JAVA_RELEASE` to `release_name`, `JAVA_TOOLCACHE_VERSION` to `version_data.semver` with its first `+`
