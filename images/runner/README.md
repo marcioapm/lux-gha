@@ -44,7 +44,7 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
 
   Native amd64: `docker image inspect` reports 3,002,175,411 bytes; `docker history` reports about
   563 MB for the browser/media apt layer (Ubuntu 26.04, 2026-10-27). No same-base baseline image was
-  available locally; total baseline size and compressed sizes were not measured. All 35 direct packages
+  available locally; total baseline size and compressed sizes were not measured. All 36 direct packages
   exist in the resolute arm64/`all` indexes, but native arm64 browser validation and image sizes are
   unmeasured locally; CI runs that native gate. Historical 24.04 sizes do not describe this image.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.

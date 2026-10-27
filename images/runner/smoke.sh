@@ -224,7 +224,7 @@ run -e PW="$playwright_version" -e NV="$(containerfile_arg NODE_VERSION)" -e A="
 	ffmpeg -hide_banner -version | head -1
 	espeak-ng --version
 	# opencv-python wheels link libGL.so.1 (visual-diff jobs import cv2).
-	ldconfig -p | grep -q "libGL.so.1 " || { echo "libGL.so.1 missing" >&2; exit 1; }
+	ldconfig -p | grep -q "^[[:space:]]*libGL[.]so[.]1[[:space:]]" || { echo "libGL.so.1 missing" >&2; exit 1; }
 	echo "libGL.so.1 present"
 	d=$(mktemp -d)
 	espeak-ng -w "$d/speech.wav" "lux gha smoke test"
