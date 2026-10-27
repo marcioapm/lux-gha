@@ -27,6 +27,19 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   the job-started hook `/usr/local/lib/lux-gha/job-started.sh`. See [In-region image registry](#in-region-image-registry).
 - `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
   `node` exits 127 without it. The amd64 image has it too.
+- System libraries for browser end-to-end jobs, which cannot `apt-get install` here (no root): exactly what
+  `playwright install-deps chromium` installs on Ubuntu 24.04, the `tools` and `chromium` groups of playwright-core
+  1.64.1's `nativeDeps.ts`. That is Xvfb (`xvfb-run`), the fonts Playwright expects (Liberation, Noto Color Emoji,
+  Unifont, IPA Gothic, WenQuanYi Zen Hei, TLWG Loma, FreeFont, the X11 scalable and Cyrillic fonts) and Chromium's
+  shared libraries (NSS, NSPR, ATK/AT-SPI, CUPS, ALSA, GBM, DRM, Cairo, Pango, the X11/XCB extension libraries,
+  xkbcommon). A job runs `playwright install chromium` without `--with-deps`, which downloads only the browser,
+  matching its own Playwright version, into `~/.cache/ms-playwright`. Firefox and WebKit libraries are not
+  included (about 90 MB and 120 MB more unpacked; Firefox's pull in systemd and GTK 3): such jobs fail at
+  browser launch with Playwright's missing-libraries message.
+- `ffmpeg` and `espeak-ng`, for jobs that record test runs and narrate videos.
+
+  Together these add one layer of about 507 MB unpacked and 199 MB compressed on arm64 (image 762.6 MB →
+  961.7 MB compressed); amd64 has not been measured.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.
@@ -158,7 +171,7 @@ output and no argument.
 
 ```sh
 make image PLATFORM=linux/arm64            # or linux/amd64; loads lux-gha-runner:dev
-images/runner/smoke.sh                     # tools, caps, runner version, entrypoint lifecycle and failure modes
+images/runner/smoke.sh                     # tools, caps, runner version, browser deps, entrypoint lifecycle and failure modes
 images/runner/smoke.sh --privileged        # also rootless dockerd, the BuildKit preload, docker-container builders offline and online
 images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail the build; rebuilds the runner layer
 PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default linux/arm64)
@@ -177,6 +190,13 @@ ensurepip` works and `python3.11 -m venv` creates a venv with pip. Under `--priv
 `preloaded` line, and the store must hold the pinned index and `PLATFORM` manifest under both tags. With
 `--network none`, a `docker-container` builder must bootstrap from the preloaded image. With network,
 `docker pull` of the pinned version tag must download nothing, and a builder pinned to it builds and runs an image.
+
+For browser jobs, `smoke.sh` muxes `espeak-ng` speech with an `ffmpeg` test source into an H.264/AAC mp4 and
+checks both streams. As `runner`, with network, it installs playwright-core 1.64.1 from npm and its Chromium
+builds, as a job would, then requires `playwright install-deps --dry-run chromium` to report every package
+installed and `ldd` to find every library of every ELF file in the browser cache. It launches Chromium headless
+and headed under `xvfb-run`, each rendering a page, taking a screenshot and recording a video that `ffprobe`
+reads back.
 
 `entrypoint_test.sh` runs inside the image as part of `smoke.sh`, or on its own on Linux as a non-root
 user with `sh images/runner/entrypoint_test.sh`, or anywhere with Docker as `make entrypoint-test` (uid 1000

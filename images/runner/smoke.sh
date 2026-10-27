@@ -37,6 +37,9 @@ bk_manifest=$(containerfile_arg "$bk_arg")
 # docker run options passing the pins to in-container checks. The values
 # hold no whitespace, so the variable is split unquoted.
 bk_env="-e BK_VERSION=$bk_version -e BK_INDEX=$bk_index -e BK_MANIFEST=$bk_manifest"
+# The playwright-core whose nativeDeps.ts the Containerfile's browser
+# library list was taken from.
+playwright_version=1.64.1
 privileged=false keep=false checksum_negative=false
 for arg in "$@"; do
 	case $arg in
@@ -202,6 +205,71 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 	bad=$(find "$t" \( ! -user runner -o ! -group runner \) -print -quit)
 	[ -z "$bad" ] || { echo "$bad is not owned by runner:runner" >&2; exit 1; }
 	echo "everything under $t is owned by runner:runner; running as $(id -un)"
+'
+
+echo "== browser end-to-end dependencies"
+# A pinned Playwright, from npm, downloads its Chromium builds into the
+# user's cache as a job's `playwright install chromium` does, then: its own
+# install-deps check, ldd on every browser binary, a headless and a headed
+# (Xvfb) launch with a screenshot and a recorded video, and espeak-ng speech
+# muxed by ffmpeg. All as runner, with no root step.
+# shellcheck disable=SC2016 # the script expands inside the container
+run -e PW="$playwright_version" -e NV="$(containerfile_arg NODE_VERSION)" -e A="$tc_arch" \
+	--entrypoint sh "$TAG" -euc '
+	export PATH="/opt/hostedtoolcache/node/$NV/$A/bin:$PATH" NPM_CONFIG_UPDATE_NOTIFIER=false
+	ffmpeg -hide_banner -version | head -1
+	espeak-ng --version
+	d=$(mktemp -d)
+	espeak-ng -w "$d/speech.wav" "lux gha smoke test"
+	ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=duration=2:size=320x240:rate=10 -i "$d/speech.wav" \
+		-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$d/narrated.mp4"
+	got=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$d/narrated.mp4" | sort | paste -sd " " -)
+	[ "$got" = "audio video" ] || { echo "narrated.mp4 has streams [$got], want audio and video" >&2; exit 1; }
+	echo "espeak-ng speech and an ffmpeg test source muxed into H.264/AAC mp4"
+	cd "$d"
+	npm install --no-save --no-audit --no-fund --loglevel=error "playwright-core@$PW" >/dev/null
+	pw="node $d/node_modules/playwright-core/cli.js"
+	$pw install chromium >/dev/null
+	# Playwright simulates its apt-get install for the chromium and tools
+	# groups; a package absent from the image fails it.
+	out=$($pw install-deps --dry-run chromium 2>&1) || { echo "$out" >&2; exit 1; }
+	echo "$out" | grep -qx "All system dependencies are installed." || { echo "$out" >&2; exit 1; }
+	echo "playwright $PW install-deps --dry-run chromium: all installed"
+	n=0
+	for f in $(find "$HOME/.cache/ms-playwright" -type f \( -perm -u+x -o -name "*.so*" \)); do
+		od -An -c -N4 "$f" | grep -q "E   L   F" || continue
+		miss=$(ldd "$f" 2>&1 | grep "not found" || true)
+		[ -z "$miss" ] || { echo "$f: $miss" >&2; exit 1; }
+		n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] || { echo "no ELF files under $HOME/.cache/ms-playwright" >&2; exit 1; }
+	echo "ldd: $n ELF files under ~/.cache/ms-playwright, no library not found"
+	cat >launch.js <<"EOF"
+const { chromium } = require("playwright-core");
+(async () => {
+  const headless = process.argv[2] === "headless";
+  const browser = await chromium.launch({ headless });
+  const context = await browser.newContext({ recordVideo: { dir: "video-" + process.argv[2] } });
+  const page = await context.newPage();
+  await page.setContent("<h1>lux-gha smoke \u2713 \u6f22\u5b57 \ud83d\ude00</h1>");
+  // A headed window that has not painted yet fails captureScreenshot.
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await page.screenshot({ path: process.argv[2] + ".png" });
+  console.log(process.argv[2], browser.version(), await page.textContent("h1"));
+  await context.close();
+  await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });
+EOF
+	node launch.js headless
+	# xvfb-run with its default screen, as a job would call it.
+	xvfb-run -a node launch.js headed
+	for m in headless headed; do
+		[ -s "$m.png" ] || { echo "$m.png is empty" >&2; exit 1; }
+		v=$(ls video-$m/*.webm)
+		[ -s "$v" ] || { echo "$m video is empty" >&2; exit 1; }
+		[ "$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$v")" = video ] || { echo "$v is not a video" >&2; exit 1; }
+	done
+	echo "chromium headless and headed (Xvfb): page rendered, screenshot and recorded video written"
 '
 
 echo "== licence"
