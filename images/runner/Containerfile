@@ -317,15 +317,13 @@ RUN case "$TARGETARCH" in \
 
 # System libraries for browser end-to-end jobs, which cannot run apt-get here
 # (no root): `playwright install chromium` without --with-deps then fetches
-# only the browser, into the user's cache. The list is what `playwright
-# install-deps chromium` installs on Ubuntu 24.04, the "tools" and
-# "chromium" groups of playwright-core's
-# packages/playwright-core/src/server/registry/nativeDeps.ts (v1.64.1,
-# identical on main, resolved 2026-10-27); the arm64 entry copies the x64
-# one. Firefox and WebKit deps are left out: about 90 MB and 120 MB more,
-# and Firefox's pull in systemd. ffmpeg and espeak-ng are for jobs that
-# record and narrate videos. Installed late so that a list change does not
-# rebuild the runner and tool cache layers above.
+# only the browser, into the user's cache. The list is the Ubuntu 26.04
+# "tools" and "chromium" groups in playwright-core 1.64.1's published
+# lib/coreBundle.js (nativeDeps.ts); hostPlatform selects ubuntu26.04
+# explicitly, not a fallback. The arm64 entry copies the x64 groups.
+# ffmpeg and espeak-ng support recording and narrating videos; Firefox and
+# WebKit dependencies are not installed. Installed late so a list change
+# does not rebuild the runner and tool cache layers above.
 RUN apt-get update; \
     apt-get install -y --no-install-recommends \
       xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \

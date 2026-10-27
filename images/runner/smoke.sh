@@ -37,8 +37,8 @@ bk_manifest=$(containerfile_arg "$bk_arg")
 # docker run options passing the pins to in-container checks. The values
 # hold no whitespace, so the variable is split unquoted.
 bk_env="-e BK_VERSION=$bk_version -e BK_INDEX=$bk_index -e BK_MANIFEST=$bk_manifest"
-# The playwright-core whose nativeDeps.ts the Containerfile's browser
-# library list was taken from.
+# The published playwright-core with explicit Ubuntu 26.04 nativeDeps and
+# hostPlatform mappings for both architectures (no distro fallback).
 playwright_version=1.64.1
 privileged=false keep=false checksum_negative=false
 for arg in "$@"; do
@@ -234,10 +234,10 @@ run -e PW="$playwright_version" -e NV="$(containerfile_arg NODE_VERSION)" -e A="
 	npm install --no-save --no-audit --no-fund --loglevel=error "playwright-core@$PW" >/dev/null
 	pw="node $d/node_modules/playwright-core/cli.js"
 	$pw install chromium >/dev/null
-	# Playwright simulates its apt-get install for the chromium and tools
-	# groups; a package absent from the image fails it.
+	# The 26.04 mapping must need neither extra packages nor a distro fallback.
 	out=$($pw install-deps --dry-run chromium 2>&1) || { echo "$out" >&2; exit 1; }
-	echo "$out" | grep -qx "All system dependencies are installed." || { echo "$out" >&2; exit 1; }
+	echo "$out"
+	[ "$out" = "All system dependencies are installed." ] || exit 1
 	echo "playwright $PW install-deps --dry-run chromium: all installed"
 	n=0
 	for f in $(find "$HOME/.cache/ms-playwright" -type f \( -perm -u+x -o -name "*.so*" \)); do

@@ -27,19 +27,24 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   the job-started hook `/usr/local/lib/lux-gha/job-started.sh`. See [In-region image registry](#in-region-image-registry).
 - `libatomic1`: the official Node.js linux-arm64 builds that `actions/setup-node` installs link it, and
   `node` exits 127 without it. The amd64 image has it too.
-- System libraries for browser end-to-end jobs, which cannot `apt-get install` here (no root): exactly what
-  `playwright install-deps chromium` installs on Ubuntu 24.04, the `tools` and `chromium` groups of playwright-core
-  1.64.1's `nativeDeps.ts`. That is Xvfb (`xvfb-run`), the fonts Playwright expects (Liberation, Noto Color Emoji,
+- System libraries for browser end-to-end jobs, which cannot `apt-get install` here (no root): the Ubuntu
+  26.04 `tools` and `chromium` groups in the published playwright-core 1.64.1 `lib/coreBundle.js`
+  (from `nativeDeps.ts`). Playwright explicitly supports `ubuntu26.04-x64` and `ubuntu26.04-arm64`;
+  it does not fall back to 24.04. Both architectures use the same tools/Chromium package names.
+  That is Xvfb (`xvfb-run`), the fonts Playwright expects (Liberation, Noto Color Emoji,
   Unifont, IPA Gothic, WenQuanYi Zen Hei, TLWG Loma, FreeFont, the X11 scalable and Cyrillic fonts) and Chromium's
   shared libraries (NSS, NSPR, ATK/AT-SPI, CUPS, ALSA, GBM, DRM, Cairo, Pango, the X11/XCB extension libraries,
   xkbcommon). A job runs `playwright install chromium` without `--with-deps`, which downloads only the browser,
-  matching its own Playwright version, into `~/.cache/ms-playwright`. Firefox and WebKit libraries are not
-  included (about 90 MB and 120 MB more unpacked; Firefox's pull in systemd and GTK 3): such jobs fail at
-  browser launch with Playwright's missing-libraries message.
+  matching its own pinned Playwright version, into `~/.cache/ms-playwright`. Active browser matrices are
+  Chromium only; Firefox and WebKit dependencies are not included or validated. Allure is not baked in:
+  consumers use a pinned Allure tarball with the cached JDK, not a second JRE.
 - `ffmpeg` and `espeak-ng`, for jobs that record test runs and narrate videos.
 
-  Together these add one layer of about 507 MB unpacked and 199 MB compressed on arm64 (image 762.6 MB →
-  961.7 MB compressed); amd64 has not been measured.
+  Native amd64: `docker image inspect` reports 3,002,175,411 bytes; `docker history` reports about
+  563 MB for the browser/media apt layer (Ubuntu 26.04, 2026-10-27). No same-base baseline image was
+  available locally; total baseline size and compressed sizes were not measured. All 35 direct packages
+  exist in the resolute arm64/`all` indexes, but native arm64 browser validation and image sizes are
+  unmeasured locally; CI runs that native gate. Historical 24.04 sizes do not describe this image.
 - User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.
@@ -211,8 +216,9 @@ ensurepip` works and `python3.11 -m venv` creates a venv with pip. Under `--priv
 
 For browser jobs, `smoke.sh` muxes `espeak-ng` speech with an `ffmpeg` test source into an H.264/AAC mp4 and
 checks both streams. As `runner`, with network, it installs playwright-core 1.64.1 from npm and its Chromium
-builds, as a job would, then requires `playwright install-deps --dry-run chromium` to report every package
-installed and `ldd` to find every library of every ELF file in the browser cache. It launches Chromium headless
+builds, as a job would, then requires `playwright install-deps --dry-run chromium` to print exactly
+`All system dependencies are installed.` (no unsupported-distro/fallback warning), and `ldd` to find every
+library of every ELF file in the browser cache. It launches Chromium headless
 and headed under `xvfb-run`, each rendering a page, taking a screenshot and recording a video that `ffprobe`
 reads back.
 
