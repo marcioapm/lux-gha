@@ -315,6 +315,29 @@ RUN case "$TARGETARCH" in \
     install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh; \
     rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}"
 
+# System libraries for browser end-to-end jobs, which cannot run apt-get here
+# (no root): `playwright install chromium` without --with-deps then fetches
+# only the browser, into the user's cache. The list is what `playwright
+# install-deps chromium` installs on Ubuntu 24.04, the "tools" and
+# "chromium" groups of playwright-core's
+# packages/playwright-core/src/server/registry/nativeDeps.ts (v1.64.1,
+# identical on main, resolved 2026-10-27); the arm64 entry copies the x64
+# one. Firefox and WebKit deps are left out: about 90 MB and 120 MB more,
+# and Firefox's pull in systemd. ffmpeg and espeak-ng are for jobs that
+# record and narrate videos. Installed late so that a list change does not
+# rebuild the runner and tool cache layers above.
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
+      xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
+      fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf \
+      libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+      libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
+      libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+      libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+      ffmpeg espeak-ng; \
+    rm -rf /var/lib/apt/lists/*
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.
