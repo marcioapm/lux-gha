@@ -39,6 +39,8 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   Chromium only; Firefox and WebKit dependencies are not included or validated. Allure is not baked in:
   consumers use a pinned Allure tarball with the cached JDK, not a second JRE.
 - `ffmpeg` and `espeak-ng`, for jobs that record test runs and narrate videos.
+- `libgl1` (`libGL.so.1`), which the `opencv-python` wheel needs to import, for screenshot comparison in
+  visual-diff jobs.
 
   Native amd64: `docker image inspect` reports 3,002,175,411 bytes; `docker history` reports about
   563 MB for the browser/media apt layer (Ubuntu 26.04, 2026-10-27). No same-base baseline image was

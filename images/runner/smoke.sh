@@ -223,11 +223,17 @@ run -e PW="$playwright_version" -e NV="$(containerfile_arg NODE_VERSION)" -e A="
 	export PATH="/opt/hostedtoolcache/node/$NV/$A/bin:$PATH" NPM_CONFIG_UPDATE_NOTIFIER=false
 	ffmpeg -hide_banner -version | head -1
 	espeak-ng --version
+	# opencv-python wheels link libGL.so.1 (visual-diff jobs import cv2).
+	ldconfig -p | grep -q "libGL.so.1 " || { echo "libGL.so.1 missing" >&2; exit 1; }
+	echo "libGL.so.1 present"
 	d=$(mktemp -d)
 	espeak-ng -w "$d/speech.wav" "lux gha smoke test"
 	ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=duration=2:size=320x240:rate=10 -i "$d/speech.wav" \
 		-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$d/narrated.mp4"
-	got=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$d/narrated.mp4" | sort | paste -sd " " -)
+	# A standalone assignment, so a failing ffprobe stops the script; in a
+	# pipeline only the status of the last command counts.
+	streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$d/narrated.mp4")
+	got=$(printf "%s\n" "$streams" | sort | paste -sd " " -)
 	[ "$got" = "audio video" ] || { echo "narrated.mp4 has streams [$got], want audio and video" >&2; exit 1; }
 	echo "espeak-ng speech and an ffmpeg test source muxed into H.264/AAC mp4"
 	cd "$d"
@@ -239,15 +245,27 @@ run -e PW="$playwright_version" -e NV="$(containerfile_arg NODE_VERSION)" -e A="
 	echo "$out"
 	[ "$out" = "All system dependencies are installed." ] || exit 1
 	echo "playwright $PW install-deps --dry-run chromium: all installed"
-	n=0
+	n=0 static=0
 	for f in $(find "$HOME/.cache/ms-playwright" -type f \( -perm -u+x -o -name "*.so*" \)); do
 		od -An -c -N4 "$f" | grep -q "E   L   F" || continue
-		miss=$(ldd "$f" 2>&1 | grep "not found" || true)
-		[ -z "$miss" ] || { echo "$f: $miss" >&2; exit 1; }
-		n=$((n + 1))
+		# ldd exits 1 for a static ELF ("not a dynamic executable"); that is
+		# the one failure accepted. Any other error fails the check, so a
+		# binary ldd cannot inspect is never counted as resolved.
+		if out=$(ldd "$f" 2>&1); then
+			case $out in
+			*"not found"*) echo "$f: $out" >&2; exit 1 ;;
+			*"statically linked"*) static=$((static + 1)) ;;
+			*) n=$((n + 1)) ;;
+			esac
+		else
+			case $out in
+			*"not a dynamic executable"*) static=$((static + 1)) ;;
+			*) echo "ldd $f failed: $out" >&2; exit 1 ;;
+			esac
+		fi
 	done
 	[ "$n" -gt 0 ] || { echo "no ELF files under $HOME/.cache/ms-playwright" >&2; exit 1; }
-	echo "ldd: $n ELF files under ~/.cache/ms-playwright, no library not found"
+	echo "ldd: $n dynamic ELF files under ~/.cache/ms-playwright resolve every library ($static static)"
 	cat >launch.js <<"EOF"
 const { chromium } = require("playwright-core");
 (async () => {
@@ -271,7 +289,8 @@ EOF
 		[ -s "$m.png" ] || { echo "$m.png is empty" >&2; exit 1; }
 		v=$(ls video-$m/*.webm)
 		[ -s "$v" ] || { echo "$m video is empty" >&2; exit 1; }
-		[ "$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$v")" = video ] || { echo "$v is not a video" >&2; exit 1; }
+		kind=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$v")
+		[ "$kind" = video ] || { echo "$v has streams [$kind], want video" >&2; exit 1; }
 	done
 	echo "chromium headless and headed (Xvfb): page rendered, screenshot and recorded video written"
 '
