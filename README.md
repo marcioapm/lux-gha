@@ -1120,7 +1120,7 @@ Check from a Run before relying on it:
 ### Fail-open
 
 The registry is an optimisation. The hook always exits 0 (a failing job-started hook fails the job): on any
-answer but `200`, after retrying `409` for up to 20 s, or when nothing listens, it writes nothing and prints
+answer but `200`, after retrying `409` for up to 60 s, or when nothing listens, it writes nothing and prints
 one line, `lux-gha registry: unavailable (HTTP <code>); continuing without it`. On `200` it prints
 `lux-gha registry: trust=<level>`. A pull through the credential helper that fails later (the bridge went
 down mid-job) fails that `docker` command as any registry error would.

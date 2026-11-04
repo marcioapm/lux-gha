@@ -484,6 +484,13 @@ run_hook hook-409-then-200 FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT=10 \
 check "exits 0" '[ "$rc" = 0 ]'
 check "a 409 then a 200 writes both paths" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(wc -l <"$d/github_env")" = 2 ] && grep -qx "LUX_REGISTRY_PUSH=$reg/acme/widgets" "$d/github_env"'
 
+# Unset or not a number, the wait is the default, so a 409 is still retried.
+for wait in "" x; do
+	run_hook "hook-409-default-wait-${wait:-unset}" FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT="$wait" \
+		FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
+	check "retries a 409 with the default wait (LUXGHA_REGISTRY_WAIT=${wait:-unset})" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(cat "$d/github_env")" = "LUX_REGISTRY=$reg/acme/widgets" ]'
+done
+
 run_hook hook-refused FAKE_CURL=refused
 check "exits 0 when nothing listens" '[ "$rc" = 0 ]'
 check "writes nothing" "$nothing_written"

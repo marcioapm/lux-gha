@@ -12,7 +12,8 @@
 # paths of the job this runner is executing and, on 200, appends
 # LUX_REGISTRY and, when the job may push, LUX_REGISTRY_PUSH to $GITHUB_ENV.
 # A 409 (GitHub has not yet shown the job on this runner) is retried for
-# LUXGHA_REGISTRY_WAIT seconds (default 20). Every other outcome writes
+# LUXGHA_REGISTRY_WAIT seconds (default 60: GitHub can take that long to show
+# a job during an Actions incident). Every other outcome writes
 # nothing. It always exits 0: a non-zero hook fails the job, and the registry
 # is an optimisation the workflow falls back from. It prints one line and
 # never the token.
@@ -73,8 +74,8 @@ main() {
 		say "identity token unreadable; continuing without it"
 		return 0 ;;
 	esac
-	wait_s=${LUXGHA_REGISTRY_WAIT:-20}
-	case $wait_s in '' | *[!0-9]*) wait_s=20 ;; esac
+	wait_s=${LUXGHA_REGISTRY_WAIT:-60}
+	case $wait_s in '' | *[!0-9]*) wait_s=60 ;; esac
 	body=$(mktemp) || return 0
 	trap 'rm -f "$body"' EXIT
 	deadline=$(($(date +%s) + wait_s))

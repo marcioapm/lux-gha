@@ -165,7 +165,7 @@ Only with `LUXGHA_REGISTRY_HOST` in the Run's env, which the bridge sets when it
 - It sets `ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/lib/lux-gha/job-started.sh`, unless the Run's env
   already sets that variable (one warning line). The runner runs the hook before the job's first step. The
   hook POSTs the identity token to `$LUXGHA_RUNNER_ENDPOINT/runner/v1/registry` (curl, 3 s to connect, 10 s
-  in all), retries `409` for `LUXGHA_REGISTRY_WAIT` seconds (default 20), and on `200` appends
+  in all), retries `409` for `LUXGHA_REGISTRY_WAIT` seconds (default 60), and on `200` appends
   `LUX_REGISTRY` (`<host>/<owner>/<repo>`) and, when non-empty, `LUX_REGISTRY_PUSH` (the same, or
   `…/pr` for an untrusted job) to `$GITHUB_ENV`, after checking that both are lower-case paths under the host. It prints one line, `trust=<level>` or why it continued without, and **always exits 0**.
 - `docker-credential-lux-gha` unsets every `AWS_*` variable of the job (credentials and profiles, but also
