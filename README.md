@@ -399,15 +399,20 @@ bridge reads that runner's Runs (`lux-gha/managed` and `lux-gha/runner`
 labels, any state; one Run per runner name). If the Run has ended:
 
 - **Explain.** The bridge posts one check run named `lux-gha` on the job's
-  commit, with conclusion `failure`, title `Lux stopped job "<job name>":
-  <reason>`, and a summary with the route, Lux Run id, state and reason,
-  exit code, finish time, and a hint. For `disk limit exceeded` the hint
+  commit, with title `Lux stopped job "<job name>": <reason>` and a summary
+  with the route, Lux Run id, state and reason, exit code, finish time, and
+  a hint. For `disk limit exceeded` the hint
   names the raw route with the next larger disk ("use a larger-disk profile
   such as `<route>` ... or reduce disk use"); on a size route it asks for a
   larger size. Its `external_id` is the Lux
-  Run id. Before posting, the bridge lists the commit's `lux-gha` check
-  runs, so neither a later pass nor a restarted bridge posts it twice. A
-  Run that ended `succeeded` (the job finished, and GitHub's listing lags)
+  Run id; `started_at` uses `FirstStartedAt`, falling back to `CreatedAt`,
+  then clamps to `finishedAt` if zero or later. `completed_at` is `finishedAt`.
+  The conclusion is `neutral` for stops eligible for an automatic re-run
+  within `hostLossReruns`: the job's own checks decide the commit result.
+  All other stops are `failure`. Before posting, the bridge lists the
+  commit's `lux-gha` check runs, so neither a later pass nor a restarted
+  bridge posts it twice. A Run that ended `succeeded` (the job finished,
+  and GitHub's listing lags)
   gets nothing.
 - **Unstick.** If the job is still `in_progress` `reconcile.stuckJobGrace`
   (default 2 m) after the Run's `finishedAt`, the runner did not report
@@ -505,7 +510,8 @@ labels, any state; one Run per runner name). If the Run has ended:
   `hostLossReruns: 0` it says "Automatic re-runs are off." and the job is
   left failed, as before. The hint can promise a re-run that is then not
   made: the run succeeded, was superseded by a newer run, or is gone. The
-  check run is not updated in that case.
+  check run is not updated in that case; it stays `neutral`, and the job's
+  own check carries its result.
 
 `in_progress` workflow runs are listed before `queued` ones so a queued
 backlog cannot hide stopped jobs. Reading their Lux Runs has its own per-pass

@@ -55,6 +55,31 @@ func TestCreateCheckRunSendsCompletedCheck(t *testing.T) {
 	}
 }
 
+func TestCreateCheckRunSendsStartedAtWhenSet(t *testing.T) {
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		if !requireInstallationToken(w, r, "ghs_token1") {
+			return
+		}
+		var body map[string]any
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		if body["started_at"] != "2026-10-09T11:50:00Z" || body["conclusion"] != "neutral" {
+			t.Errorf("body %s", raw)
+			http.Error(w, "body", 422)
+			return
+		}
+		w.WriteHeader(201)
+		w.Write([]byte(`{"id":78,"name":"lux-gha","head_sha":"` + sha + `","external_id":"run_1","status":"completed","conclusion":"neutral"}`))
+	})
+	req := checkRequest()
+	started := time.Date(2026, 10, 9, 11, 50, 0, 0, time.UTC)
+	req.StartedAt = &started
+	req.Conclusion = "neutral"
+	if got, err := c.CreateCheckRun(context.Background(), repo, req); err != nil || got.ID != 78 {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
 func TestCreateCheckRunValidatesBeforeSending(t *testing.T) {
 	var calls atomic.Int32
 	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
