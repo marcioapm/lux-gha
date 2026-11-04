@@ -190,15 +190,16 @@ func TestJobCausedStopsAreNeverRerun(t *testing.T) {
 
 func TestHostLossRerunBound(t *testing.T) {
 	for _, tc := range []struct {
-		edit    []func(string) string
-		attempt int64
-		reruns  int
-		hint    string
+		edit       []func(string) string
+		attempt    int64
+		reruns     int
+		hint       string
+		conclusion string
 	}{
-		{nil, 2, 1, "lux-gha re-runs the job automatically (attempt 3 of 3)."},
-		{nil, 3, 0, "re-run the job. Automatic re-runs are used up (this was attempt 3; lux-gha re-runs up to attempt 3)."},
-		{[]func(string) string{noReruns}, 1, 0, "re-run the job. Automatic re-runs are off."},
-		{[]func(string) string{replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 5}`)}, 5, 1, "(attempt 6 of 6)."},
+		{nil, 2, 1, "lux-gha re-runs the job automatically (attempt 3 of 3).", "neutral"},
+		{nil, 3, 0, "re-run the job. Automatic re-runs are used up (this was attempt 3; lux-gha re-runs up to attempt 3).", "failure"},
+		{[]func(string) string{noReruns}, 1, 0, "re-run the job. Automatic re-runs are off.", "failure"},
+		{[]func(string) string{replace(`"maxRunners": 10`, `"maxRunners": 10, "reconcile": {"hostLossReruns": 5}`)}, 5, 1, "(attempt 6 of 6).", "neutral"},
 	} {
 		t.Run(tc.hint, func(t *testing.T) {
 			e := newEnv(t, tc.edit...)
@@ -211,6 +212,11 @@ func TestHostLossRerunBound(t *testing.T) {
 			_, reqs := e.gh.checks()
 			if len(e.gh.rerunJobs()) != tc.reruns || len(reqs) != 1 || !strings.HasSuffix(reqs[0].Output.Summary, tc.hint+"\n") {
 				t.Fatalf("reruns %v checks %+v", e.gh.rerunJobs(), reqs)
+			}
+			// A re-run job's own checks decide the commit; only a stop left
+			// failed fails lux-gha's check.
+			if reqs[0].Conclusion != tc.conclusion {
+				t.Fatalf("conclusion %q, want %q", reqs[0].Conclusion, tc.conclusion)
 			}
 			// A Run past the bound is not read when it ends.
 			if gets := e.lux.getCalls(); tc.reruns == 0 && len(gets) != 0 {

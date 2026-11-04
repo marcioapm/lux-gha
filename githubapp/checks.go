@@ -24,6 +24,7 @@ type CheckRunRequest struct {
 	ExternalID  string         `json:"external_id,omitempty"`
 	Status      string         `json:"status"`
 	Conclusion  string         `json:"conclusion"`
+	StartedAt   *time.Time     `json:"started_at,omitempty"`
 	CompletedAt time.Time      `json:"completed_at"`
 	Output      CheckRunOutput `json:"output"`
 }

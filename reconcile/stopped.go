@@ -299,9 +299,25 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s *stoppedRun) githubapp.
 	if hint := r.hint(reason, route, j.RunAttempt); hint != "" {
 		fmt.Fprintf(&b, "\n%s\n", hint)
 	}
+	// A job lux-gha re-runs by itself is not a failure of the commit: the
+	// re-run's own checks decide it, so the explanation is neutral. Only a
+	// stop that is left failed (no re-run coming) is a failure.
+	conclusion := "failure"
+	if r.rerunEligible(run.StateReason, j.RunAttempt) {
+		conclusion = "neutral"
+	}
+	// Without started_at GitHub stamps the creation time, which is after
+	// completed_at when the check is posted late.
+	started := run.CreatedAt
+	if run.FirstStartedAt != nil {
+		started = *run.FirstStartedAt
+	}
+	if started.IsZero() || started.After(finished) {
+		started = finished
+	}
 	return githubapp.CheckRunRequest{
-		Name: CheckName, HeadSHA: j.HeadSHA, ExternalID: run.ID, Status: "completed", Conclusion: "failure",
-		CompletedAt: finished,
+		Name: CheckName, HeadSHA: j.HeadSHA, ExternalID: run.ID, Status: "completed", Conclusion: conclusion,
+		StartedAt: &started, CompletedAt: finished,
 		Output: githubapp.CheckRunOutput{
 			Title: cutRunes(`Lux stopped job "`+j.Name+`": `+reason, githubapp.MaxCheckTitle),
 			// The reason is Lux's free text, so the summary has no fixed bound.

@@ -47,6 +47,7 @@ func failOp(op string, status int) func(string, string, int) error {
 
 func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 	e := newEnv(t, bigDisk)
+	created := e.clock.Now()
 	id := e.startJob(7)
 	e.pass()
 	if checks, _ := e.gh.checks(); len(checks) != 0 {
@@ -71,6 +72,11 @@ func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 	}
 	if !req.CompletedAt.Equal(finished) {
 		t.Fatalf("completed_at %s, want the Run's finishedAt %s", req.CompletedAt, finished)
+	}
+	// started_at is the Run's start, never after completed_at though the
+	// check is posted later.
+	if req.StartedAt == nil || !req.StartedAt.Equal(created) {
+		t.Fatalf("started_at %v, want the Run's creation %s", req.StartedAt, created)
 	}
 	// Exact, so nothing else (env, labels, the JIT config) reaches a public checks tab.
 	want := "Lux ended the Run that held this job's runner, so the runner could not finish the job.\n\n" +
