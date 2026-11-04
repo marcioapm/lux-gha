@@ -396,6 +396,19 @@ if [ -n "$out" ]; then printf '%s' "$1"; exit 0; fi
 printf '%s' "${FAKE_BODY:-}"
 EOF2
 chmod 755 "$root/bin/curl"
+# Fake date: with FAKE_DATE, `date +%s` answers the next value in it
+# (space-separated, the last one repeats); otherwise the real date.
+cat >"$root/bin/date" <<'EOF2'
+#!/bin/sh
+[ -n "${FAKE_DATE:-}" ] && [ "$*" = +%s ] || exec /usr/bin/date "$@"
+n=$(($(cat "$FAKE_CASE_DIR/date.count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$FAKE_CASE_DIR/date.count"
+# shellcheck disable=SC2086 # FAKE_DATE is a list of times
+set -- $FAKE_DATE
+while [ "$n" -gt 1 ] && [ "$#" -gt 1 ]; do shift; n=$((n - 1)); done
+echo "$1"
+EOF2
+chmod 755 "$root/bin/date"
 
 check_no_token() {
 	check "the identity token is in no output and no curl argument" \
@@ -483,6 +496,19 @@ run_hook hook-409-then-200 FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT=10 \
 	FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"$reg/acme/widgets\",\"trust\":\"trusted\",\"expiresAt\":\"x\"}"
 check "exits 0" '[ "$rc" = 0 ]'
 check "a 409 then a 200 writes both paths" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(wc -l <"$d/github_env")" = 2 ] && grep -qx "LUX_REGISTRY_PUSH=$reg/acme/widgets" "$d/github_env"'
+
+# Unset or not a number, the wait is the default, so a 409 is still retried.
+for wait in "" x 08; do
+	run_hook "hook-409-default-wait-${wait:-unset}" FAKE_CURL="409 200" LUXGHA_REGISTRY_WAIT="$wait" \
+		FAKE_BODY="{\"registry\":\"$reg\",\"read\":\"$reg/acme/widgets\",\"push\":\"\",\"trust\":\"read-only\",\"expiresAt\":\"x\"}"
+	check "retries a 409 with the default wait (LUXGHA_REGISTRY_WAIT=${wait:-unset})" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(cat "$d/github_env")" = "LUX_REGISTRY=$reg/acme/widgets" ]'
+done
+# The default is 60 s, whatever made it the default: the deadline is 1060, so
+# 1059 retries and 1060 stops (2 attempts; 59 s would stop after 1, 61 s retry a 3rd).
+for wait in "" x 08; do
+	run_hook "hook-409-default-wait-60-${wait:-unset}" FAKE_CURL=409 LUXGHA_REGISTRY_WAIT="$wait" FAKE_DATE="1000 1059 1060 99999"
+	check "the default wait is 60 s (LUXGHA_REGISTRY_WAIT=${wait:-unset})" '[ "$(cat "$d/curl.count")" = 2 ] && [ "$(cat "$d/date.count")" = 3 ] && [ "$rc" = 0 ] && [ ! -s "$d/err" ]'
+done
 
 run_hook hook-refused FAKE_CURL=refused
 check "exits 0 when nothing listens" '[ "$rc" = 0 ]'
