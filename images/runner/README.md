@@ -186,7 +186,7 @@ access the job already has: the bridge decides it from GitHub's record of the jo
 config owned by uid 1000), the hook on `200` (both variables, or `LUX_REGISTRY` alone for `read-only`, names
 with `.`, `_` and `-`), on malformed answers in `read` or `push` (an injected line, another host, an
 upper-case path, an empty segment, a trailing `/`, an unknown trust level), on a token holding a quote or a
-newline, on `204`, `401`, `500`, `503`, on `409` until the wait runs out and `409` then `200`, on a refused
+newline, on `204`, `401`, `500`, `503`, on `409` until the wait runs out, an unset, non-numeric or zero-led wait falling back to exactly the 60 s default, and `409` then `200`, on a refused
 connection, and without host or token, each exiting 0 and writing nothing; the wrapper's environment
 (including `AWS_ENDPOINT_URL`, `AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CA_BUNDLE`); and the
 credentials script on `200` and `503`. A fake `curl` stands in for the bridge; the token must appear in no
