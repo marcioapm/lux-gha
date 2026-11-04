@@ -299,9 +299,7 @@ func (r *Reconciler) checkRun(j githubapp.WorkflowJob, s *stoppedRun) githubapp.
 	if hint := r.hint(reason, route, j.RunAttempt); hint != "" {
 		fmt.Fprintf(&b, "\n%s\n", hint)
 	}
-	// A job lux-gha re-runs by itself is not a failure of the commit: the
-	// re-run's own checks decide it, so the explanation is neutral. Only a
-	// stop that is left failed (no re-run coming) is a failure.
+	// Eligible re-runs leave the commit result to the job's own checks.
 	conclusion := "failure"
 	if r.rerunEligible(run.StateReason, j.RunAttempt) {
 		conclusion = "neutral"

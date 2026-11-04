@@ -192,8 +192,6 @@ func TestJobCausedStopsAreNeverRerun(t *testing.T) {
 	}
 }
 
-// The conclusion is pinned literally per stop, not derived from
-// rerunEligible: neutral only when lux-gha re-runs the job itself.
 func TestStoppedCheckConclusion(t *testing.T) {
 	e := newEnv(t)
 	for _, tc := range []struct {
@@ -248,8 +246,6 @@ func TestHostLossRerunBound(t *testing.T) {
 			if len(e.gh.rerunJobs()) != tc.reruns || len(reqs) != 1 || !strings.HasSuffix(reqs[0].Output.Summary, tc.hint+"\n") {
 				t.Fatalf("reruns %v checks %+v", e.gh.rerunJobs(), reqs)
 			}
-			// A re-run job's own checks decide the commit; only a stop left
-			// failed fails lux-gha's check.
 			if reqs[0].Conclusion != tc.conclusion {
 				t.Fatalf("conclusion %q, want %q", reqs[0].Conclusion, tc.conclusion)
 			}

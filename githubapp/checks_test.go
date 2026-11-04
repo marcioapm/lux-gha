@@ -73,7 +73,8 @@ func TestCreateCheckRunSendsStartedAtWhenSet(t *testing.T) {
 	})
 	req := checkRequest()
 	started := time.Date(2026, 10, 9, 11, 50, 0, 0, time.UTC)
-	req.StartedAt, req.Conclusion = &started, "neutral"
+	req.StartedAt = &started
+	req.Conclusion = "neutral"
 	if got, err := c.CreateCheckRun(context.Background(), repo, req); err != nil || got.ID != 78 {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}

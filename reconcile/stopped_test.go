@@ -74,8 +74,6 @@ func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 	if !req.CompletedAt.Equal(finished) {
 		t.Fatalf("completed_at %s, want the Run's finishedAt %s", req.CompletedAt, finished)
 	}
-	// started_at is the Run's start, never after completed_at though the
-	// check is posted later.
 	if req.StartedAt == nil || !req.StartedAt.Equal(created) {
 		t.Fatalf("started_at %v, want the Run's creation %s", req.StartedAt, created)
 	}
@@ -105,8 +103,6 @@ func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 	}
 }
 
-// started_at is the Run's first start, else its creation, and never zero
-// or after completed_at.
 func TestStoppedCheckStartedAt(t *testing.T) {
 	e := newEnv(t)
 	finished := e.clock.Now()
