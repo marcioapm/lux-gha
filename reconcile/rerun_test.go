@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -183,6 +184,40 @@ func TestJobCausedStopsAreNeverRerun(t *testing.T) {
 			e.pass()
 			if len(e.gh.cancels()) != 1 || len(e.gh.rerunJobs()) != 0 || ops[opGetRun]+ops[opGetJob] != 0 {
 				t.Fatalf("cancels %v reruns %v ops %v", e.gh.cancels(), e.gh.rerunJobs(), ops)
+			}
+			if _, reqs := e.gh.checks(); len(reqs) != 1 || reqs[0].Conclusion != "failure" {
+				t.Fatalf("checks %+v, want one failure", reqs)
+			}
+		})
+	}
+}
+
+// The conclusion is pinned literally per stop, not derived from
+// rerunEligible: neutral only when lux-gha re-runs the job itself.
+func TestStoppedCheckConclusion(t *testing.T) {
+	e := newEnv(t)
+	for _, tc := range []struct {
+		reason  string
+		attempt int64
+		want    string
+	}{
+		{hostLoss, 1, "neutral"},
+		{preempt, 1, "neutral"},
+		{"drain: not resumed (resumePolicy never)", 1, "neutral"},
+		{hostLoss, 2, "neutral"},
+		{hostLoss, 3, "failure"},
+		{hostLoss, 0, "failure"},
+		{hostLoss, -1, "failure"},
+		{"terminated; host lost", 1, "failure"},
+		{"timeout; resumePolicy never", 1, "failure"},
+		{diskStop, 1, "failure"},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tc.reason, tc.attempt), func(t *testing.T) {
+			req := e.rec.checkRun(githubapp.WorkflowJob{RunAttempt: tc.attempt}, &stoppedRun{
+				run: luxclient.Run{StateReason: tc.reason}, finished: e.clock.Now(),
+			})
+			if req.Conclusion != tc.want {
+				t.Fatalf("conclusion %q, want %q", req.Conclusion, tc.want)
 			}
 		})
 	}

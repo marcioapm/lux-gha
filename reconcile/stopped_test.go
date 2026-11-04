@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/luxclient"
 )
 
 const diskStop = "disk limit exceeded; resumePolicy never"
@@ -101,6 +102,44 @@ func TestDiskLimitStopPostsOneCheckRunWithReasonAndHint(t *testing.T) {
 	}
 	if checks, _ := e.gh.checks(); len(checks) != 1 {
 		t.Fatalf("check runs after restart %+v", checks)
+	}
+}
+
+// started_at is the Run's first start, else its creation, and never zero
+// or after completed_at.
+func TestStoppedCheckStartedAt(t *testing.T) {
+	e := newEnv(t)
+	finished := e.clock.Now()
+	created := finished.Add(-2 * time.Minute)
+	first := finished.Add(-time.Minute)
+	future := finished.Add(time.Minute)
+	zero := time.Time{}
+	for _, tc := range []struct {
+		name    string
+		created time.Time
+		first   *time.Time
+		want    time.Time
+	}{
+		{"first start wins", created, &first, first},
+		{"creation fallback", created, nil, created},
+		{"missing creation", zero, nil, finished},
+		{"zero first start", created, &zero, finished},
+		{"future creation", future, nil, finished},
+		{"future first start", created, &future, finished},
+		{"equal to finish", finished, nil, finished},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := e.rec.checkRun(githubapp.WorkflowJob{RunAttempt: 1}, &stoppedRun{
+				run:      luxclient.Run{StateReason: diskStop, CreatedAt: tc.created, FirstStartedAt: tc.first},
+				finished: finished,
+			})
+			if req.StartedAt == nil || !req.StartedAt.Equal(tc.want) {
+				t.Fatalf("started_at %v, want %s", req.StartedAt, tc.want)
+			}
+			if !req.CompletedAt.Equal(finished) {
+				t.Fatalf("completed_at %s, want %s", req.CompletedAt, finished)
+			}
+		})
 	}
 }
 
