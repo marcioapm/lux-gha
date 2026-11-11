@@ -214,16 +214,14 @@ run --network none -e PY="$(containerfile_arg PYTHON_VERSION)" -e A="$tc_arch" \
 '
 
 echo "== CI toolchain: compilers, psql, zsh, supplementary groups"
-# Offline, as runner. The image has no Go, so the race detector check is
-# gcc's -fsanitize=thread (the runtime `go test -race` builds on through
-# cgo): a race-free program must run clean and a racy one must be reported.
+# Offline, as runner. With no Go in the image, gcc -fsanitize=thread stands
+# in for `go test -race` (also ThreadSanitizer, through cgo).
 # shellcheck disable=SC2016 # the script expands inside the container
 run --network none -e PSQL_MAJOR="$psql_major" --entrypoint sh "$TAG" -euc '
-	gcc --version | head -1
-	g++ --version | head -1
-	make --version | head -1
-	d=$(mktemp -d)
-	cd "$d"
+	die() { echo "$*" >&2; exit 1; }
+	# The assignment, not a pipe, so that a missing tool fails under -e.
+	for t in gcc g++ make; do v=$($t --version); echo "$v" | head -1; done
+	cd "$(mktemp -d)"
 	cat >tsan.c <<"EOF"
 #include <pthread.h>
 #include <stdio.h>
@@ -251,29 +249,33 @@ int main(void) {
 }
 EOF
 	gcc -fsanitize=thread -g -DLOCKED -o locked tsan.c
-	[ "$(./locked)" = 200000 ] || { echo "-fsanitize=thread: race-free program failed" >&2; exit 1; }
+	[ "$(./locked)" = 200000 ] || die "-fsanitize=thread: race-free program failed"
 	gcc -fsanitize=thread -g -o racy tsan.c
 	rc=0; ./racy >/dev/null 2>racy.err || rc=$?
 	[ "$rc" = 66 ] && grep -q "WARNING: ThreadSanitizer: data race" racy.err ||
-		{ echo "-fsanitize=thread did not report the race (exit $rc)" >&2; cat racy.err >&2; exit 1; }
+		die "-fsanitize=thread did not report the race (exit $rc): $(cat racy.err)"
 	echo "gcc -fsanitize=thread: race-free program clean, racy program reported"
 	printf "#include <iostream>\nint main() { std::cout << \"ok\" << std::endl; }\n" >hello.cc
 	g++ -o hello hello.cc
-	[ "$(./hello)" = ok ] || { echo "g++ hello failed" >&2; exit 1; }
+	[ "$(./hello)" = ok ] || die "g++ hello failed"
 	echo "g++: compiled and ran a C++ hello"
 	v=$(psql --version)
 	echo "$v"
-	case $v in "psql (PostgreSQL) $PSQL_MAJOR."*) ;; *) echo "psql is [$v], want major $PSQL_MAJOR" >&2; exit 1 ;; esac
-	[ "$(zsh -c "echo ok")" = ok ] || { echo "zsh -c failed" >&2; exit 1; }
-	echo "zsh $(zsh -c "echo \$ZSH_VERSION"): ok"
+	case $v in "psql (PostgreSQL) $PSQL_MAJOR."*) ;; *) die "psql is [$v], want major $PSQL_MAJOR" ;; esac
+	v=$(zsh -c "echo ok \$ZSH_VERSION")
+	[ "${v%% *}" = ok ] || die "zsh -c printed [$v]"
+	echo "zsh ${v#ok }: ok"
 	# The user database, and the groups the container process actually got.
 	for g in "$(id -nG runner)" "$(id -nG)"; do
-		case " $g " in *" adm "*) ;; *) echo "groups [$g] lack adm" >&2; exit 1 ;; esac
-		case " $g " in *" docker "*) ;; *) echo "groups [$g] lack docker" >&2; exit 1 ;; esac
+		for want in adm docker; do
+			case " $g " in *" $want "*) ;; *) die "groups [$g] lack $want" ;; esac
+		done
 	done
 	echo "id -nG runner: $(id -nG runner); process groups: $(id -nG)"
-	[ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ] || { echo "a rootful Docker socket exists" >&2; exit 1; }
-	[ -z "$(find / -xdev -group docker 2>/dev/null)" ] || { echo "files owned by group docker: $(find / -xdev -group docker 2>/dev/null)" >&2; exit 1; }
+	[ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ] || die "a rootful Docker socket exists"
+	# find exits 1 on the directories runner cannot read.
+	f=$(find / -xdev -group docker 2>/dev/null || true)
+	[ -z "$f" ] || die "files owned by group docker: $f"
 	echo "no rootful Docker socket and no file owned by group docker"
 '
 
@@ -499,6 +501,15 @@ set -eu
 img=moby/buildkit:buildx-stable-1
 pinned=moby/buildkit:$BK_VERSION
 echo "rootless=$(docker info --format "{{.SecurityOptions}}" | grep -o rootless) driver=$(docker info --format "{{.Driver}}")"
+# runner joins group docker: the daemon's socket must stay runner's, in
+# runner's 0700 runtime dir, whatever group dockerd gives it.
+sock=${DOCKER_HOST#unix://}
+got=$(stat -c "%U %a" "$XDG_RUNTIME_DIR")
+[ "$got" = "runner 700" ] || { echo "$XDG_RUNTIME_DIR is $got, want runner 700" >&2; exit 1; }
+[ "$(dirname "$sock")" = "$XDG_RUNTIME_DIR" ] || { echo "$sock is outside $XDG_RUNTIME_DIR" >&2; exit 1; }
+got=$(stat -c "%U:%G" "$sock")
+case $got in runner:runner | runner:docker) ;; *) echo "$sock is owned by $got, want runner:runner or runner:docker" >&2; exit 1 ;; esac
+echo "socket $sock is $got $(stat -c %a "$sock") in $XDG_RUNTIME_DIR (runner 700)"
 # With the containerd image store an image's ID is the digest of what was
 # pulled or loaded: here the multi-arch index.
 for ref in "$img" "$pinned"; do
