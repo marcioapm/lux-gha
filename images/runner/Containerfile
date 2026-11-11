@@ -338,6 +338,24 @@ RUN apt-get update; \
       ffmpeg espeak-ng libgl1; \
     rm -rf /var/lib/apt/lists/*
 
+# Tools that GitHub-hosted Ubuntu runners ship and that repository test suites
+# expect on PATH: gcc, g++, make, libc6-dev and libcrypt-dev for cgo,
+# `go test -race` and Python sdists with C/C++ extensions (build-essential's
+# set without dpkg-dev); Ubuntu's default postgresql-client (psql 18 on
+# 26.04); zsh.
+# `runner` joins adm and docker, as on hosted runners, for tests that need a
+# supplementary group. In this image's default runtime (no socket or log
+# mounted from outside) neither gives runner more than it already has: adm
+# reads the build-time apt logs; docker owns no image file and at most
+# group-owns rootless dockerd's socket, which sits in runner's 0700
+# XDG_RUNTIME_DIR; and the strip below leaves no setgid program.
+# Installed after the browser layer so a change here rebuilds nothing above.
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends gcc g++ make libc6-dev libcrypt-dev postgresql-client zsh; \
+    rm -rf /var/lib/apt/lists/*; \
+    usermod -aG docker,adm runner; \
+    [ "$(id -nG runner)" = "runner adm docker" ] || { echo "runner groups: $(id -nG runner)" >&2; exit 1; }
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.

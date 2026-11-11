@@ -47,7 +47,32 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   available locally; total baseline size and compressed sizes were not measured. All 36 direct packages
   exist in the resolute arm64/`all` indexes, but native arm64 browser validation and image sizes are
   unmeasured locally; CI runs that native gate. Historical 24.04 sizes do not describe this image.
-- User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`.
+- Tools that GitHub-hosted Ubuntu runners ship and that repository test suites expect on `PATH`, from Ubuntu
+  26.04's archive:
+  - gcc and g++ 15, `make`, `libc6-dev` and `libcrypt-dev`: `build-essential`'s set without `dpkg-dev`,
+    which only Debian package builds need. These cover cgo, including `go test -race`, and Python sdists with
+    C/C++ extensions (for example `jsonnet==0.21.0`, which has no aarch64 wheel).
+  - `postgresql-client`, Ubuntu's default: `psql` **18** (18.6 on 2026-11-11).
+  - `zsh` 5.9.
+
+  On arm64, `docker image inspect` grows from 2,780,563,801 to 3,073,153,988 bytes (+292,590,187); `docker history`
+  shows 293 MB for the layer. Measured by layering this layer and the setuid strip on the published v0.3.5 image
+  (2026-11-11). By dpkg `Installed-Size` (KiB, 45 new packages): gcc, g++ and binutils with their compiler
+  libraries (the sanitizer runtimes, `libstdc++-15-dev`, `libgcc-15-dev`, `cpp`) about 240,800; `zsh` and
+  `zsh-common` 20,200; the C library headers (`libc6-dev`, `linux-libc-dev`, `libcrypt-dev` and their tools)
+  19,600; `postgresql-client-18` and `libpq5` 6,100; `make` 480. Perl, including `libperl5.40`, adds nothing:
+  v0.3.5 already has it for git. Installing `build-essential` instead would add `dpkg-dev`, `libdpkg-perl`,
+  `patch`, `bzip2` and `lto-disabled-list` (about 4,000 KiB by dpkg, 1.7 MB measured). amd64 has not been
+  measured locally; CI's native amd64 image job builds it.
+- User `runner` (uid/gid 1000) with `/etc/subuid` and `/etc/subgid` ranges `1:999` and `1001:64535`. It is also
+  in the supplementary groups `adm` and `docker`, as on GitHub-hosted runners, for tests that need a second
+  group. In the default image and runtime, with no socket or log mounted from outside, neither group gives
+  `runner` anything it does not already have. `adm` can read the build-time apt log
+  `/var/log/apt/term.log`. No image file belongs to `docker`, and there is no rootful daemon or
+  `/var/run/docker.sock`. The entrypoint starts rootless dockerd without `--group`, so the daemon may
+  group-own its per-Run socket as `docker`. That socket is owned by `runner` and sits in `$XDG_RUNTIME_DIR`,
+  which is `runner`'s and mode 0700. `smoke.sh --privileged` asserts both, and allows either `runner` or
+  `docker` as the socket's group. With no setgid programs, neither group lends its rights to anything else.
   The image is `USER runner`. It has no `sudo` and no setuid or setgid files: a nested Lux Run has no
   `no-new-privileges`, so either would let a job become root in its container.
 - The project licence at `/usr/share/lux-gha/LICENSE`, copied from `images/runner/LICENSE`, which must stay
@@ -59,6 +84,22 @@ the JIT config Lux places as a file secret. It exits when the runner exits.
   hosted runners keep it: `actions/setup-python`'s CPython has its library RUNPATH there and fails to load
   `libpython` elsewhere once `LD_LIBRARY_PATH` is dropped. It is not on the Lux volume, so tools a job installs are
   still per-Run. The tool cache comes preinstalled; see [Preinstalled tool cache](#preinstalled-tool-cache).
+
+## GitHub-hosted parity
+
+Still missing compared with GitHub-hosted `ubuntu-24.04`, one line each:
+
+- A running systemd: `systemctl` and `systemd-analyze` are installed (systemd 259.9), but systemd is not PID 1,
+  so there is no service manager to talk to.
+- `sudo` and root: jobs cannot `apt-get install`.
+- Podman, Buildah and Skopeo.
+- Go: it is not in the tool cache, so `actions/setup-go` downloads it.
+- Tool cache versions other than the [preinstalled ones](#preinstalled-tool-cache): other Python, Node and
+  Java versions, plus Ruby and PyPy.
+- Database servers: no PostgreSQL or MySQL server and no service running at start.
+- Cloud CLIs other than AWS (`az`, `gcloud`), plus `kubectl`, `helm` and `terraform`.
+- Browsers: no preinstalled Chrome, Firefox or Edge, and no chromedriver.
+- clang/LLVM, and the gfortran and older gcc versions that hosted runners carry.
 
 ## Preinstalled tool cache
 
@@ -196,7 +237,7 @@ output and no argument.
 
 ```sh
 make image PLATFORM=linux/arm64            # or linux/amd64; loads lux-gha-runner:dev
-images/runner/smoke.sh                     # tools, caps, runner version, browser deps, entrypoint lifecycle and failure modes
+images/runner/smoke.sh                     # tools, caps, runner version, CI toolchain, browser deps, entrypoint lifecycle and failure modes
 images/runner/smoke.sh --privileged        # also rootless dockerd, the BuildKit preload, docker-container builders offline and online
 images/runner/smoke.sh --checksum-negative # a wrong runner SHA-256 must fail the build; rebuilds the runner layer
 PLATFORM=linux/amd64 images/runner/smoke.sh  # the same for linux/amd64 (default linux/arm64)
@@ -215,6 +256,14 @@ ensurepip` works and `python3.11 -m venv` creates a venv with pip. Under `--priv
 `preloaded` line, and the store must hold the pinned index and `PLATFORM` manifest under both tags. With
 `--network none`, a `docker-container` builder must bootstrap from the preloaded image. With network,
 `docker pull` of the pinned version tag must download nothing, and a builder pinned to it builds and runs an image.
+
+For CI tools, `smoke.sh` runs as `runner` with `--network none`. It requires `gcc`, `g++` and `make` to
+report their versions, and a C++ hello to compile and run. Go is in neither the image nor the tool cache,
+so the race-detector check uses gcc's `-fsanitize=thread`. Go's race detector is also ThreadSanitizer, and
+`go test -race` needs cgo and so a C compiler. A race-free C program must run clean, and the same program
+without its mutex must be reported as a data race. It also requires `psql --version` to report major 18,
+`zsh -c` to run, and both `id -nG runner` and the process's own groups to include `adm` and `docker`. Finally
+it checks that there is no rootful Docker socket and no file owned by group `docker`.
 
 For browser jobs, `smoke.sh` muxes `espeak-ng` speech with an `ffmpeg` test source into an H.264/AAC mp4 and
 checks both streams. As `runner`, with network, it installs playwright-core 1.64.1 from npm and its Chromium
