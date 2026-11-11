@@ -338,6 +338,22 @@ RUN apt-get update; \
       ffmpeg espeak-ng libgl1; \
     rm -rf /var/lib/apt/lists/*
 
+# Tools that GitHub-hosted Ubuntu runners ship and that repository test suites
+# expect on PATH: build-essential (gcc, g++, make, libc6-dev, dpkg-dev) for
+# cgo, `go test -race` and Python sdists with C/C++ extensions; Ubuntu's
+# default postgresql-client (psql 18 on 26.04); zsh. `runner` joins docker
+# and adm, as on hosted runners, for tests that need a supplementary group.
+# Membership grants nothing here: there is no rootful daemon or
+# /var/run/docker.sock (rootless dockerd's socket is owned by runner), no
+# file belongs to group docker, adm can read only apt's logs under /var/log,
+# and the strip below leaves no setgid program to act through either group.
+# Installed after the browser layer so a change here rebuilds nothing above.
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends build-essential postgresql-client zsh; \
+    rm -rf /var/lib/apt/lists/*; \
+    usermod -aG docker,adm runner; \
+    [ "$(id -nG runner)" = "runner adm docker" ] || { echo "runner groups: $(id -nG runner)" >&2; exit 1; }
+
 # Lux runs nested workloads without no-new-privileges, so any setuid or
 # setgid program would let the job become root in its container. Strip them
 # all; newuidmap/newgidmap get only the file capability they need.
