@@ -480,9 +480,9 @@ func newBudgetEnv(t *testing.T) (*env, []string) {
 	e.pass()
 	startup = e.gh.callCount() - startup
 	e.gh.fail = nil
-	// Every repository is read once at startup: 3 calls each, plus the
+	// Every repository is read once at startup: 4 calls each, plus the
 	// listing, the two jobs read and the two JIT registrations.
-	if startup > 68*3+10 || len(runnerLists) != 68 {
+	if startup > 68*4+10 || len(runnerLists) != 68 {
 		t.Fatalf("startup pass made %d calls, read %d repositories", startup, len(runnerLists))
 	}
 	for repo, n := range runnerLists {
@@ -965,8 +965,8 @@ func TestRepositoryListedTwiceIsReadOnce(t *testing.T) {
 	if st := e.pass(); st.Demand["default"] != 1 || st.Provisioned != 1 {
 		t.Fatalf("status %+v", st)
 	}
-	// 2 run lists, 1 job list, 1 runner list, 1 JIT registration.
-	if reads := e.gh.takeReads(); reads[repoName(1)] != 5 {
+	// 3 run lists, 1 job list, 1 runner list, 1 JIT registration.
+	if reads := e.gh.takeReads(); reads[repoName(1)] != 6 {
 		t.Fatalf("reads %v", reads)
 	}
 }
@@ -1264,5 +1264,136 @@ func TestDeliveryOutlastingHotWindowIsReadByTheNextTickPass(t *testing.T) {
 				t.Fatalf("acme/r27 delivered during a %s pause was not read by the first tick pass after it", pause)
 			}
 		})
+	}
+}
+
+func TestJobsReleasedByAConcurrencyGroupInADiscoveredRepositoryGetRuns(t *testing.T) {
+	e := newDiscoveryEnv(t, 30)
+	repo := repoName(5)
+	e.gh.queueIn(repo, 50, 1, "queued", lux3...)
+	e.pass()
+	if err := e.gh.pick(runnerIn(repoID(5), 1, 0), 1); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.queueIn(repo, 50, 2, "pending", lux3...)
+	e.gh.queueIn(repo, 50, 3, "pending", lux3...)
+	e.clock.Add(time.Minute)
+	e.pass()
+	e.gh.complete(1, "success")
+	for _, job := range []int64{2, 3} {
+		e.gh.editJob(job, func(j *fakeJob) { j.status = "queued" })
+		e.deliver("workflow_job", queuedInRun(repo, 50, job))
+		e.clock.Add(10 * time.Second)
+		e.wake()
+		if len(e.lux.liveForJob(itoa(job))) != 1 {
+			t.Fatalf("job %d released: live %+v", job, e.lux.live())
+		}
+		if err := e.gh.pick(runnerIn(repoID(5), job, 0), job); err != nil {
+			t.Fatal(err)
+		}
+		e.gh.complete(job, "success")
+	}
+}
+
+func TestJobReleasedBeforeARestartGetsARun(t *testing.T) {
+	e := newDiscoveryEnv(t, 3)
+	repo := repoName(1)
+	e.gh.queueIn(repo, 10, 1, "pending", lux3...)
+	e.gh.queueIn(repo, 10, 2, "pending", "self-hosted", "gpu")
+	e.pass()
+	e.gh.editJob(1, func(j *fakeJob) { j.status = "queued" })
+	e.rec = e.newReconciler()
+	e.clock.Add(time.Minute)
+	e.pass()
+	if len(e.lux.liveForJob("1")) != 1 {
+		t.Fatalf("released job not provisioned after a restart: live %+v", e.lux.live())
+	}
+}
+
+func TestJobReleasedWhileTheCapIsFullGetsARunOnceItFrees(t *testing.T) {
+	e := newDiscoveryEnv(t, 3, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	repo := repoName(1)
+	e.gh.queueIn(repoName(0), 5, 5, "queued", lux3...)
+	e.gh.queueIn(repo, 10, 1, "pending", lux3...)
+	e.gh.queueIn(repo, 10, 2, "pending", "self-hosted", "gpu")
+	e.pass()
+	if err := e.gh.pick(runnerIn(repoID(0), 5, 0), 5); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.editJob(1, func(j *fakeJob) { j.status = "queued" })
+	e.deliver("workflow_job", queuedInRun(repo, 10, 1))
+	e.clock.Add(10 * time.Second)
+	e.wake()
+	if len(e.lux.liveForJob("1")) != 0 {
+		t.Fatalf("provisioned past a full cap: live %+v", e.lux.live())
+	}
+	e.gh.complete(5, "success")
+	for range 12 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if len(e.lux.liveForJob("1")) != 1 {
+		t.Fatalf("released job missed after the cap freed: live %+v", e.lux.live())
+	}
+}
+
+func TestManyPendingWorkflowRunsStayWithinTheHourlyBudget(t *testing.T) {
+	e := newDiscoveryEnv(t, 67)
+	e.gh.perPage = 100
+	for i := range int64(1000) {
+		e.gh.queueIn(repoName(0), 10000+i, 100000+i, "pending", lux3...)
+	}
+	e.pass()
+	_, calls := e.sweep(time.Hour, 0, nil)
+	total := 0
+	for _, n := range calls {
+		total += n
+	}
+	if total >= 5000 {
+		t.Fatalf("%d calls in the hour over %d passes", total, len(calls))
+	}
+	t.Logf("%d passes, %d calls in the hour, max %d per pass", len(calls), total, slices.Max(calls))
+}
+
+func queuedInRun(repo string, runID, job int64) []byte {
+	return []byte(fmt.Sprintf(`{"action":"queued","installation":{"id":42},"repository":{"full_name":%q},
+		"workflow_job":{"id":%d,"run_id":%d,"run_attempt":1,"status":"queued","labels":["self-hosted","lux"]}}`, repo, job, runID))
+}
+
+func TestPendingRunsOfOneRepositoryDoNotUseUpAnotherRepositorysStartupScan(t *testing.T) {
+	e := newDiscoveryEnv(t, 2)
+	e.cfg.Reconcile.MaxJobsPerPass = 4
+	for i := range int64(10) {
+		e.gh.queueIn(repoName(0), 100+i, 10+i, "pending", lux3...)
+	}
+	e.gh.queueIn(repoName(1), 200, 1, "queued", lux3...)
+	e.gh.queueIn(repoName(1), 200, 2, "pending", "self-hosted", "gpu")
+	for range 11 {
+		e.pass()
+		e.clock.Add(time.Minute)
+	}
+	if len(e.lux.liveForJob("1")) != 1 {
+		t.Fatalf("job released before startup in %s missed: live %+v", repoName(1), e.lux.live())
+	}
+}
+
+func TestJobReleasedWhileItsRepositoryWasOutOfTheInstallationGetsARun(t *testing.T) {
+	e := newDiscoveryEnv(t, 3)
+	repo := repoName(1)
+	e.pass()
+	e.gh.repo(repo).uninstalled = true
+	e.deliver("installation_repositories", installationDelivery("removed", 42))
+	e.clock.Add(time.Minute)
+	e.pass()
+	e.gh.queueIn(repo, 10, 1, "queued", lux3...)
+	e.gh.queueIn(repo, 10, 2, "pending", "self-hosted", "gpu")
+	e.gh.repo(repo).uninstalled = false
+	e.deliver("installation_repositories", installationDelivery("added", 42))
+	for range 11 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if len(e.lux.liveForJob("1")) != 1 {
+		t.Fatalf("job released while out of the installation missed: live %+v", e.lux.live())
 	}
 }
