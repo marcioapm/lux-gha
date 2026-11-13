@@ -120,6 +120,7 @@ type fakeGitHub struct {
 	// holdRuns, when set, runs before every runs listing, outside the lock,
 	// with the caller's context; its error is the listing's.
 	holdRuns func(ctx context.Context) error
+	listRuns func(repo, status string)
 	// perPage bounds page sizes to exercise paging.
 	perPage int
 	// endlessListing makes installation repository pages claim a next one
@@ -256,7 +257,7 @@ func (f *fakeGitHub) branchAt(name, tip string, ancestors ...string) {
 }
 
 func (r *fakeRepo) runStatus(runID int64) string {
-	var queued, active, done int
+	var queued, active, done, pending int
 	for _, j := range r.jobs {
 		if j.runID != runID || j.superseded {
 			continue
@@ -264,6 +265,8 @@ func (r *fakeRepo) runStatus(runID int64) string {
 		switch j.status {
 		case "queued", "waiting":
 			queued++
+		case "pending":
+			pending++
 		case "in_progress":
 			active++
 		default:
@@ -271,6 +274,8 @@ func (r *fakeRepo) runStatus(runID int64) string {
 		}
 	}
 	switch {
+	case pending > 0:
+		return "pending"
 	case active > 0 || (queued > 0 && done > 0):
 		return "in_progress"
 	case queued > 0:
@@ -301,6 +306,9 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 	r, err := f.gate(opRuns, repo, opts.Page)
 	if err != nil {
 		return githubapp.WorkflowRunPage{}, err
+	}
+	if f.listRuns != nil && opts.Page <= 1 {
+		f.listRuns(repo.Owner+"/"+repo.Name, opts.Status)
 	}
 	var ids []int64
 	for _, j := range r.jobs {

@@ -178,6 +178,9 @@ type Reconciler struct {
 	lostLive     map[string]bool        // Run id: live at the last discoverLost; nil makes the next one list
 	disc         *discovery             // nil with an explicit repository list
 
+	scannedPending map[int64]bool
+	queuedJobs     heldJobs
+
 	mu     sync.Mutex
 	status Status
 
@@ -222,6 +225,7 @@ func New(o Options) (*Reconciler, error) {
 			return t.C, t.Stop
 		},
 	}
+	r.scannedPending, r.queuedJobs.jobs = map[int64]bool{}, map[string]map[int64]heldJob{}
 	if o.Config.DiscoverRepositories() {
 		r.disc = newDiscovery()
 	}
@@ -510,6 +514,9 @@ func (p *pass) readGitHub(repositories []string) error {
 			p.r.log.Error("reading repository failed", "repository", full, "error", err)
 			p.setError(ErrGitHub)
 			p.unread = true
+			if repositoryInaccessible(err) {
+				delete(p.r.scannedPending, p.r.repoIDs[full])
+			}
 			continue
 		}
 		p.repos = append(p.repos, v)
@@ -533,6 +540,9 @@ func (p *pass) readRepo(v *repoView) error {
 	}
 	v.id = id
 	if err := p.readDemand(v); err != nil {
+		return err
+	}
+	if err := p.readHeldDemand(v); err != nil {
 		return err
 	}
 	prefix := p.r.runnerPrefix(v.id)

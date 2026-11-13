@@ -193,6 +193,7 @@ func (p *pass) forgetRemoved() {
 			delete(r.repoIDs, full)
 		}
 	}
+	maps.DeleteFunc(r.scannedPending, func(id int64, _ bool) bool { return !present[id] })
 	for _, id := range sortedKeys(d.attempted) {
 		if present[id] {
 			continue
@@ -417,10 +418,14 @@ func (p *pass) noteRead(full string, err error) {
 	if !d.known[id] && before {
 		p.r.log.Warn("repository has never been read successfully; creation is blocked while it fails", "repository", full)
 	}
-	var apiErr *githubapp.APIError
-	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusForbidden) {
+	if repositoryInaccessible(err) {
 		d.requestRefresh()
 	}
+}
+
+func repositoryInaccessible(err error) bool {
+	var apiErr *githubapp.APIError
+	return errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusForbidden)
 }
 
 // recordReads remembers, for each repository read this pass, whether it

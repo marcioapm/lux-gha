@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -1841,6 +1842,303 @@ func TestUnresolvedRunnerHoldsASlotOnEveryRouteItsLabelsContain(t *testing.T) {
 					t.Fatalf("job 8 got a Run while job 7's submission held the slot")
 				}
 			})
+		}
+	}
+}
+
+func TestJobReleasedByAConcurrencyGroupGetsARunWhenItsQueuedDeliveryArrives(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	e.gh.queueIn(widgets, 70, 8, "pending", lux3...)
+	if st := e.pass(); st.Error != "" || st.Provisioned != 0 {
+		t.Fatalf("held: %+v", st)
+	}
+	e.gh.editJob(7, func(j *fakeJob) { j.status = "queued" })
+	e.deliverQueued(widgets, 7)
+	e.clock.Add(10 * time.Second)
+	if st := e.wake(); st.Error != "" || st.Provisioned != 1 || len(e.lux.liveForJob("7")) != 1 || len(e.lux.liveForJob("8")) != 0 {
+		t.Fatalf("released: %+v live=%+v", st, e.lux.live())
+	}
+}
+
+func TestQueuedJobInAPendingWorkflowRunAtStartupGetsARun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 1, "completed", lux3...)
+	e.gh.queueIn(widgets, 70, 2, "queued", lux3...)
+	e.gh.queueIn(widgets, 70, 3, "pending", lux3...)
+	st := e.pass()
+	if st.Error != "" || st.Provisioned != 1 || st.Demand["default"] != 1 || len(e.lux.liveForJob("2")) != 1 || len(e.lux.liveForJob("3")) != 0 {
+		t.Fatalf("status %+v live=%+v", st, e.lux.live())
+	}
+}
+
+func TestPendingWorkflowRunsAreListedOnceAfterStartup(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	listed := map[string]int{}
+	e.gh.listRuns = func(_, status string) { listed[status]++ }
+	for range 5 {
+		e.pass()
+		e.clock.Add(time.Minute)
+	}
+	if want := map[string]int{"in_progress": 5, "queued": 5, "pending": 1}; !maps.Equal(listed, want) {
+		t.Fatalf("listed %v, want %v", listed, want)
+	}
+}
+
+func TestPendingWorkflowRunsShareTheQueuedAllowance(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Reconcile.MaxJobsPerPass = 4
+	for i := range int64(10) {
+		e.gh.queueIn(widgets, 100+i, 10+i, "pending", lux3...)
+	}
+	read := map[string]int{}
+	e.gh.fail = func(op, _ string, _ int) error {
+		read[op]++
+		return nil
+	}
+	e.pass()
+	if read[opJobs] != 2 {
+		t.Fatalf("read the jobs of %d pending workflow runs with a queued allowance of 2", read[opJobs])
+	}
+}
+
+func TestQueuedDeliveryOfAJobNeverListedIsFollowedForTheHotWindow(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 8, "pending", lux3...)
+	e.deliverQueued(widgets, 7)
+	ops := countOps(e, nil)
+	for range 10 {
+		e.pass()
+		e.clock.Add(time.Minute)
+	}
+	if ops[opGetRun] != 3 {
+		t.Fatalf("followed the delivered job's run %d times in 10 one-minute passes", ops[opGetRun])
+	}
+}
+
+func TestQueuedJobTheCapsKeepUnservedIsFollowedForADay(t *testing.T) {
+	e := newEnv(t, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	e.gh.queue(5, "queued", lux3...)
+	e.pass()
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.gh.queueIn(widgets, 70, 8, "pending", lux3...)
+	e.deliverQueued(widgets, 7)
+	ops := countOps(e, nil)
+	e.pass()
+	e.clock.Add(23 * time.Hour)
+	e.pass()
+	if ops[opGetRun] != 2 {
+		t.Fatalf("followed %d times within a day", ops[opGetRun])
+	}
+	e.clock.Add(time.Hour)
+	clear(ops)
+	e.pass()
+	if ops[opGetRun] != 0 {
+		t.Fatalf("still following after a day: %d reads", ops[opGetRun])
+	}
+}
+
+func TestJobReleasedWhileAConfiguredRepositoryWasUnreadableGetsARun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 8, "pending", "self-hosted", "gpu")
+	e.pass()
+	e.gh.repo(widgets).uninstalled = true
+	e.clock.Add(time.Minute)
+	e.pass()
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.gh.repo(widgets).uninstalled = false
+	e.clock.Add(time.Minute)
+	e.pass()
+	if len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("job released while its repository was unreadable missed: live %+v", e.lux.live())
+	}
+}
+
+func TestJobReleasedDuringARateLimitPauseGetsARunOnceItEnds(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	e.gh.queueIn(widgets, 70, 8, "pending", "self-hosted", "gpu")
+	e.pass()
+	e.gh.rateLimitUntil = e.clock.Now().Add(10 * time.Minute)
+	e.clock.Add(time.Minute)
+	if st := e.pass(); st.Error != ErrRateLimited {
+		t.Fatalf("status %+v", st)
+	}
+	e.gh.editJob(7, func(j *fakeJob) { j.status = "queued" })
+	e.deliverQueued(widgets, 7)
+	e.clock.Add(10 * time.Minute)
+	e.pass()
+	if len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("job released during a rate-limit pause missed: live %+v", e.lux.live())
+	}
+}
+
+func TestPendingWorkflowRunsAreNotListedAgainWhileAReadKeepsFailing(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	e.pass()
+	listed := 0
+	e.gh.listRuns = func(_, status string) {
+		if status == "pending" {
+			listed++
+		}
+	}
+	countOps(e, failing(opRunners, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+	for range 5 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if listed != 0 {
+		t.Fatalf("listed pending workflow runs %d times while the runner listing failed", listed)
+	}
+}
+
+func TestPendingWorkflowRunsAreNotListedAgainWhenTheFirstReadFailsAfterListingThem(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	listed := 0
+	e.gh.listRuns = func(_, status string) {
+		if status == "pending" {
+			listed++
+		}
+	}
+	countOps(e, failing(opRunners, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+	for range 4 {
+		e.pass()
+		e.clock.Add(time.Minute)
+	}
+	if listed != 1 {
+		t.Fatalf("listed pending workflow runs %d times while the runner listing failed", listed)
+	}
+}
+
+func TestDeliveredJobsOfCompletedWorkflowRunsShareTheQueuedAllowance(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Reconcile.MaxJobsPerPass = 4
+	for job := range int64(10) {
+		e.gh.queueIn(widgets, 100+job, 10+job, "completed", lux3...)
+		e.deliver("workflow_job", queuedInRun(widgets, 100+job, 10+job))
+	}
+	ops := countOps(e, nil)
+	e.pass()
+	if ops[opGetRun] != 2 {
+		t.Fatalf("fetched %d delivered workflow runs with a queued allowance of 2", ops[opGetRun])
+	}
+}
+
+func TestFailedFetchesOfDeliveredWorkflowRunsShareTheQueuedAllowance(t *testing.T) {
+	e := newEnv(t, replace(`"repositories": ["acme/widgets"]`, `"repositories": ["acme/widgets", "acme/gadgets", "acme/gizmos"]`))
+	e.cfg.Reconcile.MaxJobsPerPass = 4
+	for i, repo := range []string{widgets, "acme/gadgets", "acme/gizmos"} {
+		if repo != widgets {
+			e.gh.addRepo(repo, 3000+int64(i))
+		}
+		e.gh.queueIn(repo, 100+int64(i), 10+int64(i), "pending", lux3...)
+	}
+	e.pass()
+	for i, repo := range []string{widgets, "acme/gadgets", "acme/gizmos"} {
+		e.deliver("workflow_job", queuedInRun(repo, 500+int64(i), 50+int64(i)))
+	}
+	ops := countOps(e, failing(opGetRun, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+	e.clock.Add(time.Minute)
+	e.pass()
+	if ops[opGetRun] != 2 {
+		t.Fatalf("fetched %d delivered workflow runs with a queued allowance of 2", ops[opGetRun])
+	}
+}
+
+func TestReleasedJobGetsARunWhenTheQueuedAllowanceIsOne(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.Reconcile.MaxJobsPerPass = 1
+	e.gh.queueIn(widgets, 70, 7, "pending", lux3...)
+	e.gh.queueIn(widgets, 70, 8, "pending", "self-hosted", "gpu")
+	e.pass()
+	e.pass()
+	e.gh.editJob(7, func(j *fakeJob) { j.status = "queued" })
+	e.deliverQueued(widgets, 7)
+	for range 2 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if len(e.lux.liveForJob("7")) != 1 {
+		t.Fatalf("released job missed with maxJobsPerPass 1: live %+v", e.lux.live())
+	}
+}
+
+func TestQueuedDeliveryOfAListedJobIsNotFollowed(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.deliverQueued(widgets, 7)
+	ops := countOps(e, nil)
+	e.pass()
+	e.gh.complete(7, "success")
+	for range 3 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if ops[opGetRun] != 0 {
+		t.Fatalf("fetched the workflow run of a listed job %d times", ops[opGetRun])
+	}
+}
+
+func TestReleasedJobIsNotFollowedOnceItsStartIsDelivered(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 8, "pending", "self-hosted", "gpu")
+	e.pass()
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.deliverQueued(widgets, 7)
+	e.clock.Add(10 * time.Second)
+	e.wake()
+	if err := e.gh.pick(runner("7", 0), 7); err != nil {
+		t.Fatal(err)
+	}
+	e.deliver("workflow_job", []byte(`{"action":"in_progress","installation":{"id":42},"repository":{"full_name":"acme/widgets"},
+		"workflow_job":{"id":7,"run_id":70,"run_attempt":1,"status":"in_progress","labels":["self-hosted","lux"],"runner_name":"`+runner("7", 0)+`"}}`))
+	ops := countOps(e, nil)
+	for range 3 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if ops[opGetRun] != 0 {
+		t.Fatalf("fetched the workflow run %d times after the job's start was delivered", ops[opGetRun])
+	}
+}
+
+func TestReleasedJobsInTwoRepositoriesAreServedInTurnUnderACapOfOne(t *testing.T) {
+	e := newDiscoveryEnv(t, 2, replace(`"maxRunners": 10`, `"maxRunners": 1`))
+	e.cfg.Reconcile.MaxJobsPerPass = 2
+	e.pass()
+	var jobs []int64
+	for r := range 2 {
+		for k := range 4 {
+			run, job := int64(1000+r*10+k), int64(100+r*10+k)
+			e.gh.queueIn(repoName(r), run, job+5000, "pending", "self-hosted", "gpu")
+			e.gh.queueIn(repoName(r), run, job, "queued", lux3...)
+			e.deliver("workflow_job", queuedInRun(repoName(r), run, job))
+			jobs = append(jobs, job)
+		}
+	}
+	e.clock.Add(5 * time.Second)
+	e.wake()
+	served := map[string]bool{}
+	for range 60 {
+		for _, run := range e.lux.live() {
+			job := run.run.Labels[LabelJob]
+			served[job] = true
+			id, _ := strconv.ParseInt(job, 10, 64)
+			if err := e.gh.pick(run.run.Labels[LabelRunner], id); err != nil {
+				t.Fatal(err)
+			}
+			e.gh.complete(id, "success")
+			e.lux.end(run.run.ID, "exited")
+		}
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	for _, job := range jobs {
+		if !served[itoa(job)] {
+			t.Fatalf("released job %d never got a run: served %v", job, served)
 		}
 	}
 }
