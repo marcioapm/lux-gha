@@ -744,6 +744,27 @@ func (e *env) swappedLoss(actualRun, triggerAttempt, actualAttempt int64, trigge
 	e.gh.complete(8, "cancelled")
 }
 
+// swappedPairs provisions each pair's trigger job in workflow run 70; the
+// pair's actual job, in workflow run 80, takes the trigger's runner and is
+// cancelled, while the trigger succeeds elsewhere. The Runs stay live.
+func (e *env) swappedPairs(pairs ...[2]int64) {
+	e.t.Helper()
+	for _, pair := range pairs {
+		e.gh.queueIn(widgets, 70, pair[0], "queued", lux3...)
+	}
+	e.pass()
+	for _, pair := range pairs {
+		trigger, actual := pair[0], pair[1]
+		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
+		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
+			e.t.Fatal(err)
+		}
+		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
+		e.gh.complete(trigger, "success")
+		e.gh.complete(actual, "cancelled")
+	}
+}
+
 func TestHostLossRerunFindsTheJobThatTookTheTriggerRunner(t *testing.T) {
 	for _, tc := range []struct {
 		name                               string
@@ -807,21 +828,8 @@ func TestHostLossSwappedJobRestartDoesNotDuplicateReruns(t *testing.T) {
 
 func TestHostLossSwappedSiblingStillStoppingBlocksGroupedRerun(t *testing.T) {
 	e := newEnv(t)
-	for _, trigger := range []int64{7, 9} {
-		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
-	}
-	e.pass()
+	e.swappedPairs([2]int64{7, 8}, [2]int64{9, 10})
 	id7, id9 := e.runID("7"), e.runID("9")
-	for _, trigger := range []int64{7, 9} {
-		actual := trigger + 1
-		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
-		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
-			t.Fatal(err)
-		}
-		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
-		e.gh.complete(trigger, "success")
-		e.gh.complete(actual, "cancelled")
-	}
 	e.lux.end(id7, preempt)
 	e.lux.setState(id9, "stopping")
 	ops := countOps(e, nil)
@@ -915,21 +923,9 @@ func TestHostLossSwappedUpgradeDoesNotRetrySuccessfulJob(t *testing.T) {
 func TestHostLossSwappedSiblingsAreGroupedWithOneRepositoryScan(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	for _, trigger := range []int64{7, 9, 11} {
-		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
-	}
-	e.pass()
-	for _, trigger := range []int64{7, 9, 11} {
-		id := e.runID(itoa(trigger))
-		actual := trigger + 1
-		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
-		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
-			t.Fatal(err)
-		}
-		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
-		e.gh.complete(trigger, "success")
-		e.lux.end(id, preempt)
-		e.gh.complete(actual, "cancelled")
+	e.swappedPairs([2]int64{7, 8}, [2]int64{9, 10}, [2]int64{11, 12})
+	for _, trigger := range []string{"7", "9", "11"} {
+		e.lux.end(e.runID(trigger), preempt)
 	}
 	ops := countOps(e, nil)
 	st := e.pass()
@@ -1096,20 +1092,9 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 
 func TestHostLossSwappedCachedPartialSearchKeepsSiblingsTogether(t *testing.T) {
 	e := newEnv(t)
-	for _, trigger := range []int64{7, 9} {
-		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
-	}
-	e.pass()
-	for _, trigger := range []int64{7, 9} {
-		actual := trigger + 1
-		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
-		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
-			t.Fatal(err)
-		}
-		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "external-runner")
-		e.gh.complete(trigger, "success")
-		e.gh.complete(actual, "cancelled")
-		e.lux.end(e.runID(itoa(trigger)), preempt)
+	e.swappedPairs([2]int64{7, 8}, [2]int64{9, 10})
+	for _, trigger := range []string{"7", "9"} {
+		e.lux.end(e.runID(trigger), preempt)
 	}
 	e.gh.queueIn(widgets, 80, 12, "completed", "ubuntu-latest")
 	e.gh.editJob(12, func(j *fakeJob) { j.conclusion = "success" })
@@ -1190,21 +1175,8 @@ func TestHostLossSwappedUnreadSiblingPagesBlockRerun(t *testing.T) {
 		for _, truncated := range []bool{false, true} {
 			t.Run(fmt.Sprintf("verified=%t/truncated=%t", verified, truncated), func(t *testing.T) {
 				e := newEnv(t)
-				for _, trigger := range []int64{7, 9} {
-					e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
-				}
-				e.pass()
+				e.swappedPairs([2]int64{7, 8}, [2]int64{9, 100})
 				id7, id9 := e.runID("7"), e.runID("9")
-				for _, pair := range [][2]int64{{7, 8}, {9, 100}} {
-					trigger, actual := pair[0], pair[1]
-					e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
-					if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
-						t.Fatal(err)
-					}
-					e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
-					e.gh.complete(trigger, "success")
-					e.gh.complete(actual, "cancelled")
-				}
 				e.lux.end(id7, preempt)
 				e.lux.setState(id9, "stopping")
 				if verified {
