@@ -304,14 +304,14 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 	}
 	var ids []int64
 	for _, j := range r.jobs {
-		if !slices.Contains(ids, j.runID) && r.runStatus(j.runID) == opts.Status {
+		if !slices.Contains(ids, j.runID) && (opts.Status == "" || r.runStatus(j.runID) == opts.Status) {
 			ids = append(ids, j.runID)
 		}
 	}
 	slices.Sort(ids)
 	var runs []githubapp.WorkflowRun
 	for _, id := range ids {
-		s := opts.Status
+		s := r.runStatus(id)
 		run := r.runs[id]
 		run.ID, run.Status, run.HeadSHA = id, &s, fakeSHA(id)
 		runs = append(runs, run)

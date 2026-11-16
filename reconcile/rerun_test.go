@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
@@ -167,7 +168,7 @@ func TestLostRunThatNeverHeldTheJobIsNotRerun(t *testing.T) {
 	ops := countOps(e, nil)
 	e.pass()
 	e.pass()
-	if len(e.gh.rerunJobs()) != 0 || ops[opGetJob] != 1 || ops[opGetRun] != 0 {
+	if len(e.gh.rerunJobs()) != 0 || ops[opGetRun] != 0 {
 		t.Fatalf("reruns %v ops %v", e.gh.rerunJobs(), ops)
 	}
 }
@@ -249,8 +250,9 @@ func TestHostLossRerunBound(t *testing.T) {
 			if reqs[0].Conclusion != tc.conclusion {
 				t.Fatalf("conclusion %q, want %q", reqs[0].Conclusion, tc.conclusion)
 			}
-			// A Run past the bound is not read when it ends.
-			if gets := e.lux.getCalls(); tc.reruns == 0 && len(gets) != 0 {
+			// Trigger attempts cannot exclude discovery: this runner may
+			// have executed an eligible job from another workflow.
+			if gets := e.lux.getCalls(); tc.reruns == 0 && tc.attempt != 3 && len(gets) != 0 {
 				t.Fatalf("gets %v", gets)
 			}
 		})
@@ -718,6 +720,233 @@ func TestRerunRateLimitAbortsThePass(t *testing.T) {
 				t.Fatalf("after the limit: %+v", st)
 			}
 		})
+	}
+}
+
+// swappedLoss provisions for job 7, but job 8 takes that runner and is
+// cancelled before a reconciliation pass can observe its assignment.
+func (e *env) swappedLoss(actualRun, triggerAttempt, actualAttempt int64, triggerActive bool) {
+	e.t.Helper()
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.gh.editJob(7, func(j *fakeJob) { j.attempt = triggerAttempt })
+	e.pass()
+	id := e.runID("7")
+	e.gh.queueIn(widgets, actualRun, 8, "queued", lux3...)
+	e.gh.editJob(8, func(j *fakeJob) { j.attempt = actualAttempt })
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		e.t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9001, "another-runner")
+	if !triggerActive {
+		e.gh.complete(7, "success")
+	}
+	e.lux.end(id, preempt)
+	e.gh.complete(8, "cancelled")
+}
+
+func TestHostLossRerunFindsTheJobThatTookTheTriggerRunner(t *testing.T) {
+	for _, tc := range []struct {
+		name                               string
+		run, triggerAttempt, actualAttempt int64
+		active                             bool
+		want                               int
+	}{
+		{"same workflow", 70, 1, 1, false, 1},
+		{"cross workflow trigger succeeded", 80, 1, 1, false, 1},
+		{"cross workflow trigger active", 80, 1, 1, true, 1},
+		{"trigger exhausted actual eligible", 80, 3, 1, false, 1},
+		{"trigger exhausted and active", 80, 3, 2, true, 1},
+		{"actual exhausted", 80, 1, 3, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.swappedLoss(tc.run, tc.triggerAttempt, tc.actualAttempt, tc.active)
+			st := e.pass()
+			if st.Error != "" || st.Rerun != tc.want || len(e.gh.rerunJobs()) != tc.want {
+				t.Fatalf("status %+v reruns %v, want %d", st, e.gh.rerunJobs(), tc.want)
+			}
+			if tc.want != 0 {
+				if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+					t.Fatalf("re-ran trigger instead of actual job: %v", e.gh.rerunJobs())
+				}
+				if j := e.gh.job(e.gh.rerunOf(8)); j == nil || j.runID != tc.run || j.attempt != tc.actualAttempt+1 {
+					t.Fatalf("new attempt %+v", j)
+				}
+			}
+			if len(e.gh.cancels()) != 0 {
+				t.Fatalf("cancelled unrelated workflow: %v", e.gh.cancels())
+			}
+		})
+	}
+}
+
+func TestHostLossSwappedJobRestartDoesNotDuplicateReruns(t *testing.T) {
+	for _, restartBefore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart before discovery=%t", restartBefore), func(t *testing.T) {
+			e := newEnv(t)
+			e.swappedLoss(80, 1, 2, false)
+			if restartBefore {
+				e.rec = e.newReconciler()
+			}
+			if st := e.pass(); st.Rerun != 1 || st.Error != "" || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+				t.Fatalf("discovery: %+v reruns %v", st, e.gh.rerunJobs())
+			}
+			for range 3 {
+				e.pass()
+			}
+			e.rec = e.newReconciler()
+			for range 3 {
+				e.pass()
+			}
+			if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+				t.Fatalf("duplicate reruns: %v", e.gh.rerunJobs())
+			}
+		})
+	}
+}
+
+func TestHostLossSwappedSiblingsAreGroupedWithOneRepositoryScan(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	for _, trigger := range []int64{7, 9, 11} {
+		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+	}
+	e.pass()
+	for _, trigger := range []int64{7, 9, 11} {
+		id := e.runID(itoa(trigger))
+		actual := trigger + 1
+		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
+		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
+			t.Fatal(err)
+		}
+		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
+		e.gh.complete(trigger, "success")
+		e.lux.end(id, preempt)
+		e.gh.complete(actual, "cancelled")
+	}
+	ops := countOps(e, nil)
+	st := e.pass()
+	if st.Error != "" || st.Rerun != 3 || !slices.Equal(e.gh.rerunJobs(), []int64{8, 10, 12}) || ops[opRerunFailed] != 1 || ops[opRerun] != 0 || ops[opGetRun] != 1 {
+		t.Fatalf("status %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	if ops[opJobs] == 0 || ops[opJobs] > 2 || ops[opRuns] > 4 {
+		t.Fatalf("repository scan repeated for swapped siblings: %v", ops)
+	}
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8, 10, 12}) {
+		t.Fatalf("duplicate reruns: %v", e.gh.rerunJobs())
+	}
+}
+
+// The listing supplies a candidate, not authority to re-run it.
+type lostJobReadOverride struct {
+	GitHub
+	change func(*githubapp.WorkflowJob)
+	reads  int
+}
+
+func (g *lostJobReadOverride) GetWorkflowJob(ctx context.Context, repo githubapp.Repository, id int64) (githubapp.WorkflowJob, error) {
+	j, err := g.GitHub.GetWorkflowJob(ctx, repo, id)
+	if err == nil && id == 8 {
+		g.reads++
+		g.change(&j)
+	}
+	return j, err
+}
+
+func TestHostLossSwappedCandidateRequiresAuthoritativeJobIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*githubapp.WorkflowJob)
+	}{
+		{"runner", func(j *githubapp.WorkflowJob) { j.RunnerName = ptr("different-runner") }},
+		{"missing runner", func(j *githubapp.WorkflowJob) { j.RunnerName = nil }},
+		{"attempt", func(j *githubapp.WorkflowJob) { j.RunAttempt++ }},
+		{"workflow run", func(j *githubapp.WorkflowJob) { j.RunID = 90 }},
+		{"job ID", func(j *githubapp.WorkflowJob) { j.ID = 9 }},
+		{"success", func(j *githubapp.WorkflowJob) { j.Conclusion = ptr("success") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.swappedLoss(80, 1, 1, false)
+			gh := &lostJobReadOverride{GitHub: e.gh, change: tc.change}
+			e.rec.gh = gh
+			st := e.pass()
+			if gh.reads == 0 {
+				t.Fatal("actual job was not verified with GetWorkflowJob")
+			}
+			if st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+				t.Fatalf("re-ran contradicted candidate: %+v reruns %v", st, e.gh.rerunJobs())
+			}
+		})
+	}
+}
+
+func TestHostLossSwappedJobRecoversFromPartialPagesAndReadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   string
+		page int
+	}{
+		{"workflow page", opRuns, 2},
+		{"job page", opJobs, 2},
+		{"direct job read", opGetJob, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.swappedLoss(80, 1, 1, false)
+			e.gh.perPage = 1
+			e.gh.queueIn(widgets, 80, 6, "completed", "ubuntu-latest")
+			e.gh.editJob(6, func(j *fakeJob) { j.conclusion = "success" })
+			failed := 0
+			e.gh.fail = func(op, _ string, page int) error {
+				if op == tc.op && page == tc.page {
+					failed++
+					return &githubapp.APIError{StatusCode: http.StatusInternalServerError}
+				}
+				return nil
+			}
+			st := e.pass()
+			if failed == 0 || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+				t.Fatalf("failure not exercised safely: %+v failed %d reruns %v", st, failed, e.gh.rerunJobs())
+			}
+			countOps(e, nil)
+			for range 2 {
+				e.pass()
+			}
+			if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+				t.Fatalf("lost candidate after recovery: %v", e.gh.rerunJobs())
+			}
+		})
+	}
+}
+
+func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
+	e := newEnv(t)
+	e.swappedLoss(80, 1, 1, false)
+	e.gh.perPage = 1
+	for id := int64(1); id <= int64(maxRunPages+1); id++ {
+		e.gh.queueIn(widgets, id, 100+id, "completed", "ubuntu-latest")
+		e.gh.editJob(100+id, func(j *fakeJob) { j.conclusion = "success" })
+	}
+	ops := countOps(e, nil)
+	maxPage := 0
+	e.gh.fail = func(op, _ string, page int) error {
+		ops[op]++
+		if op == opRuns || op == opJobs {
+			maxPage = max(maxPage, page)
+		}
+		return nil
+	}
+	st := e.pass()
+	if st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("re-ran a job outside the search window: %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	if maxPage > maxRunPages || ops[opRuns] > maxRunPages+2 || ops[opJobs] > maxRunPages {
+		t.Fatalf("unbounded repository search: max page %d ops %v", maxPage, ops)
+	}
+	if ops[opJobs] == 0 {
+		t.Fatalf("repository search was not exercised: ops %v", ops)
 	}
 }
 
