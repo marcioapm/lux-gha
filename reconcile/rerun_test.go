@@ -1012,8 +1012,8 @@ func TestHostLossSwappedAssignmentVisibleNextPass(t *testing.T) {
 	e.swappedLoss(80, 1, 1, false)
 	gh := &lostAssignmentListing{GitHub: e.gh, hidden: true}
 	e.rec.gh = gh
-	if st := e.pass(); st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
-		t.Fatalf("hidden assignment retried: %+v reruns %v", st, e.gh.rerunJobs())
+	if st := e.pass(); st.Error != "" || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("hidden assignment retried or reported an error: %+v reruns %v", st, e.gh.rerunJobs())
 	}
 	gh.hidden = false
 	for range 3 {
@@ -1263,5 +1263,70 @@ func TestRerunOfAGoneWorkflowRunIsDropped(t *testing.T) {
 	e.pass()
 	if ops[opGetRun] != 1 || ops[opRerun] != 0 {
 		t.Fatalf("ops %v", ops)
+	}
+}
+
+func TestHostLossSwappedCompleteCandidateStillAbortsOnRateLimit(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 1
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.gh.queueIn(widgets, 50, 9, "queued", lux3...)
+	e.pass()
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.complete(8, "cancelled")
+	e.gh.pickElsewhere(widgets, 7, 9007, "external-runner")
+	e.gh.complete(7, "success")
+	e.lux.end(e.runID("7"), preempt)
+	if err := e.gh.pick(runner("9", 0), 9); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.complete(9, "cancelled")
+	e.lux.end(e.runID("9"), preempt)
+	e.gh.queueIn(widgets, 60, 160, "completed", "ubuntu-latest")
+	e.gh.editJob(160, func(j *fakeJob) { j.conclusion = "success" })
+	e.gh.fail = func(op, _ string, page int) error {
+		if op == opRuns && page == 3 {
+			return &githubapp.APIError{StatusCode: 429, RateLimited: true, RetryAt: e.clock.Now().Add(time.Minute)}
+		}
+		return nil
+	}
+	if st := e.pass(); st.Error != ErrRateLimited || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("rate limit did not abort: %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	e.gh.fail = nil
+	e.clock.Add(time.Minute)
+	for range maxRerunTries + 1 {
+		e.pass()
+	}
+	got := e.gh.rerunJobs()
+	slices.Sort(got)
+	if !slices.Equal(got, []int64{8, 9}) {
+		t.Fatalf("after the limit: %v", got)
+	}
+}
+
+func TestHostLossUnmatchedRunnerStopsSearchingAfterBoundedTries(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	e.gh.pickElsewhere(widgets, 7, 9007, "external-runner")
+	e.gh.complete(7, "failure")
+	e.lux.end(e.runID("7"), preempt)
+	ops := countOps(e, nil)
+	for range maxRerunTries {
+		if st := e.pass(); st.Error != "" {
+			t.Fatalf("no-match pass reported an error: %+v", st)
+		}
+	}
+	searching := ops[opRuns] / maxRerunTries
+	before := ops[opRuns]
+	for range 3 {
+		e.pass()
+	}
+	if settled := (ops[opRuns] - before) / 3; settled >= searching || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("unmatched loss kept searching: %d/pass -> %d/pass reruns %v", searching, settled, e.gh.rerunJobs())
 	}
 }
