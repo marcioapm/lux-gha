@@ -417,6 +417,12 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}}
 	p.lostSearches[v.id] = s
 	budget := searchPageBudget
+	targets := map[string]bool{}
+	for _, lost := range p.r.lost {
+		if lost.repoID == v.id && !lost.verified {
+			targets[lost.runner] = true
+		}
+	}
 	for page := 1; page <= maxRunPages && budget > 0; page++ {
 		budget--
 		runs, err := p.r.gh.ListWorkflowRuns(p.ctx, v.ref, githubapp.WorkflowRunListOptions{
@@ -440,6 +446,7 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 				for _, job := range jobs.Jobs {
 					if job.RunnerName != nil && job.RunID == run.ID && job.ID > 0 && job.RunAttempt > 0 {
 						s.jobs[*job.RunnerName] = job
+						delete(targets, *job.RunnerName)
 					}
 				}
 				if !jobs.HasNext {
@@ -449,6 +456,9 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 			}
 			if !complete {
 				s.err = errors.New("lost runner job search exceeded its page bound")
+				return s
+			}
+			if len(targets) == 0 {
 				return s
 			}
 		}

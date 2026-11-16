@@ -309,6 +309,9 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 		}
 	}
 	slices.Sort(ids)
+	if opts.Status == "" {
+		slices.Reverse(ids)
+	}
 	var runs []githubapp.WorkflowRun
 	for _, id := range ids {
 		s := r.runStatus(id)

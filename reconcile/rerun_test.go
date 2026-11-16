@@ -971,6 +971,8 @@ func TestHostLossSwappedJobRecoversFromPartialPagesAndReadFailures(t *testing.T)
 			e := newEnv(t)
 			e.swappedLoss(80, 1, 1, false)
 			e.gh.perPage = 1
+			e.gh.queueIn(widgets, 90, 9, "completed", "ubuntu-latest")
+			e.gh.editJob(9, func(j *fakeJob) { j.conclusion = "success" })
 			e.gh.queueIn(widgets, 80, 6, "completed", "ubuntu-latest")
 			e.gh.editJob(6, func(j *fakeJob) { j.conclusion = "success" })
 			failed := 0
@@ -1000,7 +1002,7 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 	e := newEnv(t)
 	e.swappedLoss(80, 1, 1, false)
 	e.gh.perPage = 1
-	for id := int64(1); id <= int64(maxRunPages+1); id++ {
+	for id := int64(81); id <= 81+int64(maxRunPages); id++ {
 		e.gh.queueIn(widgets, id, 100+id, "completed", "ubuntu-latest")
 		e.gh.editJob(100+id, func(j *fakeJob) { j.conclusion = "success" })
 	}
@@ -1022,6 +1024,94 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 	}
 	if ops[opJobs] == 0 {
 		t.Fatalf("repository search was not exercised: ops %v", ops)
+	}
+}
+
+func TestHostLossSwappedNewestMatchDoesNotRequireFullRepositoryHistory(t *testing.T) {
+	e := newEnv(t)
+	e.swappedLoss(80, 1, 1, false)
+	e.gh.perPage = 1
+	for id := int64(1); id <= int64(maxRunPages+1); id++ {
+		e.gh.queueIn(widgets, id, 100+id, "completed", "ubuntu-latest")
+		e.gh.editJob(100+id, func(j *fakeJob) { j.conclusion = "success" })
+	}
+	ops := countOps(e, nil)
+	if st := e.pass(); st.Error != "" || st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("newest match blocked by older history: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("duplicate reruns: %v", e.gh.rerunJobs())
+	}
+}
+
+func TestHostLossSwappedUnreadSiblingPagesBlockRerun(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		for _, truncated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("verified=%t/truncated=%t", verified, truncated), func(t *testing.T) {
+				e := newEnv(t)
+				for _, trigger := range []int64{7, 9} {
+					e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+				}
+				e.pass()
+				id7, id9 := e.runID("7"), e.runID("9")
+				for _, pair := range [][2]int64{{7, 8}, {9, 100}} {
+					trigger, actual := pair[0], pair[1]
+					e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
+					if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
+						t.Fatal(err)
+					}
+					e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
+					e.gh.complete(trigger, "success")
+					e.gh.complete(actual, "cancelled")
+				}
+				e.lux.end(id7, preempt)
+				e.lux.setState(id9, "stopping")
+				if verified {
+					e.gh.perPage = 100
+					if st := e.pass(); st.Error != "" || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+						t.Fatalf("initial sibling guard: %+v reruns %v", st, e.gh.rerunJobs())
+					}
+				}
+				e.gh.perPage = 1
+				if truncated {
+					// The lost job is on page 1, but the stopping sibling is beyond the bound.
+					for id := int64(10); id < 10+int64(maxRunPages); id++ {
+						e.gh.queueIn(widgets, 80, id, "completed", "ubuntu-latest")
+						e.gh.editJob(id, func(j *fakeJob) { j.conclusion = "success" })
+					}
+				}
+				failed := 0
+				ops := countOps(e, nil)
+				e.gh.fail = func(op, _ string, page int) error {
+					ops[op]++
+					if !truncated && op == opJobs && page == 2 {
+						failed++
+						return &githubapp.APIError{StatusCode: http.StatusInternalServerError}
+					}
+					return nil
+				}
+				if st := e.pass(); st.Error != ErrGitHub || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 || ops[opRerun]+ops[opRerunFailed] != 0 {
+					t.Fatalf("unread sibling pages allowed rerun: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+				}
+				if !truncated && failed == 0 {
+					t.Fatal("sibling page read failure was not exercised")
+				}
+				countOps(e, nil)
+				e.gh.perPage = 100
+				if st := e.pass(); st.Error != "" || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+					t.Fatalf("repaired listing missed stopping sibling: %+v reruns %v", st, e.gh.rerunJobs())
+				}
+				e.lux.end(id9, preempt)
+				if st := e.pass(); st.Error != "" || st.Rerun != 2 || !slices.Equal(e.gh.rerunJobs(), []int64{8, 100}) {
+					t.Fatalf("ended siblings after repair: %+v reruns %v", st, e.gh.rerunJobs())
+				}
+				e.pass()
+				if !slices.Equal(e.gh.rerunJobs(), []int64{8, 100}) {
+					t.Fatalf("duplicate reruns: %v", e.gh.rerunJobs())
+				}
+			})
+		}
 	}
 }
 
