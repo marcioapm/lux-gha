@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"net/http"
 	"slices"
 	"sync"
 	"testing"
@@ -655,4 +656,103 @@ func countOf(ids []int64, id int64) int {
 		}
 	}
 	return n
+}
+
+// As SkipsRunsBetweenDisjointLosses, but the newer Run's runner took no job,
+// so its window stays open for the whole scan; the gap runs still cost no
+// job page.
+func TestLostSearchSkipsRunsBetweenDisjointUnresolvedLosses(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	t0 := e.clock.Now().Add(time.Hour)
+	e.pastLoss(t0, 70, 7, 80, 8, 20*time.Minute)
+	e.pastRuns(100_000, 300, t0.Add(30*time.Minute), 48*time.Second, 10*time.Minute)
+	at := t0.Add(5 * time.Hour)
+	e.clock.Add(at.Sub(e.clock.Now()))
+	id := e.lux.seed("api.github.com/t1/1001/9/0", luxclient.RunSpec{Labels: map[string]string{
+		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "9", LabelGen: "0",
+		LabelRunner: runner("9", 0), LabelRunID: "75", LabelRunAttempt: "1"}})
+	e.clock.Add(20 * time.Minute)
+	e.lux.end(id, preempt)
+	e.gh.queueIn(widgets, 75, 9, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, 9, 9_000_009, "hosted-9")
+	e.gh.complete(9, "success")
+	e.gh.setRunTimes(widgets, 75, at.Add(-time.Minute), at.Add(2*time.Minute))
+	e.clock.Add(5 * time.Minute)
+	g := e.recordSearch()
+	st := e.pass()
+	if st.Error != "" || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	if !slices.Equal(g.jobRuns, []int64{75, 70, 80}) {
+		t.Fatalf("jobs listed for %v", g.jobRuns)
+	}
+}
+
+// A resolved loss whose job then reads as gone leaves the search with no
+// target: it lists nothing rather than every workflow run unfiltered.
+func TestLostSearchWithNoTargetListsNothing(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	idA := e.runID("7")
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
+	e.gh.complete(7, "success")
+	e.lux.runnerListState = "running"
+	e.clock.Add(5 * time.Minute)
+	e.lux.end(idA, preempt)
+	e.clock.Add(30 * time.Second)
+	if st := e.pass(); st.Error != "" || st.Rerun != 0 {
+		t.Fatalf("loss A pass: %+v", st)
+	}
+	if l := e.rec.lost["1001/"+runner("7", 0)]; l == nil || l.verified || l.jobID != 8 {
+		t.Fatalf("loss A %+v, want resolved, unverified, job 8", l)
+	}
+	e.completedRuns(100_000, 1100)
+	e.gh.fail = func(op, _ string, _ int) error {
+		if op == opGetJob {
+			return &githubapp.APIError{StatusCode: http.StatusNotFound}
+		}
+		return nil
+	}
+	e.clock.Add(30 * time.Second)
+	g := e.recordSearch()
+	st := e.pass()
+	if st.Error != "" || g.runPages != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("status %+v, %d search run pages, reruns %v", st, g.runPages, e.gh.rerunJobs())
+	}
+}
+
+// When the run listing hits its page cap, each loss's own label workflow
+// run is still listed, so a runner that took a sibling there is found. The
+// label run is a re-run of a workflow run created 8 h earlier, out of the
+// listing's reach, and 1,100 runs that finished before the loss fill the
+// listing past its cap.
+func TestLostSearchListsTheLabelRunWhenTheListingIsTruncated(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	at := e.clock.Now().Add(6 * time.Hour)
+	e.pastRuns(100_000, 1100, at.Add(-5*time.Hour), time.Second, time.Second)
+	e.pastLoss(at, 70, 7, 70, 8, 20*time.Minute)
+	e.gh.setRunTimes(widgets, 70, at.Add(-8*time.Hour), at.Add(20*time.Minute))
+	e.clock.Add(5 * time.Minute)
+	g := e.recordSearch()
+	for range maxRerunTries {
+		e.pass()
+		if len(e.gh.rerunJobs()) > 0 {
+			break
+		}
+	}
+	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
+	if g.runPages < maxSearchRunPages {
+		t.Fatalf("listing not truncated: %d run pages", g.runPages)
+	}
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("reruns %v, want [8]", e.gh.rerunJobs())
+	}
 }
