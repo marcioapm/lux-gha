@@ -463,27 +463,24 @@ labels, any state; one Run per runner name). If the Run has ended:
   job. The search lists runs newest first created at or before the latest
   window's end
   (`GET /repos/{owner}/{repo}/actions/runs?created=<=<end>&per_page=100`)
-  and stops after a page whose runs were all created more than 6 hours
-  before the earliest window's start. It lists the latest jobs only of the
-  runs that may hold the job of a loss not yet resolved: not `queued`;
-  created, or with their latest attempt started (`run_started_at`), by
-  the window's end and at most 6 hours before its start; and, if
-  `completed`, last updated (`updated_at`) after the window's start. A
-  re-run keeps its workflow run's `created_at`, so a run created more than
-  6 hours before the window is reached only through `run_started_at` and
-  only if the listing reaches its page; past the listing, including when
-  the listing hits its page cap, the search lists the latest jobs of each
-  unresolved loss's own label workflow run (`lux-gha/run-id`), within the
-  same job page cap. A job not found
-  either way is not re-run: one in a workflow run longer than 6 hours, or
-  in a re-run attempt of another workflow run created more than 6 hours
-  before the window. Run listing pages and job
-  listing pages are capped separately, at 10 (1,000 runs, which is also
-  the most GitHub returns for a filtered listing) and 200, with
-  at most 10 job pages per run and 100 items per page. Runs are listed
-  newest first, so the listing stops after the first page whose last run
-  was created more than 6 hours before the earliest window's start. The
-  search stops as soon as every loss is resolved.
+  and stops after the first page whose last run was created more than 6
+  hours before the earliest window's start. It lists the latest jobs only
+  of the runs that may hold the job of a loss not yet resolved: not
+  `queued`; created, or with their latest attempt started
+  (`run_started_at`), by the window's end and at most 6 hours before its
+  start; and, if `completed`, last updated (`updated_at`) after the
+  window's start. A re-run keeps its workflow run's `created_at`, so a run
+  created more than 6 hours before the window is reached only through
+  `run_started_at` and only if the listing reaches its page; past the
+  listing, including when the listing hits its page cap, the search lists
+  the latest jobs of each unresolved loss's own label workflow run
+  (`lux-gha/run-id`), within the same job page cap. A job not found either
+  way is not re-run: one in a workflow run longer than 6 hours, or in a
+  re-run attempt of another workflow run created more than 6 hours before
+  the window. Run listing pages and job listing pages are capped
+  separately, at 10 (1,000 runs, which is also the most GitHub returns for
+  a filtered listing) and 200, with at most 10 job pages per run and 100
+  items per page. The search stops as soon as every loss is resolved.
 
   A search therefore makes at most 210 requests per repository per pass
   that has an unresolved loss in that repository; the passes themselves
