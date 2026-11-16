@@ -436,8 +436,9 @@ labels, any state; one Run per runner name). If the Run has ended:
   usually cancels the job itself within `stopGrace`, before its Run ends,
   so the bridge does not rely on seeing the job `in_progress`. Every pass
   reads each Run of the instance that was live in the previous pass and is
-  no longer live (`GET /v1/runs/{id}`, one request per Run end; Runs whose
-  `lux-gha/run-attempt` is past the bound are not read). Instead, a pass
+  no longer live (`GET /v1/runs/{id}`, one request per Run end). Triggering
+  attempt labels do not exclude a Run: it may have executed another workflow.
+  Instead, a pass
   lists the instance's Runs in `stopped`, `failed`, `terminated` or `lost`
   (`GET /v1/runs?label=lux-gha/managed=<instance>&state=…&sort=created`)
   created since the oldest Run live in the previous pass when it cannot rely
@@ -451,17 +452,32 @@ labels, any state; one Run per runner name). If the Run has ended:
   host losses in it are not re-run. A Run that lost its host, ended within the
   last 24 hours and carries the `lux-gha/repo`, `lux-gha/job`,
   `lux-gha/run-id`, `lux-gha/run-attempt` and `lux-gha/runner` labels is a
-  candidate. Once per candidate the bridge reads the job
-  (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`) and keeps it only if
-  its `runner_name` is the Run's runner, its `run_attempt` the Run's, and
-  its conclusion `failure` or `cancelled`. A Run lost before its runner took
-  the job fails this: the job ran on a later Run.
+  candidate. The labels are hints, not execution identity. The bridge first
+  reads the triggering job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`).
+  If its runner differs or the job is gone, it searches repository workflow
+  runs (all statuses) and their latest jobs for the exact runner name, even
+  across workflows. One search per repository per pass shares at most 20
+  run/job pages, with at most 10 pages per listing and 100 items per page.
+  A listed candidate is verified by a direct job read: job ID, workflow run,
+  attempt and runner must agree. The actual job's attempt controls the retry
+  budget; its conclusion must be `failure` or `cancelled`. Pre-pickup loss
+  finds no executing job and never causes a retry.
+
+  This bounded search cannot guarantee discovery outside its window. GitHub
+  has no runner-to-completed-job lookup in the client contract. A truncated
+  or failed search does not authorize a retry; it is retried within the
+  existing five-failed-pass and 24-hour limits. No historical unbounded scan
+  is made.
 
   The bridge waits while the workflow run is listed `queued` or
   `in_progress`, or while any of its Lux Runs is live (a sibling's runner
   can still be uploading its log after the run completed), then reads it once
   (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`). It must be
-  `completed` with conclusion `failure` or `cancelled`. For a `push` or
+  `completed` with conclusion `failure` or `cancelled`. If any Lux runner
+  is live, a complete latest-job listing checks the actual workflow's runner
+  assignments before retrying, including siblings provisioned for other
+  workflows. That read is cached per workflow per pass and bounded to 10
+  pages; errors or truncation prevent retry. For a `push` or
   `pull_request` run, if a newer run of the same workflow, branch and event
   exists
   (`GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?branch=…&event=…&per_page=1`),

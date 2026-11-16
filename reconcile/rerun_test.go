@@ -805,6 +805,81 @@ func TestHostLossSwappedJobRestartDoesNotDuplicateReruns(t *testing.T) {
 	}
 }
 
+func TestHostLossSwappedSiblingStillStoppingBlocksGroupedRerun(t *testing.T) {
+	e := newEnv(t)
+	for _, trigger := range []int64{7, 9} {
+		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+	}
+	e.pass()
+	id7, id9 := e.runID("7"), e.runID("9")
+	for _, trigger := range []int64{7, 9} {
+		actual := trigger + 1
+		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
+		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
+			t.Fatal(err)
+		}
+		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "elsewhere-"+itoa(trigger))
+		e.gh.complete(trigger, "success")
+		e.gh.complete(actual, "cancelled")
+	}
+	e.lux.end(id7, preempt)
+	e.lux.setState(id9, "stopping")
+	ops := countOps(e, nil)
+	if st := e.pass(); st.Error != "" || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 || ops[opRerun]+ops[opRerunFailed] != 0 {
+		t.Fatalf("re-ran while cross-workflow sibling was stopping: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	e.lux.end(id9, preempt)
+	if st := e.pass(); st.Error != "" || st.Rerun != 2 || !slices.Equal(e.gh.rerunJobs(), []int64{8, 10}) || ops[opRerunFailed] != 1 || ops[opRerun] != 0 {
+		t.Fatalf("ended siblings: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8, 10}) || ops[opRerunFailed] != 1 || ops[opRerun] != 0 {
+		t.Fatalf("duplicate reruns: %v ops %v", e.gh.rerunJobs(), ops)
+	}
+}
+
+func TestHostLossSwappedVerifiedIdentityMergesAfterJobReadFailure(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9001, "another-runner")
+	e.gh.complete(7, "failure")
+	e.lux.end(id, preempt)
+	// The runner-specific listing can lag the ended Run read by discovery.
+	e.lux.runnerListState = "running"
+	ops := countOps(e, failing(opGetJob, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+	if st := e.pass(); st.Error != ErrGitHub || st.Rerun != 0 || st.CheckRuns != 0 || ops[opGetJob] != 1 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("failed direct read: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	e.lux.runnerListState = ""
+	countOps(e, nil)
+	if st := e.pass(); st.Error != "" || st.CheckRuns != 1 || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("stopped-job observation: %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	e.clock.Add(2 * time.Minute)
+	if st := e.pass(); st.Error != "" || st.ForceCancelled != 1 || st.Rerun != 0 || !slices.Equal(e.gh.cancels(), []int64{80}) {
+		t.Fatalf("force cancellation: %+v cancels %v reruns %v", st, e.gh.cancels(), e.gh.rerunJobs())
+	}
+	if j := e.gh.job(8); j.status != "completed" || j.conclusion != "cancelled" {
+		t.Fatalf("actual job after force cancellation: %+v", j)
+	}
+	if st := e.pass(); st.Error != "" || st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("re-ran trigger instead of verified actual job: %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	if j := e.gh.job(e.gh.rerunOf(8)); j == nil || j.runID != 80 || j.attempt != 2 {
+		t.Fatalf("actual job's new attempt: %+v", j)
+	}
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("duplicate reruns: %v", e.gh.rerunJobs())
+	}
+}
+
 func TestHostLossSwappedSiblingsAreGroupedWithOneRepositoryScan(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100

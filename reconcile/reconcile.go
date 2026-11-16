@@ -395,6 +395,7 @@ type pass struct {
 	// workflowRuns: workflow runs rerunLost read this pass, by id.
 	workflowRuns map[int64]githubapp.WorkflowRun
 	lostSearches map[int64]*lostSearch
+	lostSiblings map[string]*lostSearch
 	// lostPrev: the previous pass's lostLive, for discoverLost.
 	lostPrev map[string]bool
 }

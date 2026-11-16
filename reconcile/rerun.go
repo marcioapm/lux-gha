@@ -238,15 +238,6 @@ func (p *pass) rerunLost() error {
 	for _, v := range p.repos {
 		repos[v.id] = v
 	}
-	// A sibling's Run still live (stopping, uploading its log) may end lost
-	// in a later pass; re-running now would start a new attempt it is not
-	// part of, so the workflow run waits for all of its Runs.
-	runLive := map[int64]bool{}
-	for _, run := range p.live {
-		if id, err := strconv.ParseInt(run.Labels[LabelRunID], 10, 64); err == nil {
-			runLive[id] = true
-		}
-	}
 	now := r.now()
 	due := map[int64][]string{}
 	for _, key := range sortedKeys(r.lost) {
@@ -261,7 +252,7 @@ func (p *pass) rerunLost() error {
 			continue
 		}
 		log := r.log.With("repository", v.full, "workflowRun", l.runID, "job", l.jobID, "attempt", l.attempt)
-		step, err := p.checkLost(v, l, log, runLive)
+		step, err := p.checkLost(v, l, log)
 		if err != nil {
 			return err
 		}
@@ -293,7 +284,7 @@ func (p *pass) retryLost(key string, log *slog.Logger) {
 
 // checkLost verifies, once, that the job ran on the lost Run's runner, then
 // reads its workflow run (once per pass per run).
-func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger, runLive map[int64]bool) (rerunStep, error) {
+func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, error) {
 	if !l.verified {
 		job, err := p.r.gh.GetWorkflowJob(p.ctx, v.ref, l.jobID)
 		var apiErr *githubapp.APIError
@@ -336,7 +327,7 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger, runLive map[
 		}
 		l.verified = true
 	}
-	if v.active[l.runID] || runLive[l.runID] {
+	if v.active[l.runID] {
 		return stepWait, nil
 	}
 	// Live siblings may have been provisioned for another workflow.
@@ -364,7 +355,49 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger, runLive map[
 		log.Info("workflow run did not fail; not re-running the job", "conclusion", run.Conclusion)
 		return stepDrop, nil
 	}
+	if len(p.liveRunner) > 0 {
+		siblings := p.lostSiblingJobs(v, l.runID)
+		if step, failed, abort := p.readFailed(siblings.err, log, "reading lost job siblings failed"); failed {
+			return step, abort
+		}
+		for runner := range siblings.jobs {
+			if p.liveRunner[runner] {
+				return stepWait, nil
+			}
+		}
+	}
 	return stepDue, nil
+}
+
+func (p *pass) lostSiblingJobs(v *repoView, runID int64) *lostSearch {
+	if p.lostSiblings == nil {
+		p.lostSiblings = map[string]*lostSearch{}
+	}
+	key := strconv.FormatInt(v.id, 10) + "/" + strconv.FormatInt(runID, 10)
+	if s := p.lostSiblings[key]; s != nil {
+		return s
+	}
+	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}}
+	p.lostSiblings[key] = s
+	for page := 1; page <= maxRunPages; page++ {
+		jobs, err := p.r.gh.ListWorkflowRunJobs(p.ctx, v.ref, runID, githubapp.WorkflowJobListOptions{
+			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, Filter: "latest",
+		})
+		if err != nil {
+			s.err = err
+			return s
+		}
+		for _, job := range jobs.Jobs {
+			if job.RunnerName != nil {
+				s.jobs[*job.RunnerName] = job
+			}
+		}
+		if !jobs.HasNext {
+			return s
+		}
+	}
+	s.err = errors.New("lost job sibling search exceeded its page bound")
+	return s
 }
 
 type lostSearch struct {
