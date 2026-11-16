@@ -51,8 +51,11 @@ type lostJob struct {
 	// runner is the lost Run's runner name. verified: GitHub says the job
 	// ran on it and ended failed or cancelled; a Run lost before its runner
 	// took the job is never verified, as the job ran on a later gen.
+	// resolved: a direct job read confirmed the identity, so no search is
+	// needed while the job runs on.
 	runner   string
 	verified bool
+	resolved bool
 	created  time.Time // the Run's creation, before its runner could take a job
 	since    time.Time // the Run's end
 	tries    int
@@ -343,7 +346,7 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 		if !p.r.attemptEligible(job.RunAttempt) {
 			return stepDrop, nil
 		}
-		l.jobID, l.runID, l.attempt = job.ID, job.RunID, job.RunAttempt
+		l.jobID, l.runID, l.attempt, l.resolved = job.ID, job.RunID, job.RunAttempt, true
 		switch {
 		case job.Status != "completed":
 			return stepWait, nil
@@ -435,12 +438,12 @@ type lostWindow struct {
 	runID      int64
 }
 
-// lostWindows maps the runner of each unverified loss of repository repoID
+// lostWindows maps the runner of each unresolved loss of repository repoID
 // to its window.
 func (r *Reconciler) lostWindows(repoID int64) map[string]lostWindow {
 	windows := map[string]lostWindow{}
 	for _, lost := range r.lost {
-		if lost.repoID != repoID || lost.verified {
+		if lost.repoID != repoID || lost.verified || lost.resolved {
 			continue
 		}
 		created := lost.created

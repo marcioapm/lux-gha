@@ -555,6 +555,66 @@ func TestLostSearchWindowsARunWithoutCreatedAtByTheRouteTimeout(t *testing.T) {
 	}
 }
 
+// Loss A's runner took job 8, which GitHub still shows in_progress after
+// the host loss: a pass finds it and waits. Loss B follows within the stuck
+// job grace. B's search has only B's window; A's identity is known, so the
+// 30 runs that completed during A's Run before B's started cost no job page.
+func TestLostSearchLeavesOutALossWhoseJobIsFoundButRunning(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	idA := e.runID("7")
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
+	e.gh.complete(7, "success")
+	e.clock.Add(10 * time.Minute)
+	e.completedRuns(1000, 30)
+	e.clock.Add(20 * time.Minute)
+	e.gh.queueIn(widgets, 75, 9, "queued", lux3...)
+	e.pass()
+	idB := e.runID("9")
+	e.gh.queueIn(widgets, 85, 10, "queued", lux3...)
+	if err := e.gh.pick(runner("9", 0), 10); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 9, 9009, "hosted-9")
+	e.gh.complete(9, "success")
+	// closeStopped reads A's runner as live, so A is queued unverified from
+	// the ended Run and resolved by a search.
+	e.lux.runnerListState = "running"
+	e.clock.Add(5 * time.Minute)
+	e.lux.end(idA, preempt)
+	e.clock.Add(30 * time.Second)
+	if st := e.pass(); st.Error != "" || st.Rerun != 0 {
+		t.Fatalf("loss A pass: %+v", st)
+	}
+	e.clock.Add(30 * time.Second)
+	e.lux.end(idB, preempt)
+	e.gh.complete(10, "cancelled")
+	e.clock.Add(30 * time.Second)
+	g := e.recordSearch()
+	if l := e.rec.lost["1001/"+runner("7", 0)]; l == nil || l.verified || l.jobID != 8 {
+		t.Fatalf("loss A %+v, want unverified with job 8", l)
+	}
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
+	if st.Error != "" || !slices.Equal(e.gh.rerunJobs(), []int64{10}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	// Run 80 is listed by the pass's in_progress job listing, not the
+	// search, which stops at run 85.
+	if !slices.Equal(g.jobRuns, []int64{80, 85}) {
+		t.Fatalf("jobs listed for %v", g.jobRuns)
+	}
+	if j := e.gh.job(8); j.status != "in_progress" {
+		t.Fatalf("job 8 %+v, want in_progress", j)
+	}
+}
+
 func countOf(ids []int64, id int64) int {
 	n := 0
 	for _, x := range ids {
