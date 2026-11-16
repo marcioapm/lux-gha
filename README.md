@@ -471,9 +471,10 @@ labels, any state; one Run per runner name). If the Run has ended:
   `completed`, last updated (`updated_at`) after the window's start. A
   re-run keeps its workflow run's `created_at`, so a run created more than
   6 hours before the window is reached only through `run_started_at` and
-  only if the listing reaches its page; past the listing, the search lists
-  the latest jobs of each unresolved loss's own label workflow run
-  (`lux-gha/run-id`), within the same job page cap. A job not found
+  only if the listing reaches its page; past the listing, including when
+  the listing hits its page cap, the search lists the latest jobs of each
+  unresolved loss's own label workflow run (`lux-gha/run-id`), within the
+  same job page cap. A job not found
   either way is not re-run: one in a workflow run longer than 6 hours, or
   in a re-run attempt of another workflow run created more than 6 hours
   before the window. Run listing pages and job

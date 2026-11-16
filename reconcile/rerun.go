@@ -573,8 +573,11 @@ func (c *lostScan) scanWindows() bool {
 			return true
 		}
 	}
+	// The listing is truncated, but each target's own label workflow run can
+	// still be listed: a candidate found while err is set counts only from a
+	// completely listed workflow run.
 	c.s.err = errors.New("lost runner workflow search exceeded its page bound")
-	return false
+	return true
 }
 
 // mayHoldLost reports whether workflow run may have run a job on the runner
