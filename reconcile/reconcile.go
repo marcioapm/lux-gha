@@ -172,7 +172,7 @@ type Reconciler struct {
 	queuedTurn   bool                   // alternates the sole demand allowance when maxJobsPerPass is 1
 	stopped      map[string]*stoppedRun // runner name: ended Run under an in_progress job
 	refused      map[string]*refusal    // repo id/job id: queued job whose Run Lux refused for its size
-	lost         map[string]*lostJob    // repo id/job id: job whose Run's host was lost, to re-run
+	lost         map[string]*lostJob    // repo id/runner name: job whose Run's host was lost, to re-run
 	lostSeen     map[string]time.Time   // Run id: lost Run already queued, by its end
 	lostCursor   time.Time              // discoverLost lists Runs created since; zero after a start
 	lostLive     map[string]bool        // Run id: live at the last discoverLost; nil makes the next one list
@@ -394,6 +394,8 @@ type pass struct {
 	unresolvedRoute map[string]int
 	// workflowRuns: workflow runs rerunLost read this pass, by id.
 	workflowRuns map[int64]githubapp.WorkflowRun
+	lostSearches map[int64]*lostSearch
+	lostSiblings map[string]*lostSearch
 	// lostPrev: the previous pass's lostLive, for discoverLost.
 	lostPrev map[string]bool
 }
