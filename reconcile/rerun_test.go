@@ -957,6 +957,41 @@ func TestHostLossSwappedCandidateRequiresAuthoritativeJobIdentity(t *testing.T) 
 	}
 }
 
+type lostAssignmentListing struct {
+	GitHub
+	hidden bool
+}
+
+func (g *lostAssignmentListing) ListWorkflowRunJobs(ctx context.Context, repo githubapp.Repository, runID int64, opts githubapp.WorkflowJobListOptions) (githubapp.WorkflowJobPage, error) {
+	out, err := g.GitHub.ListWorkflowRunJobs(ctx, repo, runID, opts)
+	if g.hidden {
+		for i := range out.Jobs {
+			if out.Jobs[i].ID == 8 {
+				out.Jobs[i].RunnerName = nil
+				out.Jobs[i].RunnerID = nil
+			}
+		}
+	}
+	return out, err
+}
+
+func TestHostLossSwappedAssignmentVisibleNextPass(t *testing.T) {
+	e := newEnv(t)
+	e.swappedLoss(80, 1, 1, false)
+	gh := &lostAssignmentListing{GitHub: e.gh, hidden: true}
+	e.rec.gh = gh
+	if st := e.pass(); st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("hidden assignment retried: %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	gh.hidden = false
+	for range 3 {
+		e.pass()
+	}
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("visible assignment did not recover exactly once: %v", e.gh.rerunJobs())
+	}
+}
+
 func TestHostLossSwappedJobRecoversFromPartialPagesAndReadFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name string

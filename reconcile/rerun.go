@@ -308,7 +308,7 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 				}
 			}
 			if !ok {
-				return stepDrop, nil
+				return stepRetry, nil
 			}
 			job, err = p.r.gh.GetWorkflowJob(p.ctx, v.ref, candidate.ID)
 			if step, failed, abort := p.readFailed(err, log, "reading the executing job failed"); failed {
