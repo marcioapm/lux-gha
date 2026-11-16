@@ -438,8 +438,8 @@ labels, any state; one Run per runner name). If the Run has ended:
   reads each Run of the instance that was live in the previous pass and is
   no longer live (`GET /v1/runs/{id}`, one request per Run end). Triggering
   attempt labels do not exclude a Run: it may have executed another workflow.
-  Instead, a pass
-  lists the instance's Runs in `stopped`, `failed`, `terminated` or `lost`
+  Instead, a pass lists the instance's Runs in `stopped`, `failed`,
+  `terminated` or `lost`
   (`GET /v1/runs?label=lux-gha/managed=<instance>&state=…&sort=created`)
   created since the oldest Run live in the previous pass when it cannot rely
   on that set: the first pass after a start, after a pass that failed before
