@@ -24,11 +24,8 @@ const (
 	lostCursorSkew = time.Minute
 	// maxWorkflowLookback is how long before a lost Run's creation a
 	// workflow run may have been created, or its latest attempt started
-	// (run_started_at), and still hold the job the Run's runner took. A
-	// re-run keeps the run's created_at: a re-run attempt of a run created
-	// earlier is reached by run_started_at on a listed page, or as the
-	// loss's own label workflow run; any other such attempt, and a run
-	// longer than this, is not searched.
+	// (run_started_at), and still hold the job the Run's runner took; a
+	// longer workflow run is not searched.
 	maxWorkflowLookback = 6 * time.Hour
 	// lostWindowSkew widens the lost Runs' window for the skew between
 	// Lux's and GitHub's clocks.
@@ -499,14 +496,10 @@ func (c *lostScan) listJobs(runID int64) bool {
 // searchLost shares a bounded repository search across every lost runner in
 // the pass. Listings only nominate jobs; checkLost reads each nominee again.
 //
-// Runs are listed newest first with created at or before the latest window
-// end, and listing stops at a page created wholly before the earliest window
-// start minus maxWorkflowLookback. Only a run that may hold the job of a loss
-// still unresolved (mayHoldLost) has its jobs listed; a loss is resolved once
-// its runner is found, so the skipped set grows during the scan. A re-run
-// keeps its workflow run's created_at, so the listing can miss a re-run of a
-// run created before the lookback; the label job's own workflow run, which
-// the runner most often took a sibling of, is then listed directly.
+// A re-run keeps its workflow run's created_at, so the listing reaches a
+// re-run of a run created before the lookback only through run_started_at
+// on a listed page. The label job's own workflow run, which the runner most
+// often took a sibling of, is therefore listed directly after the listing.
 func (p *pass) searchLost(v *repoView) *lostSearch {
 	if p.lostSearches == nil {
 		p.lostSearches = map[int64]*lostSearch{}
@@ -532,8 +525,10 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	return s
 }
 
-// scanWindows lists the workflow runs that may hold a target's job and
-// their jobs. It is false when the search must end.
+// scanWindows lists, newest first, the workflow runs created by the latest
+// window end, and the jobs of those that may hold the job of a loss still
+// unresolved; each resolved loss narrows the rest of the scan. It is false
+// when the search must end.
 func (c *lostScan) scanWindows() bool {
 	var start, end time.Time
 	for _, w := range c.targets {
