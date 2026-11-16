@@ -67,9 +67,10 @@ func (r *Reconciler) attemptEligible(attempt int64) bool {
 // Run: a Run already seen is not queued again after its job was settled.
 func (r *Reconciler) queueLost(runID string, finished time.Time, l *lostJob) {
 	if q := r.lost[l.key()]; q != nil {
+		// Assignment observation does not establish failed completion, so
+		// only the identity is taken over; q stays unverified.
 		if l.verified && !q.verified {
 			q.jobID, q.runID, q.attempt = l.jobID, l.runID, l.attempt
-			// Assignment observation does not establish failed completion.
 		}
 		r.lostSeen[runID] = finished
 		return
