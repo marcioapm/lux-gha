@@ -116,6 +116,9 @@ type RunnerListOptions struct {
 type WorkflowRunListOptions struct {
 	PageOptions
 	Status string
+	// CreatedAtOrBefore, when set, sends created=<=<RFC 3339, UTC seconds>;
+	// GitHub's created_at has whole-second precision.
+	CreatedAtOrBefore time.Time
 }
 
 // Attempt selects the per-attempt endpoint; Filter ("latest" or "all") applies only without Attempt.
@@ -232,6 +235,9 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, repo Repository, opts Wor
 	}
 	if opts.Status != "" {
 		q.Set("status", opts.Status)
+	}
+	if !opts.CreatedAtOrBefore.IsZero() {
+		q.Set("created", "<="+opts.CreatedAtOrBefore.UTC().Format(time.RFC3339))
 	}
 	out.HasNext, err = c.list(ctx, repo, "/actions/runs", q, &out)
 	return out, err

@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -573,6 +574,37 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 	}
 	if _, err := c.ListWorkflowRunJobs(context.Background(), repo, 5, WorkflowJobListOptions{Attempt: 2, Filter: "all"}); err == nil {
 		t.Fatal("accepted filter with attempt")
+	}
+}
+
+func TestListWorkflowRunsCreatedFilter(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		queries []string
+	)
+	c, _, _ := newTestClient(t, pkcs1PEM(testKey), func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/octo-org/app.repo/actions/runs" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		queries = append(queries, r.URL.RawQuery)
+		mu.Unlock()
+		w.Write([]byte(`{"total_count":0,"workflow_runs":[]}`))
+	})
+	at := time.Date(2026, 10, 9, 14, 3, 7, 900_000_000, time.FixedZone("CEST", 2*3600))
+	if _, err := c.ListWorkflowRuns(context.Background(), repo, WorkflowRunListOptions{
+		PageOptions: PageOptions{Page: 3, PerPage: 100}, CreatedAtOrBefore: at}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListWorkflowRuns(context.Background(), repo, WorkflowRunListOptions{PageOptions: PageOptions{Page: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"created=%3C%3D2026-10-09T12%3A03%3A07Z&page=3&per_page=100", "page=1"}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(queries, want) {
+		t.Fatalf("queries %q, want %q", queries, want)
 	}
 }
 
