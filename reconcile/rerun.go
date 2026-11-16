@@ -337,12 +337,6 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 	if v.active[l.runID] {
 		return stepWait, nil
 	}
-	// Live siblings may have been provisioned for another workflow.
-	for _, runner := range v.runRunners[l.runID] {
-		if p.liveRunner[runner] {
-			return stepWait, nil
-		}
-	}
 	run, ok := p.workflowRuns[l.runID]
 	if !ok {
 		var err error
@@ -362,6 +356,7 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 		log.Info("workflow run did not fail; not re-running the job", "conclusion", run.Conclusion)
 		return stepDrop, nil
 	}
+	// Live siblings may have been provisioned for another workflow.
 	if len(p.liveRunner) > 0 {
 		siblings := p.lostSiblingJobs(v, l.runID)
 		if step, failed, abort := p.readFailed(siblings.err, log, "reading lost job siblings failed"); failed {
