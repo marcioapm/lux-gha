@@ -69,7 +69,7 @@ func (r *Reconciler) queueLost(runID string, finished time.Time, l *lostJob) {
 	if q := r.lost[l.key()]; q != nil {
 		if l.verified && !q.verified {
 			q.jobID, q.runID, q.attempt = l.jobID, l.runID, l.attempt
-			q.verified = true
+			// Assignment observation does not establish failed completion.
 		}
 		r.lostSeen[runID] = finished
 		return

@@ -880,6 +880,38 @@ func TestHostLossSwappedVerifiedIdentityMergesAfterJobReadFailure(t *testing.T) 
 	}
 }
 
+func TestHostLossSwappedUpgradeDoesNotRetrySuccessfulJob(t *testing.T) {
+	e := newEnv(t)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9001, "another-runner")
+	e.gh.complete(7, "failure")
+	e.lux.end(id, preempt)
+	e.lux.runnerListState = "running"
+	countOps(e, failing(opGetJob, &githubapp.APIError{StatusCode: http.StatusInternalServerError}))
+	if st := e.pass(); st.Error != ErrGitHub || st.Rerun != 0 {
+		t.Fatalf("failed direct read: %+v", st)
+	}
+	e.lux.runnerListState = ""
+	countOps(e, nil)
+	if st := e.pass(); st.CheckRuns != 1 || st.Rerun != 0 {
+		t.Fatalf("assignment observation: %+v", st)
+	}
+	e.gh.complete(8, "success")
+	e.gh.queueIn(widgets, 80, 10, "completed", "ubuntu-latest")
+	e.gh.editJob(10, func(j *fakeJob) { j.conclusion, j.runner = "failure", "external-runner" })
+	for range 3 {
+		if st := e.pass(); st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+			t.Fatalf("successful actual job retried: %+v reruns %v", st, e.gh.rerunJobs())
+		}
+	}
+}
+
 func TestHostLossSwappedSiblingsAreGroupedWithOneRepositoryScan(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
