@@ -403,6 +403,117 @@ func TestLostSearchRecoversLossesSpreadOverARestart(t *testing.T) {
 	}
 }
 
+// oldReRun queues jobs in workflow run 60 at the clock's time, which fail on
+// GitHub-hosted runners, waits age and re-runs them by hand: GitHub keeps
+// run 60's created_at and moves its run_started_at to now. It returns the
+// re-run jobs' ids.
+func (e *env) oldReRun(age time.Duration, jobs ...int64) []int64 {
+	for _, j := range jobs {
+		e.gh.queueIn(widgets, 60, j, "queued", lux3...)
+		e.gh.pickElsewhere(widgets, j, 9000+j, "hosted-"+itoa(j))
+		e.gh.complete(j, "failure")
+	}
+	e.clock.Add(age)
+	return e.gh.rerunByHand(60)
+}
+
+// Workflow run 60 was created eight hours before the loss and re-run 12
+// minutes before it. A Lux Run provisioned for job 7 of a new workflow run
+// 70 has its runner take run 60's attempt-2 job; the host is lost. Run 60's
+// created_at is past the lookback, but its run_started_at is within the
+// Run's window, so the search lists its jobs and re-runs the job once.
+func TestLostSearchFindsTheJobOfAReRunOfAnOldWorkflowRun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	j2 := e.oldReRun(8*time.Hour-12*time.Minute, 61)[0]
+	e.clock.Add(2 * time.Minute)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	if err := e.gh.pick(runner("7", 0), j2); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
+	e.gh.complete(7, "success")
+	e.clock.Add(8 * time.Minute)
+	e.lux.end(id, preempt)
+	e.gh.complete(j2, "cancelled")
+	e.clock.Add(2 * time.Minute)
+	g := e.recordSearch()
+	ops := countOps(e, nil)
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v; all GitHub calls %v", g.runPages, g.jobRuns, ops)
+	if st.Error != "" || st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{j2}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	// Run 60 by the search, after run 70, then by the sibling guard.
+	if g.runPages != 1 || !slices.Equal(g.jobRuns, []int64{70, 60, 60}) {
+		t.Fatalf("search pages %d, jobs listed for %v", g.runPages, g.jobRuns)
+	}
+	if j := e.gh.job(e.gh.rerunOf(j2)); j == nil || j.runID != 60 || j.attempt != 3 {
+		t.Fatalf("new attempt %+v", j)
+	}
+	for range 3 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if !slices.Equal(e.gh.rerunJobs(), []int64{j2}) {
+		t.Fatalf("reruns %v", e.gh.rerunJobs())
+	}
+}
+
+// The lost Run was provisioned for a job of the re-run of workflow run 60,
+// created eight hours earlier, and its runner took that job's sibling in
+// the same attempt. 250 runs created seven hours before the loss end the
+// listing at its first page, before it reaches run 60; the search then
+// lists the label job's own workflow run and finds the sibling.
+func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	e.gh.queueIn(widgets, 60, 61, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, 61, 9061, "hosted-61")
+	e.gh.complete(61, "failure")
+	e.gh.queueIn(widgets, 60, 62, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, 62, 9062, "hosted-62")
+	e.gh.complete(62, "failure")
+	e.clock.Add(time.Hour)
+	e.completedRuns(1000, 250)
+	e.clock.Add(7*time.Hour - 12*time.Minute)
+	jobs := e.gh.rerunByHand(60)
+	label, sibling := jobs[0], jobs[1]
+	e.clock.Add(2 * time.Minute)
+	e.pass()
+	id := e.runID(itoa(label))
+	if err := e.gh.pick(runner(itoa(label), 0), sibling); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, label, 9000+label, "hosted-label")
+	e.gh.complete(label, "success")
+	e.clock.Add(8 * time.Minute)
+	e.lux.end(id, preempt)
+	e.gh.complete(sibling, "cancelled")
+	e.clock.Add(2 * time.Minute)
+	g := e.recordSearch()
+	ops := countOps(e, nil)
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v; all GitHub calls %v", g.runPages, g.jobRuns, ops)
+	if st.Error != "" || st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{sibling}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	// The search lists run 60 once; the sibling guard lists it again, as
+	// the label job's Run is live.
+	if g.runPages != 1 || !slices.Equal(g.jobRuns, []int64{60, 60}) {
+		t.Fatalf("search pages %d, jobs listed for %v", g.runPages, g.jobRuns)
+	}
+	for range 3 {
+		e.clock.Add(time.Minute)
+		e.pass()
+	}
+	if !slices.Equal(e.gh.rerunJobs(), []int64{sibling}) {
+		t.Fatalf("reruns %v", e.gh.rerunJobs())
+	}
+}
+
 func countOf(ids []int64, id int64) int {
 	n := 0
 	for _, x := range ids {

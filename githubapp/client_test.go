@@ -537,6 +537,7 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 				return
 			}
 			w.Write([]byte(`{"total_count":1,"workflow_runs":[{"id":5,"run_attempt":2,"status":"queued","conclusion":null,"head_sha":"abc",` +
+				`"created_at":"2026-10-09T04:00:00Z","run_started_at":"2026-10-09T11:48:00Z",` +
 				`"head_branch":"feature/x","run_number":12,"event":"pull_request","name":"CI","pull_requests":[{"id":900,"number":34,"url":"u","base":{"ref":"main","repo":{"id":77,"name":"app.repo"}}}],` +
 				`"head_repository":{"id":78,"owner":{"login":"contributor","id":5}}}]}`))
 		case "/repos/octo-org/app.repo/actions/runs/5/jobs":
@@ -563,6 +564,9 @@ func TestListWorkflowRunsAndJobs(t *testing.T) {
 		len(r.PullRequests) != 1 || r.PullRequests[0].Number != 34 || r.PullRequests[0].Base.Repo.ID != 77 ||
 		r.HeadRepository == nil || r.HeadRepository.ID != 78 || r.HeadRepository.Owner.Login != "contributor" {
 		t.Fatalf("run metadata %+v", r)
+	}
+	if r := runs.Runs[0]; !r.CreatedAt.Equal(time.Date(2026, 10, 9, 4, 0, 0, 0, time.UTC)) || !r.RunStartedAt.Equal(time.Date(2026, 10, 9, 11, 48, 0, 0, time.UTC)) {
+		t.Fatalf("run times: created %v, attempt started %v", r.CreatedAt, r.RunStartedAt)
 	}
 	all, err := c.ListWorkflowRunJobs(context.Background(), repo, 5, WorkflowJobListOptions{Filter: "all"})
 	if err != nil || len(all.Jobs) != 2 {

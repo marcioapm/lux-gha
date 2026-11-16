@@ -48,8 +48,10 @@ type fakeRepo struct {
 	// id and status (name, branch, number, pull requests).
 	runs map[int64]githubapp.WorkflowRun
 	// created and updated are each workflow run's created_at (its first job
-	// queued) and updated_at (its last job change), as GitHub reports them.
-	created, updated map[int64]time.Time
+	// queued) and updated_at (its last job change), as GitHub reports them;
+	// started is run_started_at, its latest attempt's start, which a re-run
+	// moves while created_at stays.
+	created, updated, started map[int64]time.Time
 	// unlisted runners exist but are missing from unfiltered listings, as a
 	// lagging listing would leave them.
 	unlisted map[string]bool
@@ -148,7 +150,7 @@ func newFakeGitHub(clock *fakeClock) *fakeGitHub {
 
 func (f *fakeGitHub) addRepo(full string, id int64) *fakeRepo {
 	r := &fakeRepo{id: id, jobs: map[int64]*fakeJob{}, runners: map[int64]*githubapp.Runner{}, runs: map[int64]githubapp.WorkflowRun{}, unlisted: map[string]bool{},
-		created: map[int64]time.Time{}, updated: map[int64]time.Time{},
+		created: map[int64]time.Time{}, updated: map[int64]time.Time{}, started: map[int64]time.Time{},
 		tags: map[string]string{}, branches: map[string]*fakeBranch{"main": {}}}
 	f.repos[full] = r
 	return r
@@ -263,19 +265,19 @@ func (f *fakeGitHub) branchAt(name, tip string, ancestors ...string) {
 // its first, updated_at its latest. The caller holds mu.
 func (r *fakeRepo) touch(runID int64, now time.Time) {
 	if _, ok := r.created[runID]; !ok {
-		r.created[runID] = now
+		r.created[runID], r.started[runID] = now, now
 	}
 	r.updated[runID] = now
 }
 
-// runTimes is runID's created_at and updated_at; a run whose jobs were
-// stored without touch reads as created and updated now.
-func (r *fakeRepo) runTimes(runID int64, now time.Time) (created, updated time.Time) {
+// runTimes is runID's created_at, updated_at and run_started_at; a run
+// whose jobs were stored without touch reads as created and updated now.
+func (r *fakeRepo) runTimes(runID int64, now time.Time) (created, updated, started time.Time) {
 	created, ok := r.created[runID]
 	if !ok {
-		return now, now
+		return now, now, now
 	}
-	return created, r.updated[runID]
+	return created, r.updated[runID], r.started[runID]
 }
 
 func (r *fakeRepo) runStatus(runID int64) string {
@@ -333,7 +335,7 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 			continue
 		}
 		// GitHub compares created_at, at whole seconds, with the cutoff.
-		if created, _ := r.runTimes(j.runID, now); !cutoff.IsZero() && created.Truncate(time.Second).After(cutoff) {
+		if created, _, _ := r.runTimes(j.runID, now); !cutoff.IsZero() && created.Truncate(time.Second).After(cutoff) {
 			continue
 		}
 		ids = append(ids, j.runID)
@@ -342,8 +344,8 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 	if opts.Status == "" {
 		// Newest created first, as GitHub lists them; ids break ties.
 		slices.SortStableFunc(ids, func(a, b int64) int {
-			ca, _ := r.runTimes(a, now)
-			cb, _ := r.runTimes(b, now)
+			ca, _, _ := r.runTimes(a, now)
+			cb, _, _ := r.runTimes(b, now)
 			return cmp.Or(cb.Compare(ca), cmp.Compare(b, a))
 		})
 	}
@@ -352,7 +354,7 @@ func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, repo githubapp.Reposi
 		s := r.runStatus(id)
 		run := r.runs[id]
 		run.ID, run.Status, run.HeadSHA = id, &s, fakeSHA(id)
-		run.CreatedAt, run.UpdatedAt = r.runTimes(id, now)
+		run.CreatedAt, run.UpdatedAt, run.RunStartedAt = r.runTimes(id, now)
 		runs = append(runs, run)
 	}
 	items, next := page(runs, opts.PageOptions, f.perPage)
@@ -576,7 +578,7 @@ func (f *fakeGitHub) GetWorkflowRun(_ context.Context, repo githubapp.Repository
 	}
 	run := r.runs[runID]
 	run.ID, run.RunAttempt, run.HeadSHA = runID, 0, fakeSHA(runID)
-	run.CreatedAt, run.UpdatedAt = r.runTimes(runID, f.clock.Now())
+	run.CreatedAt, run.UpdatedAt, run.RunStartedAt = r.runTimes(runID, f.clock.Now())
 	for _, j := range r.jobs {
 		if j.runID == runID {
 			run.RunAttempt = max(run.RunAttempt, attemptOf(j))
@@ -701,6 +703,28 @@ func (f *fakeGitHub) newAttempt(r *fakeRepo, runID int64, rerun []*fakeJob) {
 		f.replaced[j.id] = f.nextID
 	}
 	r.touch(runID, f.clock.Now())
+	r.started[runID] = f.clock.Now()
+}
+
+// rerunByHand re-runs the failed or cancelled jobs of workflow run runID of
+// acme/widgets as a person would, outside the bridge's re-run record, and
+// returns the new attempt's job ids.
+func (f *fakeGitHub) rerunByHand(runID int64) []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.repos[widgets]
+	var failed []*fakeJob
+	for _, id := range sortedKeys(r.jobs) {
+		if j := r.jobs[id]; j.runID == runID && !j.superseded && (j.conclusion == "failure" || j.conclusion == "cancelled") {
+			failed = append(failed, j)
+		}
+	}
+	f.newAttempt(r, runID, failed)
+	var ids []int64
+	for _, j := range failed {
+		ids = append(ids, f.replaced[j.id])
+	}
+	return ids
 }
 
 func attemptOf(j *fakeJob) int64 { return max(j.attempt, 1) }
@@ -798,11 +822,13 @@ func (f *fakeGitHub) touchJob(jobID int64) {
 	}
 }
 
-// setRunTimes sets created_at and updated_at of a workflow run of repo.
+// setRunTimes sets created_at and updated_at of a workflow run of repo, at
+// its first attempt: run_started_at is created_at.
 func (f *fakeGitHub) setRunTimes(repo string, runID int64, created, updated time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.repos[repo].created[runID], f.repos[repo].updated[runID] = created, updated
+	r := f.repos[repo]
+	r.created[runID], r.updated[runID], r.started[runID] = created, updated, created
 }
 
 // describeRun sets what acme/widgets' runs listing reports of a workflow run.

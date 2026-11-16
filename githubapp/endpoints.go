@@ -82,6 +82,9 @@ type WorkflowRun struct {
 	WorkflowID int64     `json:"workflow_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// RunStartedAt is when the latest attempt started; a re-run keeps
+	// CreatedAt.
+	RunStartedAt time.Time `json:"run_started_at"`
 	// PullRequests lists the open pull requests whose head is this run's
 	// head, whatever their base: it can hold a pull request into a fork, and
 	// it is empty for a pull request from a fork.

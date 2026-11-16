@@ -457,17 +457,26 @@ labels, any state; one Run per runner name). If the Run has ended:
   If its runner differs or the job is gone, it searches the repository's
   workflow runs (all statuses) and their latest jobs for the exact runner
   name, even across workflows. One search per repository per pass serves
-  every unresolved loss of that repository, over one window: from the
-  earliest of their Lux Runs' `createdAt` to the latest `finishedAt`, each
-  widened by a minute of clock skew. Only workflow runs whose lifetime
-  overlaps the window can hold the job, so the search lists runs newest
-  first created at or before the window's end
+  every unresolved loss of that repository. Each loss has its own window,
+  its Lux Run's `createdAt` to its `finishedAt`, widened by a minute of
+  clock skew; only a workflow run overlapping a window can hold that loss's
+  job. The search lists runs newest first created at or before the latest
+  window's end
   (`GET /repos/{owner}/{repo}/actions/runs?created=<=<end>&per_page=100`)
   and stops after a page whose runs were all created more than 6 hours
-  before the window's start: a workflow run longer than that whose job
-  is lost is not found. It lists the latest jobs only of the remaining
-  runs that are not `queued` and, if `completed`, were last updated
-  (`updated_at`) after the window's start. Run listing pages and job
+  before the earliest window's start. It lists the latest jobs only of the
+  runs that may hold the job of a loss not yet resolved: not `queued`;
+  created, or with their latest attempt started (`run_started_at`), by
+  the window's end and at most 6 hours before its start; and, if
+  `completed`, last updated (`updated_at`) after the window's start. A
+  re-run keeps its workflow run's `created_at`, so a run created more than
+  6 hours before the window is reached only through `run_started_at` and
+  only if the listing reaches its page; past the listing, the search lists
+  the latest jobs of each unresolved loss's own label workflow run
+  (`lux-gha/run-id`), within the same job page cap. A job not found
+  either way is not re-run: one in a workflow run longer than 6 hours, or
+  in a re-run attempt of another workflow run created more than 6 hours
+  before the window. Run listing pages and job
   listing pages are capped separately, at 10 (1,000 runs) and 200, with
   at most 10 job pages per run and 100 items per page. The search stops as
   soon as every loss is resolved.
