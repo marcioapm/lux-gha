@@ -93,6 +93,8 @@ func fakeInstallation(t *testing.T) (string, chan struct{}, chan struct{}) {
 			io.WriteString(w, `{"id":1001,"full_name":"acme/widgets"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/actions/runs":
 			io.WriteString(w, `{"total_count":0,"workflow_runs":[]}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/actions/runs/"):
+			http.NotFound(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/actions/runners":
 			io.WriteString(w, `{"total_count":0,"runners":[]}`)
 			passes <- struct{}{}

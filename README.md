@@ -79,6 +79,24 @@ The bridge keeps **one live Run per queued matching job**. A pass:
    complete pass. Repository order remains configuration order (name order
    when discovered): earlier backlogs can still delay later repositories,
    including their stopped-job recovery. This is not cross-repository fairness.
+
+   A job a `concurrency` group holds is `pending`, and GitHub lists its
+   workflow run as `pending`, not `queued`, while any job of that run is
+   still held. When the group releases the job, it becomes `queued` and
+   GitHub sends its `queued` delivery, but neither listing above shows it.
+   So the bridge remembers each matching `queued` delivery's workflow run,
+   and a read fetches that run (`GET /actions/runs/{id}` and its jobs)
+   whenever its listings did not show the delivered job, until the job is
+   listed, or delivered or listed `in_progress` or `completed`, a whole read of the run still shows
+   it neither queued nor anywhere `reconcile.hotWindow` after its delivery,
+   the run completes, or 24 hours pass (GitHub cancels a job queued that
+   long).
+   A release from before the bridge started, or while the installation
+   could not read a repository (404 or 403), has no delivery it remembers,
+   so after startup, and after such an answer, the bridge lists a
+   repository's `pending` workflow runs once, in the first read that has
+   some of the `queued` half of the allowance left. Each fetched or listed
+   run's jobs, and each fetched run, spend that half.
 2. **Supply.** Lists the instance's live Lux Runs (`submitted`, `scheduled`,
    `provisioning`, `starting`, `running`, `stopping`, `resuming`) and the
    repository's runners named `lux-gha-<instance>-...`.
@@ -215,8 +233,8 @@ and about `66 / 9 ≈ 7.3` cold ones at 3 requests each (22), plus one listing
 page every 10 minutes: about 30 requests per pass, about 1,800 per hour.
 The cold share is paced by time, not by passes, so it stays near
 `66 × 3 × 60 / 9 ≈ 1,320` requests per hour however often webhooks wake the
-loop. The startup pass reads every repository once, at about 3 requests each
-(about `68 × 3 ≈ 204`). An installation's limit is 5,000 requests per hour
+loop. The startup pass reads every repository once, at about 4 requests each
+(about `68 × 4 ≈ 272`), including its one `pending` listing. An installation's limit is 5,000 requests per hour
 (more for large organisations), so this leaves well over half of it free.
 
 Hot reads happen once per tick: `hot × ~4 requests × 60` per hour. A woken
@@ -224,6 +242,8 @@ pass costs about `K × 4` requests, K being the repositories with a delivery
 since the previous pass, whatever the hot set (plus one listing page when an
 installation event asked for a refresh); so wakes, at most every 5 s,
 add about 4 requests per delivered repository rather than a hot-set read.
+A delivery that a concurrency group's release sent costs 2 more, the run
+and its jobs, since neither listing shows the job.
 During a burst the hot set is bounded by free capacity, not by the
 installation: repositories with live Runs (at most `maxRunners`), demand only
 while a slot is free for it, and deliveries whose job no read has listed yet.

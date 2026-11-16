@@ -24,7 +24,11 @@ func (r *Reconciler) Webhook(secret []byte) (*webhook.Handler, error) {
 		if ev.Action == "completed" && ev.RunnerName != "" {
 			r.noteCompleted(ev.Repository, ev.RunnerName)
 		}
+		if ev.Action == "in_progress" || ev.Action == "completed" {
+			r.forgetQueuedJobs(ev.Repository, func(job int64, _ heldJob) bool { return job == ev.JobID })
+		}
 		if queuedMatching(ev) {
+			r.rememberQueuedJob(ev.Repository, ev.RunID, ev.JobID)
 			r.NoteQueued(ev.Repository, ev.JobID)
 			r.Wake()
 		}
@@ -36,6 +40,7 @@ func (r *Reconciler) Webhook(secret []byte) (*webhook.Handler, error) {
 	h.OnUnlistedRepository = func(_ context.Context, ev webhook.WorkflowJobEvent) error {
 		// Marked hot, the repository is read as soon as a refresh lists it.
 		if queuedMatching(ev) {
+			r.rememberQueuedJob(ev.Repository, ev.RunID, ev.JobID)
 			r.NoteQueued(ev.Repository, ev.JobID)
 		}
 		r.noteUnlisted(ev.Repository)
