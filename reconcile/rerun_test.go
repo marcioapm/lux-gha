@@ -1094,6 +1094,47 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 	}
 }
 
+func TestHostLossSwappedCachedPartialSearchKeepsSiblingsTogether(t *testing.T) {
+	e := newEnv(t)
+	for _, trigger := range []int64{7, 9} {
+		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+	}
+	e.pass()
+	for _, trigger := range []int64{7, 9} {
+		actual := trigger + 1
+		e.gh.queueIn(widgets, 80, actual, "queued", lux3...)
+		if err := e.gh.pick(runner(itoa(trigger), 0), actual); err != nil {
+			t.Fatal(err)
+		}
+		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "external-runner")
+		e.gh.complete(trigger, "success")
+		e.gh.complete(actual, "cancelled")
+		e.lux.end(e.runID(itoa(trigger)), preempt)
+	}
+	e.gh.queueIn(widgets, 80, 12, "completed", "ubuntu-latest")
+	e.gh.editJob(12, func(j *fakeJob) { j.conclusion = "success" })
+	e.gh.perPage = 1
+	failed := 0
+	e.gh.fail = func(op, _ string, page int) error {
+		if op == opJobs && page == 3 {
+			failed++
+			return &githubapp.APIError{StatusCode: http.StatusInternalServerError}
+		}
+		return nil
+	}
+	if st := e.pass(); failed != 1 || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+		t.Fatalf("partial cached listing advanced one sibling: %+v failed %d reruns %v", st, failed, e.gh.rerunJobs())
+	}
+	ops := countOps(e, nil)
+	if st := e.pass(); st.Rerun != 2 || !slices.Equal(e.gh.rerunJobs(), []int64{8, 10}) || ops[opRerunFailed] != 1 || ops[opRerun] != 0 {
+		t.Fatalf("repaired siblings not grouped: %+v reruns %v ops %v", st, e.gh.rerunJobs(), ops)
+	}
+	e.pass()
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8, 10}) {
+		t.Fatalf("duplicate retry: %v", e.gh.rerunJobs())
+	}
+}
+
 func TestHostLossSwappedNewestMatchSurvivesUnmatchedLoss(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
