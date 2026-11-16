@@ -458,22 +458,20 @@ func (r *Reconciler) lostWindows(repoID int64) map[string]lostWindow {
 	return windows
 }
 
-// lostScan is one searchLost in progress: the losses not yet resolved, the
-// job pages left and the workflow runs whose jobs were listed.
+// lostScan is one searchLost in progress: the losses not yet resolved and
+// the job pages left.
 type lostScan struct {
 	p       *pass
 	v       *repoView
 	s       *lostSearch
 	targets map[string]lostWindow
 	budget  int
-	listed  map[int64]bool
 }
 
 // listJobs lists the latest jobs of workflow run runID, resolving the
 // targets whose runner took one. It is false, with s.err set, when the
 // search must end: a failed read or an exhausted job budget.
 func (c *lostScan) listJobs(runID int64) bool {
-	c.listed[runID] = true
 	for jp := 1; jp <= maxRunPages && c.budget > 0; jp++ {
 		c.budget--
 		jobs, err := c.p.r.gh.ListWorkflowRunJobs(c.p.ctx, c.v.ref, runID, githubapp.WorkflowJobListOptions{
@@ -518,18 +516,17 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	}
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
-	c := &lostScan{p: p, v: v, s: s, targets: p.r.lostWindows(v.id), budget: maxSearchJobPages, listed: map[int64]bool{}}
+	c := &lostScan{p: p, v: v, s: s, targets: p.r.lostWindows(v.id), budget: maxSearchJobPages}
 	// With no target, a zero window end would list unfiltered.
 	if len(c.targets) == 0 || !c.scanWindows() {
 		return s
 	}
+	// Every run listed so far is complete: an incomplete listing ends the
+	// search.
 	for _, runner := range sortedKeys(c.targets) {
 		w, ok := c.targets[runner]
-		if !ok || c.listed[w.runID] {
-			continue
-		}
-		if !c.listJobs(w.runID) {
-			return s
+		if ok && !s.complete[w.runID] && !c.listJobs(w.runID) {
+			break
 		}
 	}
 	return s
