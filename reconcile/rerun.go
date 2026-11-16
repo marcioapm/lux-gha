@@ -22,6 +22,18 @@ const (
 	maxRerunTries = 5
 	// lostCursorSkew allows for Lux's clock running behind the bridge's.
 	lostCursorSkew = time.Minute
+	// maxWorkflowLookback is how long before a lost Run's creation a
+	// workflow run may have been created and still hold the job the Run's
+	// runner took: the longest workflow run the search covers.
+	maxWorkflowLookback = 6 * time.Hour
+	// lostWindowSkew widens the lost Runs' window for the skew between
+	// Lux's and GitHub's clocks.
+	lostWindowSkew = time.Minute
+	// maxSearchRunPages and maxSearchJobPages bound one lost-runner search:
+	// workflow-run listing pages (pageSize runs each) and job listing pages
+	// of the candidate runs, budgeted separately.
+	maxSearchRunPages = 10
+	maxSearchJobPages = 200
 )
 
 // endedStates are the Lux Run states that are not live; succeeded is left
@@ -37,6 +49,7 @@ type lostJob struct {
 	// took the job is never verified, as the job ran on a later gen.
 	runner   string
 	verified bool
+	created  time.Time // the Run's creation, before its runner could take a job
 	since    time.Time // the Run's end
 	tries    int
 }
@@ -188,6 +201,7 @@ func (p *pass) considerEnded(run luxclient.Run, now time.Time) {
 		return
 	}
 	if l := lostFromLabels(run.Labels); l != nil && hostLost(run.StateReason) {
+		l.created = run.CreatedAt
 		p.r.queueLost(run.ID, finished, l)
 	}
 }
@@ -411,6 +425,13 @@ type lostSearch struct {
 
 // searchLost shares a bounded repository search across every lost runner in
 // the pass. Listings only nominate jobs; checkLost reads each nominee again.
+//
+// Only workflow runs whose lifetime overlaps the window spanning the
+// unverified losses' Runs can hold their jobs. Runs are listed newest first
+// with created at or before the window's end, and listing stops at a page
+// created wholly before the window's start minus maxWorkflowLookback. A run
+// last updated before the window's start, still queued or older than the
+// lookback is skipped without listing its jobs.
 func (p *pass) searchLost(v *repoView) *lostSearch {
 	if p.lostSearches == nil {
 		p.lostSearches = map[int64]*lostSearch{}
@@ -420,26 +441,47 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	}
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
-	budget := searchPageBudget
 	targets := map[string]bool{}
+	var start, end time.Time
 	for _, lost := range p.r.lost {
-		if lost.repoID == v.id && !lost.verified {
-			targets[lost.runner] = true
+		if lost.repoID != v.id || lost.verified {
+			continue
+		}
+		targets[lost.runner] = true
+		created := lost.created
+		if created.IsZero() {
+			// No Run outlives its route's timeout.
+			created = lost.since.Add(-p.r.longestTimeout())
+		}
+		if start.IsZero() || created.Before(start) {
+			start = created
+		}
+		if lost.since.After(end) {
+			end = lost.since
 		}
 	}
-	for page := 1; page <= maxRunPages && budget > 0; page++ {
-		budget--
+	start, end = start.Add(-lostWindowSkew), end.Add(lostWindowSkew)
+	oldest := start.Add(-maxWorkflowLookback)
+	jobBudget := maxSearchJobPages
+	for page := 1; page <= maxSearchRunPages; page++ {
 		runs, err := p.r.gh.ListWorkflowRuns(p.ctx, v.ref, githubapp.WorkflowRunListOptions{
-			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize},
+			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, CreatedAtOrBefore: end,
 		})
 		if err != nil {
 			s.err = err
 			return s
 		}
+		pastLookback := len(runs.Runs) > 0
 		for _, run := range runs.Runs {
+			if !run.CreatedAt.Before(oldest) {
+				pastLookback = false
+			}
+			if run.CreatedAt.Before(oldest) || cannotHoldLost(run, start) {
+				continue
+			}
 			complete := false
-			for jp := 1; jp <= maxRunPages && budget > 0; jp++ {
-				budget--
+			for jp := 1; jp <= maxRunPages && jobBudget > 0; jp++ {
+				jobBudget--
 				jobs, err := p.r.gh.ListWorkflowRunJobs(p.ctx, v.ref, run.ID, githubapp.WorkflowJobListOptions{
 					PageOptions: githubapp.PageOptions{Page: jp, PerPage: pageSize}, Filter: "latest",
 				})
@@ -467,12 +509,22 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 				return s
 			}
 		}
-		if !runs.HasNext {
+		if !runs.HasNext || pastLookback {
 			return s
 		}
 	}
 	s.err = errors.New("lost runner workflow search exceeded its page bound")
 	return s
+}
+
+// cannotHoldLost reports whether workflow run could not have run a job on a
+// runner of a Run created at start: it completed before then (updated_at is
+// its completion), or none of its jobs has started.
+func cannotHoldLost(run githubapp.WorkflowRun, start time.Time) bool {
+	if run.Status == nil {
+		return false
+	}
+	return *run.Status == "queued" || *run.Status == "completed" && run.UpdatedAt.Before(start)
 }
 
 // readFailed classifies a failed GitHub read; failed is false for a nil err.
