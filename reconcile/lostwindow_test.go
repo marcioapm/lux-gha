@@ -514,6 +514,47 @@ func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
 	}
 }
 
+// Lux reports the lost Run with no createdAt, so its window starts the
+// longest route timeout (2h) before its end. 250 runs that completed three
+// hours before that start sit between the window and the executing job's
+// run; they are skipped without a job page, and the job is re-run in the
+// first pass that sees the loss.
+func TestLostSearchWindowsARunWithoutCreatedAtByTheRouteTimeout(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
+	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.clock.Add(10 * time.Minute)
+	e.completedRuns(1000, 250)
+	e.clock.Add(3 * time.Hour)
+	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
+	e.pass()
+	id := e.runID("7")
+	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+	if err := e.gh.pick(runner("7", 0), 8); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
+	e.gh.complete(7, "success")
+	e.clock.Add(10 * time.Minute)
+	e.lux.end(id, preempt)
+	e.gh.complete(8, "cancelled")
+	e.gh.complete(1080, "success")
+	e.lux.getNoCreated = true
+	g := e.recordSearch()
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
+	if !slices.Contains(e.lux.getCalls(), id) {
+		t.Fatalf("the loss was not read with Get: %v", e.lux.getCalls())
+	}
+	if st.Error != "" || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	if !slices.Equal(g.jobRuns, []int64{70, 80}) {
+		t.Fatalf("jobs listed for %v", g.jobRuns)
+	}
+}
+
 func countOf(ids []int64, id int64) int {
 	n := 0
 	for _, x := range ids {

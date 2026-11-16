@@ -962,9 +962,11 @@ type fakeLux struct {
 	// sinceListErr fails them.
 	sinceLists   []time.Time
 	sinceListErr error
-	// gets records each Get's id; failGet fails them.
-	gets    []string
-	failGet bool
+	// gets records each Get's id; failGet fails them; getNoCreated answers
+	// them with a zero createdAt.
+	gets         []string
+	failGet      bool
+	getNoCreated bool
 }
 
 func newFakeLux(clock *fakeClock) *fakeLux { return &fakeLux{clock: clock, lateCommit: -1} }
@@ -1144,6 +1146,9 @@ func (l *fakeLux) Get(_ context.Context, id string) (*luxclient.Run, error) {
 	for _, r := range l.runs {
 		if r.run.ID == id {
 			run := r.run
+			if l.getNoCreated {
+				run.CreatedAt = time.Time{}
+			}
 			return &run, nil
 		}
 	}
