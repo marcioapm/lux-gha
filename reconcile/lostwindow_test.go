@@ -270,21 +270,27 @@ func TestLostSearchRunPagesDoNotSpendTheJobBudget(t *testing.T) {
 // the bridge was down.
 func (e *env) pastLoss(at time.Time, triggerRun, trigger, actualRun, actual int64, life time.Duration) {
 	e.t.Helper()
+	e.pastLostRun(at, triggerRun, trigger, life)
+	e.gh.queueIn(widgets, actualRun, actual, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, actual, 8_000_000+actual, runner(itoa(trigger), 0))
+	e.gh.complete(actual, "cancelled")
+	e.gh.setRunTimes(widgets, actualRun, at.Add(-5*time.Minute), at.Add(life))
+}
+
+// pastLostRun is pastLoss without the actual job: the Run's runner took no
+// job.
+func (e *env) pastLostRun(at time.Time, triggerRun, trigger int64, life time.Duration) {
+	e.t.Helper()
 	e.clock.Add(at.Sub(e.clock.Now()))
-	name := runner(itoa(trigger), 0)
 	id := e.lux.seed("api.github.com/t1/1001/"+itoa(trigger)+"/0", luxclient.RunSpec{Labels: map[string]string{
-		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: itoa(trigger), LabelGen: "0", LabelRunner: name,
-		LabelRunID: itoa(triggerRun), LabelRunAttempt: "1"}})
+		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: itoa(trigger), LabelGen: "0",
+		LabelRunner: runner(itoa(trigger), 0), LabelRunID: itoa(triggerRun), LabelRunAttempt: "1"}})
 	e.clock.Add(life)
 	e.lux.end(id, preempt)
 	e.gh.queueIn(widgets, triggerRun, trigger, "queued", lux3...)
 	e.gh.pickElsewhere(widgets, trigger, 9_000_000+trigger, "hosted-"+itoa(trigger))
 	e.gh.complete(trigger, "success")
-	e.gh.queueIn(widgets, actualRun, actual, "queued", lux3...)
-	e.gh.pickElsewhere(widgets, actual, 8_000_000+actual, name)
-	e.gh.complete(actual, "cancelled")
 	e.gh.setRunTimes(widgets, triggerRun, at.Add(-time.Minute), at.Add(2*time.Minute))
-	e.gh.setRunTimes(widgets, actualRun, at.Add(-5*time.Minute), at.Add(life))
 }
 
 // pastRuns adds n workflow runs from first, created every apart from from,
@@ -599,17 +605,7 @@ func TestLostSearchSkipsRunsBetweenDisjointUnresolvedLosses(t *testing.T) {
 	t0 := e.clock.Now().Add(time.Hour)
 	e.pastLoss(t0, 70, 7, 80, 8, 20*time.Minute)
 	e.pastRuns(100_000, 300, t0.Add(30*time.Minute), 48*time.Second, 10*time.Minute)
-	at := t0.Add(5 * time.Hour)
-	e.clock.Add(at.Sub(e.clock.Now()))
-	id := e.lux.seed("api.github.com/t1/1001/9/0", luxclient.RunSpec{Labels: map[string]string{
-		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: "9", LabelGen: "0",
-		LabelRunner: runner("9", 0), LabelRunID: "75", LabelRunAttempt: "1"}})
-	e.clock.Add(20 * time.Minute)
-	e.lux.end(id, preempt)
-	e.gh.queueIn(widgets, 75, 9, "queued", lux3...)
-	e.gh.pickElsewhere(widgets, 9, 9_000_009, "hosted-9")
-	e.gh.complete(9, "success")
-	e.gh.setRunTimes(widgets, 75, at.Add(-time.Minute), at.Add(2*time.Minute))
+	e.pastLostRun(t0.Add(5*time.Hour), 75, 9, 20*time.Minute)
 	e.clock.Add(5 * time.Minute)
 	g := e.recordSearch()
 	st := e.pass()
@@ -652,19 +648,25 @@ func TestLostSearchWithNoTargetListsNothing(t *testing.T) {
 	}
 }
 
-// When the run listing hits its page cap, each loss's own label workflow
-// run is still listed, so a runner that took a sibling there is found. The
-// label run is a re-run of a workflow run created 8 h earlier, out of the
-// listing's reach, and 1,100 runs that finished before the loss fill the
-// listing past its cap.
-func TestLostSearchListsTheLabelRunWhenTheListingIsTruncated(t *testing.T) {
-	e := newEnv(t)
+// truncatedLabelLoss loses, 6 hours from now, a Run whose runner took a
+// sibling of its label job in workflow run 70, a re-run of a run created 8
+// hours earlier. 1,100 runs that finished before the loss fill the listing
+// past its cap.
+func (e *env) truncatedLabelLoss() {
+	e.t.Helper()
 	e.gh.perPage = 100
 	at := e.clock.Now().Add(6 * time.Hour)
 	e.pastRuns(100_000, 1100, at.Add(-5*time.Hour), time.Second, time.Second)
 	e.pastLoss(at, 70, 7, 70, 8, 20*time.Minute)
 	e.gh.setRunTimes(widgets, 70, at.Add(-8*time.Hour), at.Add(20*time.Minute))
 	e.clock.Add(5 * time.Minute)
+}
+
+// When the run listing hits its page cap, each loss's own label workflow
+// run is still listed, so a runner that took a sibling there is found.
+func TestLostSearchListsTheLabelRunWhenTheListingIsTruncated(t *testing.T) {
+	e := newEnv(t)
+	e.truncatedLabelLoss()
 	g := e.recordSearch()
 	st := e.pass()
 	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
@@ -682,21 +684,16 @@ func TestLostSearchListsTheLabelRunWhenTheListingIsTruncated(t *testing.T) {
 func TestLostSearchEndsOnAListingError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		err  error
+		err  *githubapp.APIError
 	}{
 		{"server error", &githubapp.APIError{StatusCode: http.StatusInternalServerError}},
 		{"rate limited", &githubapp.APIError{StatusCode: http.StatusTooManyRequests, RateLimited: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
-			e.gh.perPage = 100
-			at := e.clock.Now().Add(6 * time.Hour)
-			e.pastRuns(100_000, 1100, at.Add(-5*time.Hour), time.Second, time.Second)
-			e.pastLoss(at, 70, 7, 70, 8, 20*time.Minute)
-			e.gh.setRunTimes(widgets, 70, at.Add(-8*time.Hour), at.Add(20*time.Minute))
-			e.clock.Add(5 * time.Minute)
-			if rl, ok := tc.err.(*githubapp.APIError); ok && rl.RateLimited {
-				rl.RetryAt = e.clock.Now().Add(time.Minute)
+			e.truncatedLabelLoss()
+			if tc.err.RateLimited {
+				tc.err.RetryAt = e.clock.Now().Add(time.Minute)
 			}
 			e.gh.fail = func(op, _ string, page int) error {
 				if op == opRuns && page == 2 {
@@ -709,7 +706,7 @@ func TestLostSearchEndsOnAListingError(t *testing.T) {
 			if slices.Contains(g.jobRuns, 70) || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
 				t.Fatalf("search went on after the listing failed: jobs listed for %v, status %+v", g.jobRuns, st)
 			}
-			if rl := tc.err.(*githubapp.APIError); rl.RateLimited && (st.Error != ErrRateLimited || st.RateLimitedUntil == nil) {
+			if tc.err.RateLimited && (st.Error != ErrRateLimited || st.RateLimitedUntil == nil) {
 				t.Fatalf("rate limit not reported: %+v", st)
 			}
 		})
