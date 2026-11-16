@@ -423,15 +423,39 @@ type lostSearch struct {
 	err      error
 }
 
+// lostWindow is the lifetime of an unresolved loss's Run, widened by
+// lostWindowSkew: only a workflow run overlapping it can hold the job the
+// Run's runner took.
+type lostWindow struct {
+	start, end time.Time
+}
+
+// lostWindows maps the runner of each unverified loss of repository repoID
+// to its window.
+func (r *Reconciler) lostWindows(repoID int64) map[string]lostWindow {
+	windows := map[string]lostWindow{}
+	for _, lost := range r.lost {
+		if lost.repoID != repoID || lost.verified {
+			continue
+		}
+		created := lost.created
+		if created.IsZero() {
+			// No Run outlives its route's timeout.
+			created = lost.since.Add(-r.longestTimeout())
+		}
+		windows[lost.runner] = lostWindow{created.Add(-lostWindowSkew), lost.since.Add(lostWindowSkew)}
+	}
+	return windows
+}
+
 // searchLost shares a bounded repository search across every lost runner in
 // the pass. Listings only nominate jobs; checkLost reads each nominee again.
 //
-// Only workflow runs whose lifetime overlaps the window spanning the
-// unverified losses' Runs can hold their jobs. Runs are listed newest first
-// with created at or before the window's end, and listing stops at a page
-// created wholly before the window's start minus maxWorkflowLookback. A run
-// last updated before the window's start, still queued or older than the
-// lookback is skipped without listing its jobs.
+// Runs are listed newest first with created at or before the latest window
+// end, and listing stops at a page created wholly before the earliest window
+// start minus maxWorkflowLookback. Only a run that may hold the job of a loss
+// still unresolved (mayHoldLost) has its jobs listed; a loss is resolved once
+// its runner is found, so the skipped set grows during the scan.
 func (p *pass) searchLost(v *repoView) *lostSearch {
 	if p.lostSearches == nil {
 		p.lostSearches = map[int64]*lostSearch{}
@@ -441,26 +465,16 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	}
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
-	targets := map[string]bool{}
+	targets := p.r.lostWindows(v.id)
 	var start, end time.Time
-	for _, lost := range p.r.lost {
-		if lost.repoID != v.id || lost.verified {
-			continue
+	for _, w := range targets {
+		if start.IsZero() || w.start.Before(start) {
+			start = w.start
 		}
-		targets[lost.runner] = true
-		created := lost.created
-		if created.IsZero() {
-			// No Run outlives its route's timeout.
-			created = lost.since.Add(-p.r.longestTimeout())
-		}
-		if start.IsZero() || created.Before(start) {
-			start = created
-		}
-		if lost.since.After(end) {
-			end = lost.since
+		if w.end.After(end) {
+			end = w.end
 		}
 	}
-	start, end = start.Add(-lostWindowSkew), end.Add(lostWindowSkew)
 	oldest := start.Add(-maxWorkflowLookback)
 	jobBudget := maxSearchJobPages
 	for page := 1; page <= maxSearchRunPages; page++ {
@@ -476,7 +490,7 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 			if !run.CreatedAt.Before(oldest) {
 				pastLookback = false
 			}
-			if run.CreatedAt.Before(oldest) || cannotHoldLost(run, start) {
+			if !mayHoldLost(run, targets) {
 				continue
 			}
 			complete := false
@@ -517,14 +531,28 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	return s
 }
 
-// cannotHoldLost reports whether workflow run could not have run a job on a
-// runner of a Run created at start: it completed before then (updated_at is
-// its completion), or none of its jobs has started.
-func cannotHoldLost(run githubapp.WorkflowRun, start time.Time) bool {
-	if run.Status == nil {
+// mayHoldLost reports whether workflow run may have run a job on the runner
+// of a loss in targets: created by the window's end and at most
+// maxWorkflowLookback before its start, with a started job (not queued), and
+// not completed before the window's start (updated_at is its completion).
+func mayHoldLost(run githubapp.WorkflowRun, targets map[string]lostWindow) bool {
+	status := ""
+	if run.Status != nil {
+		status = *run.Status
+	}
+	if status == "queued" {
 		return false
 	}
-	return *run.Status == "queued" || *run.Status == "completed" && run.UpdatedAt.Before(start)
+	for _, w := range targets {
+		if run.CreatedAt.After(w.end) || run.CreatedAt.Before(w.start.Add(-maxWorkflowLookback)) {
+			continue
+		}
+		if status == "completed" && run.UpdatedAt.Before(w.start) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // readFailed classifies a failed GitHub read; failed is false for a nil err.

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/marcioapm/lux-gha/githubapp"
+	"github.com/marcioapm/lux-gha/luxclient"
 )
 
 // searchRecorder records the lost-runner search's GitHub listings: every
@@ -297,6 +298,108 @@ func TestLostSearchRunPagesDoNotSpendTheJobBudget(t *testing.T) {
 	}
 	if g.runPages != 2 || len(g.jobRuns) != maxSearchJobPages {
 		t.Fatalf("search pages %d, jobs pages %d", g.runPages, len(g.jobRuns))
+	}
+}
+
+// pastLoss records a host loss at the clock's time, which must not be after
+// at: a Lux Run for job trigger of workflow run triggerRun is created at at,
+// its runner takes job actual of workflow run actualRun instead, and it is
+// preempted after life. The trigger job runs on a GitHub-hosted runner; the
+// actual job ends cancelled, and so does actualRun. No pass runs, as when
+// the bridge was down.
+func (e *env) pastLoss(at time.Time, triggerRun, trigger, actualRun, actual int64, life time.Duration) {
+	e.t.Helper()
+	e.clock.Add(at.Sub(e.clock.Now()))
+	name := runner(itoa(trigger), 0)
+	id := e.lux.seed("api.github.com/t1/1001/"+itoa(trigger)+"/0", luxclient.RunSpec{Labels: map[string]string{
+		LabelManaged: "t1", LabelRepo: "1001", LabelRoute: "default", LabelJob: itoa(trigger), LabelGen: "0", LabelRunner: name,
+		LabelRunID: itoa(triggerRun), LabelRunAttempt: "1"}})
+	e.clock.Add(life)
+	e.lux.end(id, preempt)
+	e.gh.queueIn(widgets, triggerRun, trigger, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, trigger, 9_000_000+trigger, "hosted-"+itoa(trigger))
+	e.gh.complete(trigger, "success")
+	e.gh.queueIn(widgets, actualRun, actual, "queued", lux3...)
+	e.gh.pickElsewhere(widgets, actual, 8_000_000+actual, name)
+	e.gh.complete(actual, "cancelled")
+	e.gh.setRunTimes(widgets, triggerRun, at.Add(-time.Minute), at.Add(2*time.Minute))
+	e.gh.setRunTimes(widgets, actualRun, at.Add(-5*time.Minute), at.Add(life))
+}
+
+// pastRuns adds n workflow runs from first, created every apart from from,
+// each with one job that ran for life and succeeded on a GitHub-hosted
+// runner.
+func (e *env) pastRuns(first int64, n int, from time.Time, every, life time.Duration) {
+	for i := range int64(n) {
+		e.gh.queueIn(widgets, first+i, 1_000_000+first+i, "completed", "ubuntu-latest")
+		e.gh.editJob(1_000_000+first+i, func(j *fakeJob) { j.conclusion = "success" })
+		created := from.Add(time.Duration(i) * every)
+		e.gh.setRunTimes(widgets, first+i, created, created.Add(life))
+	}
+}
+
+// Two losses five hours apart, rediscovered together after a restart, with
+// 300 runs created and completed between them: those runs overlap neither
+// loss's Run, so none of them is job-listed, and the job budget is left for
+// the runs that can hold the jobs.
+func TestLostSearchSkipsRunsBetweenDisjointLosses(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	t0 := e.clock.Now().Add(time.Hour)
+	e.pastLoss(t0, 70, 7, 80, 8, 20*time.Minute)
+	e.pastRuns(100_000, 300, t0.Add(30*time.Minute), 48*time.Second, 10*time.Minute)
+	e.pastLoss(t0.Add(5*time.Hour), 75, 9, 85, 10, 20*time.Minute)
+	e.clock.Add(5 * time.Minute)
+	g := e.recordSearch()
+	ops := countOps(e, nil)
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v; all GitHub calls %v", g.runPages, g.jobRuns, ops)
+	got := e.gh.rerunJobs()
+	slices.Sort(got)
+	if st.Error != "" || st.Rerun != 2 || !slices.Equal(got, []int64{8, 10}) {
+		t.Fatalf("status %+v reruns %v", st, got)
+	}
+	if !slices.Equal(g.jobRuns, []int64{75, 85, 70, 80}) {
+		t.Fatalf("jobs listed for %v", g.jobRuns)
+	}
+}
+
+// A restart rediscovers 20 losses spread over 20 hours of a repository
+// creating 50 workflow runs an hour, each running 15 minutes: about 1,040
+// runs, past the 1,000-run listing cap. One search cannot list the jobs of
+// every loss's candidates within its job budget, so each pass resolves the
+// newest losses it can and retries the rest; a resolved loss leaves the
+// window, so later listings end earlier and reach the oldest. Every loss is
+// re-run within maxRerunTries passes and none is given up on.
+func TestLostSearchRecoversLossesSpreadOverARestart(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	t0 := e.clock.Now().Add(30 * time.Minute)
+	e.pastRuns(100_000, 1000, t0.Add(-15*time.Minute), 72*time.Second, 15*time.Minute)
+	var want []int64
+	for i := range int64(20) {
+		at := t0.Add(time.Duration(i) * time.Hour)
+		e.pastLoss(at, 200+i, 30_000+i, 400+i, 50_000+i, 20*time.Minute)
+		want = append(want, 50_000+i)
+	}
+	e.clock.Add(5 * time.Minute)
+	g := e.recordSearch()
+	ops := countOps(e, nil)
+	passes := 0
+	for passes < maxRerunTries && len(e.gh.rerunJobs()) < len(want) {
+		e.pass()
+		passes++
+		t.Logf("pass %d: re-ran %d jobs, %d search runs pages, %d jobs pages so far", passes, len(e.gh.rerunJobs()), g.runPages, len(g.jobRuns))
+		e.clock.Add(time.Minute)
+	}
+	t.Logf("all GitHub calls %v", ops)
+	got := e.gh.rerunJobs()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("after %d passes re-ran %v, want %v", passes, got, want)
+	}
+	if len(e.rec.lost) != 0 {
+		t.Fatalf("losses left: %d", len(e.rec.lost))
 	}
 }
 
