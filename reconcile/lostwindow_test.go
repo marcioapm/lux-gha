@@ -742,17 +742,52 @@ func TestLostSearchListsTheLabelRunWhenTheListingIsTruncated(t *testing.T) {
 	e.gh.setRunTimes(widgets, 70, at.Add(-8*time.Hour), at.Add(20*time.Minute))
 	e.clock.Add(5 * time.Minute)
 	g := e.recordSearch()
-	for range maxRerunTries {
-		e.pass()
-		if len(e.gh.rerunJobs()) > 0 {
-			break
-		}
-	}
+	st := e.pass()
 	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
-	if g.runPages < maxSearchRunPages {
+	if g.runPages != maxSearchRunPages {
 		t.Fatalf("listing not truncated: %d run pages", g.runPages)
 	}
-	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
-		t.Fatalf("reruns %v, want [8]", e.gh.rerunJobs())
+	// Found in the pass whose listing was truncated, not a later one.
+	if st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{8}) {
+		t.Fatalf("status %+v reruns %v, want [8] in this pass", st, e.gh.rerunJobs())
+	}
+}
+
+// A failed run listing ends the search: the label workflow run is not
+// listed after it, and a rate limit is reported as such.
+func TestLostSearchEndsOnAListingError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"server error", &githubapp.APIError{StatusCode: http.StatusInternalServerError}},
+		{"rate limited", &githubapp.APIError{StatusCode: http.StatusTooManyRequests, RateLimited: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.gh.perPage = 100
+			at := e.clock.Now().Add(6 * time.Hour)
+			e.pastRuns(100_000, 1100, at.Add(-5*time.Hour), time.Second, time.Second)
+			e.pastLoss(at, 70, 7, 70, 8, 20*time.Minute)
+			e.gh.setRunTimes(widgets, 70, at.Add(-8*time.Hour), at.Add(20*time.Minute))
+			e.clock.Add(5 * time.Minute)
+			if rl, ok := tc.err.(*githubapp.APIError); ok && rl.RateLimited {
+				rl.RetryAt = e.clock.Now().Add(time.Minute)
+			}
+			e.gh.fail = func(op, _ string, page int) error {
+				if op == opRuns && page == 2 {
+					return tc.err
+				}
+				return nil
+			}
+			g := e.recordSearch()
+			st := e.pass()
+			if slices.Contains(g.jobRuns, 70) || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
+				t.Fatalf("search went on after the listing failed: jobs listed for %v, status %+v", g.jobRuns, st)
+			}
+			if rl := tc.err.(*githubapp.APIError); rl.RateLimited && (st.Error != ErrRateLimited || st.RateLimitedUntil == nil) {
+				t.Fatalf("rate limit not reported: %+v", st)
+			}
+		})
 	}
 }
