@@ -454,10 +454,35 @@ labels, any state; one Run per runner name). If the Run has ended:
   `lux-gha/run-id`, `lux-gha/run-attempt` and `lux-gha/runner` labels is a
   candidate. The labels are hints, not execution identity. The bridge first
   reads the triggering job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`).
-  If its runner differs or the job is gone, it searches repository workflow
-  runs (all statuses) and their latest jobs for the exact runner name, even
-  across workflows. One search per repository per pass shares at most 20
-  run/job pages, with at most 10 pages per listing and 100 items per page.
+  If its runner differs or the job is gone, it searches the repository's
+  workflow runs (all statuses) and their latest jobs for the exact runner
+  name, even across workflows. One search per repository per pass serves
+  every unresolved loss of that repository, over one window: from the
+  earliest of their Lux Runs' `createdAt` to the latest `finishedAt`, each
+  widened by a minute of clock skew. Only workflow runs whose lifetime
+  overlaps the window can hold the job, so the search lists runs newest
+  first created at or before the window's end
+  (`GET /repos/{owner}/{repo}/actions/runs?created=<=<end>&per_page=100`)
+  and stops after a page whose runs were all created more than 6 hours
+  before the window's start: a workflow run longer than that whose job
+  is lost is not found. It lists the latest jobs only of the remaining
+  runs that are not `queued` and, if `completed`, were last updated
+  (`updated_at`) after the window's start. Run listing pages and job
+  listing pages are capped separately, at 10 (1,000 runs) and 200, with
+  at most 10 job pages per run and 100 items per page. The search stops as
+  soon as every loss is resolved.
+
+  A search therefore makes at most 210 requests per repository per pass.
+  A loss whose job is found is not searched for again; a loss not found,
+  or whose search failed or was truncated, is searched for in at most five
+  passes, so it costs at most 1,050 search requests, shared with every other
+  loss of its repository in those passes, plus at most 10 job reads, one
+  workflow run read, one newer-run read, 10 sibling job pages and one
+  re-run. On the first pilot repository (about 185 workflow runs in 3.5
+  hours, at most about 27 jobs each), a window of one 90-minute Run spans
+  about 400 listable runs (4 run pages) and about 130 candidates (one job
+  page each), well under the installation's 5,000 requests per hour; a
+  Run lost after minutes costs a handful of pages.
   A listed candidate is verified by a direct job read: job ID, workflow run,
   attempt and runner must agree. The actual job's attempt controls the retry
   budget; its conclusion must be `failure` or `cancelled`. Pre-pickup loss
