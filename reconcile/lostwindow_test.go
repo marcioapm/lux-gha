@@ -58,18 +58,20 @@ func (e *env) completedRuns(first int64, n int) {
 	}
 }
 
-// windowedLoss starts workflow run actualRun now with a job running on a
-// GitHub-hosted runner (job actualRun+1000), and lead later provisions a Lux
-// Run for job trigger of workflow run 70. That Run's runner takes job actual
-// of actualRun instead, and its host is lost ten minutes later; actualRun
-// then completes cancelled. It returns the Lux Run's id.
-func (e *env) windowedLoss(actualRun, trigger, actual int64, lead time.Duration) string {
+// hostedRun starts workflow run runID with job 1000+runID running on a
+// GitHub-hosted runner.
+func (e *env) hostedRun(runID int64) {
+	e.gh.queueIn(widgets, runID, 1000+runID, "queued", "ubuntu-latest")
+	e.gh.pickElsewhere(widgets, 1000+runID, 9000+runID, "hosted-"+itoa(runID))
+}
+
+// swappedRun has a pass provision a Lux Run for job trigger of workflow run
+// triggerRun; that Run's runner takes job actual of workflow run actualRun
+// instead, and trigger runs and succeeds on a GitHub-hosted runner. It
+// returns the Lux Run's id.
+func (e *env) swappedRun(triggerRun, trigger, actualRun, actual int64) string {
 	e.t.Helper()
-	other := actualRun + 1000
-	e.gh.queueIn(widgets, actualRun, other, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, other, 9000+other, "hosted-"+itoa(other))
-	e.clock.Add(lead)
-	e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+	e.gh.queueIn(widgets, triggerRun, trigger, "queued", lux3...)
 	e.pass()
 	id := e.runID(itoa(trigger))
 	e.gh.queueIn(widgets, actualRun, actual, "queued", lux3...)
@@ -78,11 +80,25 @@ func (e *env) windowedLoss(actualRun, trigger, actual int64, lead time.Duration)
 	}
 	e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "hosted-"+itoa(trigger))
 	e.gh.complete(trigger, "success")
-	e.clock.Add(10 * time.Minute)
+	return id
+}
+
+// loseAfter preempts Lux Run id after life; job actual ends cancelled and
+// the hostedRun job of actualRun succeeds.
+func (e *env) loseAfter(id string, life time.Duration, actualRun, actual int64) {
+	e.clock.Add(life)
 	e.lux.end(id, preempt)
 	e.gh.complete(actual, "cancelled")
-	e.gh.complete(other, "success")
-	return id
+	e.gh.complete(1000+actualRun, "success")
+}
+
+// windowedLoss starts hostedRun 80 and, 40 minutes later, a swappedRun from
+// job 7 of workflow run 70 to job 8 of run 80, lost after ten minutes.
+func (e *env) windowedLoss() {
+	e.t.Helper()
+	e.hostedRun(80)
+	e.clock.Add(40 * time.Minute)
+	e.loseAfter(e.swappedRun(70, 7, 80, 8), 10*time.Minute, 80, 8)
 }
 
 // The first pilot repository's shape: the executing job's workflow run was
@@ -91,7 +107,7 @@ func (e *env) windowedLoss(actualRun, trigger, actual int64, lead time.Duration)
 func TestLostSearchReachesTheJobOnABusyRepository(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.windowedLoss(80, 7, 8, 40*time.Minute)
+	e.windowedLoss()
 	e.clock.Add(5 * time.Minute)
 	e.completedRuns(1000, 200)
 	g := e.recordSearch()
@@ -120,7 +136,7 @@ func TestLostSearchReachesTheJobOnABusyRepository(t *testing.T) {
 func TestLostSearchNeverListsRunsCreatedAfterTheWindow(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.windowedLoss(80, 7, 8, 40*time.Minute)
+	e.windowedLoss()
 	e.clock.Add(2 * time.Minute)
 	e.completedRuns(900, 1)
 	g := e.recordSearch()
@@ -138,24 +154,11 @@ func TestLostSearchNeverListsRunsCreatedAfterTheWindow(t *testing.T) {
 func TestLostSearchSkipsRunsThatFinishedBeforeTheWindow(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.hostedRun(80)
 	e.clock.Add(10 * time.Minute)
 	e.completedRuns(1000, 250)
 	e.clock.Add(30 * time.Minute)
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	id := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
-	e.clock.Add(10 * time.Minute)
-	e.lux.end(id, preempt)
-	e.gh.complete(8, "cancelled")
-	e.gh.complete(1080, "success")
+	e.loseAfter(e.swappedRun(70, 7, 80, 8), 10*time.Minute, 80, 8)
 	g := e.recordSearch()
 	st := e.pass()
 	t.Logf("search: %d runs pages, %d jobs pages", g.runPages, len(g.jobRuns))
@@ -174,25 +177,12 @@ func TestLostSearchSkipsRunsThatFinishedBeforeTheWindow(t *testing.T) {
 func TestLostSearchStopsAtTheLookback(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.hostedRun(80)
 	e.completedRuns(2000, 1050)
 	e.clock.Add(time.Minute)
 	e.completedRuns(1000, 50)
 	e.clock.Add(7 * time.Hour)
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	id := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
-	e.clock.Add(10 * time.Minute)
-	e.lux.end(id, preempt)
-	e.gh.complete(8, "cancelled")
-	e.gh.complete(1080, "success")
+	e.loseAfter(e.swappedRun(70, 7, 80, 8), 10*time.Minute, 80, 8)
 	g := e.recordSearch()
 	st := e.pass()
 	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
@@ -210,32 +200,14 @@ func TestLostSearchStopsAtTheLookback(t *testing.T) {
 func TestLostSearchSharesOneWindowAcrossLosses(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.hostedRun(80)
 	e.clock.Add(40 * time.Minute)
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	id7 := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
+	id7 := e.swappedRun(70, 7, 80, 8)
 	e.clock.Add(10 * time.Minute)
 	e.completedRuns(1000, 30)
 	e.clock.Add(20 * time.Minute)
-	e.gh.queueIn(widgets, 85, 1085, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1085, 9085, "hosted-85")
-	e.gh.queueIn(widgets, 75, 9, "queued", lux3...)
-	e.pass()
-	id9 := e.runID("9")
-	e.gh.queueIn(widgets, 85, 10, "queued", lux3...)
-	if err := e.gh.pick(runner("9", 0), 10); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 9, 9009, "hosted-9")
-	e.gh.complete(9, "success")
+	e.hostedRun(85)
+	id9 := e.swappedRun(75, 9, 85, 10)
 	e.clock.Add(5 * time.Minute)
 	e.lux.end(id7, preempt)
 	e.gh.complete(8, "cancelled")
@@ -273,24 +245,12 @@ func TestLostSearchSharesOneWindowAcrossLosses(t *testing.T) {
 func TestLostSearchRunPagesDoNotSpendTheJobBudget(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.hostedRun(80)
 	e.clock.Add(40 * time.Minute)
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	id := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
+	id := e.swappedRun(70, 7, 80, 8)
 	e.clock.Add(5 * time.Minute)
 	e.completedRuns(1000, maxSearchJobPages-2)
-	e.clock.Add(5 * time.Minute)
-	e.lux.end(id, preempt)
-	e.gh.complete(8, "cancelled")
-	e.gh.complete(1080, "success")
+	e.loseAfter(id, 5*time.Minute, 80, 8)
 	g := e.recordSearch()
 	st := e.pass()
 	t.Logf("search: %d runs pages, %d jobs pages", g.runPages, len(g.jobRuns))
@@ -555,24 +515,12 @@ func TestLostSearchEndsTheListingOnAPageThatCrossesTheLookback(t *testing.T) {
 func TestLostSearchWindowsARunWithoutCreatedAtByTheRouteTimeout(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 80, 1080, "queued", "ubuntu-latest")
-	e.gh.pickElsewhere(widgets, 1080, 9080, "hosted-80")
+	e.hostedRun(80)
 	e.clock.Add(10 * time.Minute)
 	e.completedRuns(1000, 250)
 	e.clock.Add(3 * time.Hour)
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	id := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
-	e.clock.Add(10 * time.Minute)
-	e.lux.end(id, preempt)
-	e.gh.complete(8, "cancelled")
-	e.gh.complete(1080, "success")
+	id := e.swappedRun(70, 7, 80, 8)
+	e.loseAfter(id, 10*time.Minute, 80, 8)
 	e.lux.getNoCreated = true
 	g := e.recordSearch()
 	st := e.pass()
@@ -595,27 +543,11 @@ func TestLostSearchWindowsARunWithoutCreatedAtByTheRouteTimeout(t *testing.T) {
 func TestLostSearchLeavesOutALossWhoseJobIsFoundButRunning(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	idA := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
+	idA := e.swappedRun(70, 7, 80, 8)
 	e.clock.Add(10 * time.Minute)
 	e.completedRuns(1000, 30)
 	e.clock.Add(20 * time.Minute)
-	e.gh.queueIn(widgets, 75, 9, "queued", lux3...)
-	e.pass()
-	idB := e.runID("9")
-	e.gh.queueIn(widgets, 85, 10, "queued", lux3...)
-	if err := e.gh.pick(runner("9", 0), 10); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 9, 9009, "hosted-9")
-	e.gh.complete(9, "success")
+	idB := e.swappedRun(75, 9, 85, 10)
 	// closeStopped reads A's runner as live, so A is queued unverified from
 	// the ended Run and resolved by a search.
 	e.lux.runnerListState = "running"
@@ -694,15 +626,7 @@ func TestLostSearchSkipsRunsBetweenDisjointUnresolvedLosses(t *testing.T) {
 func TestLostSearchWithNoTargetListsNothing(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 70, 7, "queued", lux3...)
-	e.pass()
-	idA := e.runID("7")
-	e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
-	if err := e.gh.pick(runner("7", 0), 8); err != nil {
-		t.Fatal(err)
-	}
-	e.gh.pickElsewhere(widgets, 7, 9007, "hosted-7")
-	e.gh.complete(7, "success")
+	idA := e.swappedRun(70, 7, 80, 8)
 	e.lux.runnerListState = "running"
 	e.clock.Add(5 * time.Minute)
 	e.lux.end(idA, preempt)
