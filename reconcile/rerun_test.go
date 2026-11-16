@@ -1027,6 +1027,38 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 	}
 }
 
+func TestHostLossSwappedNewestMatchSurvivesUnmatchedLoss(t *testing.T) {
+	e := newEnv(t)
+	e.gh.perPage = 100
+	for _, trigger := range []int64{7, 9} {
+		e.gh.queueIn(widgets, 70, trigger, "queued", lux3...)
+	}
+	e.pass()
+	for _, trigger := range []int64{7, 9} {
+		if trigger == 7 {
+			e.gh.queueIn(widgets, 80, 8, "queued", lux3...)
+			if err := e.gh.pick(runner("7", 0), 8); err != nil {
+				t.Fatal(err)
+			}
+			e.gh.complete(8, "cancelled")
+		}
+		e.gh.pickElsewhere(widgets, trigger, 9000+trigger, "external-runner")
+		e.gh.complete(trigger, "success")
+		e.lux.end(e.runID(itoa(trigger)), preempt)
+	}
+	for id := int64(1); id <= 25; id++ {
+		e.gh.queueIn(widgets, id, 100+id, "completed", "ubuntu-latest")
+		e.gh.editJob(100+id, func(j *fakeJob) { j.conclusion = "success" })
+	}
+	ops := countOps(e, nil)
+	for range maxRerunTries + 1 {
+		e.pass()
+	}
+	if !slices.Equal(e.gh.rerunJobs(), []int64{8}) || ops[opRerun] != 1 || ops[opRerunFailed] != 0 {
+		t.Fatalf("unmatched loss poisoned newest candidate: reruns %v ops %v", e.gh.rerunJobs(), ops)
+	}
+}
+
 func TestHostLossSwappedNewestMatchDoesNotRequireFullRepositoryHistory(t *testing.T) {
 	e := newEnv(t)
 	e.swappedLoss(80, 1, 1, false)

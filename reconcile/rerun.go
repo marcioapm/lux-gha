@@ -296,10 +296,17 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 		}
 		if missing || job.RunnerName == nil || *job.RunnerName != l.runner {
 			search := p.searchLost(v)
-			if step, failed, abort := p.readFailed(search.err, log, "resolving a lost runner failed"); failed {
-				return step, abort
-			}
 			candidate, ok := search.jobs[l.runner]
+			// A complete candidate workflow is independent of unrelated history,
+			// but partial same-workflow results cannot establish the retry group.
+			if p.rateLimited(search.err) {
+				return stepWait, errAbort
+			}
+			if search.err != nil && (!ok || !search.complete[candidate.RunID]) {
+				if step, failed, abort := p.readFailed(search.err, log, "resolving a lost runner failed"); failed {
+					return step, abort
+				}
+			}
 			if !ok {
 				return stepDrop, nil
 			}
@@ -401,8 +408,9 @@ func (p *pass) lostSiblingJobs(v *repoView, runID int64) *lostSearch {
 }
 
 type lostSearch struct {
-	jobs map[string]githubapp.WorkflowJob
-	err  error
+	jobs     map[string]githubapp.WorkflowJob
+	complete map[int64]bool
+	err      error
 }
 
 // searchLost shares a bounded repository search across every lost runner in
@@ -414,7 +422,7 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	if s := p.lostSearches[v.id]; s != nil {
 		return s
 	}
-	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}}
+	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
 	budget := searchPageBudget
 	targets := map[string]bool{}
@@ -451,6 +459,7 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 				}
 				if !jobs.HasNext {
 					complete = true
+					s.complete[run.ID] = true
 					break
 				}
 			}
