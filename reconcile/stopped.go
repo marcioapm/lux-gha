@@ -62,7 +62,7 @@ func (p *pass) closeStopped() error {
 				r.stopped[name] = s
 				// The job ran on this Run's runner, so it needs no check.
 				if r.rerunEligible(run.StateReason, j.RunAttempt) {
-					r.queueLost(run.ID, s.finished, &lostJob{repoID: v.id, jobID: j.ID, runID: j.RunID, attempt: j.RunAttempt, runner: name, verified: true, created: run.CreatedAt})
+					r.queueLost(run.ID, s.finished, &lostJob{repoID: v.id, jobID: j.ID, runID: j.RunID, attempt: j.RunAttempt, runner: name, verified: true})
 				}
 			}
 			observed[name] = true

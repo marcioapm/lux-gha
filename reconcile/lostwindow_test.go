@@ -168,8 +168,8 @@ func TestLostSearchSkipsRunsThatFinishedBeforeTheWindow(t *testing.T) {
 
 // The executing job's run was created seven hours before the lost Run,
 // beyond the lookback, behind 450 older runs. The search stops listing at
-// the first page wholly past the lookback instead of exhausting its page
-// bound, and the job is not found: no re-run, no error.
+// the first page whose last run is past the lookback instead of exhausting
+// its page bound, and the job is not found: no re-run, no error.
 func TestLostSearchStopsAtTheLookback(t *testing.T) {
 	e := newEnv(t)
 	e.gh.perPage = 100
@@ -198,7 +198,7 @@ func TestLostSearchStopsAtTheLookback(t *testing.T) {
 	if st.Error != "" || st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
 		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
 	}
-	if g.runPages != 2 || !slices.Equal(g.jobRuns, []int64{70}) {
+	if g.runPages != 1 || !slices.Equal(g.jobRuns, []int64{70}) {
 		t.Fatalf("search pages %d, jobs listed for %v", g.runPages, g.jobRuns)
 	}
 }
@@ -462,30 +462,32 @@ func TestLostSearchFindsTheJobOfAReRunOfAnOldWorkflowRun(t *testing.T) {
 	}
 }
 
-// The lost Run was provisioned for a job of the re-run of workflow run 60,
-// created eight hours earlier, and its runner took that job's sibling in
-// the same attempt. 250 runs created seven hours before the loss end the
-// listing at its first page, before it reaches run 60; the search then
-// lists the label job's own workflow run and finds the sibling.
-func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
-	e := newEnv(t)
+// labelReRunLoss creates workflow run 60 with two jobs that fail, then
+// 250 completed runs an hour later, then recent completed runs created
+// three hours after run 60; eight hours after run 60 it re-runs both jobs
+// by hand. A Lux Run is provisioned for the first re-run job (the label
+// job); its runner takes the second (the sibling), and its host is lost.
+// It returns the sibling's id.
+func (e *env) labelReRunLoss(recent int) int64 {
+	e.t.Helper()
 	e.gh.perPage = 100
-	e.gh.queueIn(widgets, 60, 61, "queued", lux3...)
-	e.gh.pickElsewhere(widgets, 61, 9061, "hosted-61")
-	e.gh.complete(61, "failure")
-	e.gh.queueIn(widgets, 60, 62, "queued", lux3...)
-	e.gh.pickElsewhere(widgets, 62, 9062, "hosted-62")
-	e.gh.complete(62, "failure")
+	for _, j := range []int64{61, 62} {
+		e.gh.queueIn(widgets, 60, j, "queued", lux3...)
+		e.gh.pickElsewhere(widgets, j, 9000+j, "hosted-"+itoa(j))
+		e.gh.complete(j, "failure")
+	}
 	e.clock.Add(time.Hour)
 	e.completedRuns(1000, 250)
-	e.clock.Add(7*time.Hour - 12*time.Minute)
+	e.clock.Add(2 * time.Hour)
+	e.completedRuns(2000, recent)
+	e.clock.Add(5*time.Hour - 12*time.Minute)
 	jobs := e.gh.rerunByHand(60)
 	label, sibling := jobs[0], jobs[1]
 	e.clock.Add(2 * time.Minute)
 	e.pass()
 	id := e.runID(itoa(label))
 	if err := e.gh.pick(runner(itoa(label), 0), sibling); err != nil {
-		t.Fatal(err)
+		e.t.Fatal(err)
 	}
 	e.gh.pickElsewhere(widgets, label, 9000+label, "hosted-label")
 	e.gh.complete(label, "success")
@@ -493,6 +495,17 @@ func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
 	e.lux.end(id, preempt)
 	e.gh.complete(sibling, "cancelled")
 	e.clock.Add(2 * time.Minute)
+	return sibling
+}
+
+// The lost Run was provisioned for a job of the re-run of workflow run 60,
+// created eight hours earlier, and its runner took that job's sibling in
+// the same attempt. 250 runs created seven hours before the loss end the
+// listing at its first page, before it reaches run 60; the search then
+// lists the label job's own workflow run and finds the sibling.
+func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
+	e := newEnv(t)
+	sibling := e.labelReRunLoss(0)
 	g := e.recordSearch()
 	ops := countOps(e, nil)
 	st := e.pass()
@@ -511,6 +524,25 @@ func TestLostSearchListsTheLabelWorkflowRunOfAnOldReRun(t *testing.T) {
 	}
 	if !slices.Equal(e.gh.rerunJobs(), []int64{sibling}) {
 		t.Fatalf("reruns %v", e.gh.rerunJobs())
+	}
+}
+
+// As above, with 920 runs inside the lookback that completed before the
+// lost Run: the listing's 10th and last allowed page holds the last 20 of
+// them and 80 runs past the lookback. Its last run being past the lookback
+// ends the listing within its page bound, so the search is complete and
+// goes on to the label job's workflow run.
+func TestLostSearchEndsTheListingOnAPageThatCrossesTheLookback(t *testing.T) {
+	e := newEnv(t)
+	sibling := e.labelReRunLoss(920)
+	g := e.recordSearch()
+	st := e.pass()
+	t.Logf("search: %d runs pages, jobs listed for runs %v", g.runPages, g.jobRuns)
+	if st.Error != "" || st.Rerun != 1 || !slices.Equal(e.gh.rerunJobs(), []int64{sibling}) {
+		t.Fatalf("status %+v reruns %v", st, e.gh.rerunJobs())
+	}
+	if g.runPages != maxSearchRunPages {
+		t.Fatalf("search pages %d, want %d", g.runPages, maxSearchRunPages)
 	}
 }
 

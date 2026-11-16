@@ -35,7 +35,9 @@ const (
 	lostWindowSkew = time.Minute
 	// maxSearchRunPages and maxSearchJobPages bound one lost-runner search:
 	// workflow-run listing pages (pageSize runs each) and job listing pages
-	// of the candidate runs, budgeted separately.
+	// of the candidate runs, budgeted separately. GitHub returns at most
+	// 1,000 runs (10 pages of 100) for a filtered listing; further pages
+	// come back empty, so a higher run page bound would read nothing more.
 	maxSearchRunPages = 10
 	maxSearchJobPages = 200
 )
@@ -56,7 +58,7 @@ type lostJob struct {
 	runner   string
 	verified bool
 	resolved bool
-	created  time.Time // the Run's creation, before its runner could take a job
+	created  time.Time // the Run's creation; set only on an unverified loss, whose search window it starts
 	since    time.Time // the Run's end
 	tries    int
 }
@@ -517,7 +519,8 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
 	c := &lostScan{p: p, v: v, s: s, targets: p.r.lostWindows(v.id), budget: maxSearchJobPages, listed: map[int64]bool{}}
-	if !c.scanWindows() {
+	// With no target, a zero window end would list unfiltered.
+	if len(c.targets) == 0 || !c.scanWindows() {
 		return s
 	}
 	for _, runner := range sortedKeys(c.targets) {
@@ -545,6 +548,8 @@ func (c *lostScan) scanWindows() bool {
 		}
 	}
 	oldest := start.Add(-maxWorkflowLookback)
+	// Newest first: once a page's last run is older than oldest, so is
+	// every run on a later page.
 	for page := 1; page <= maxSearchRunPages; page++ {
 		runs, err := c.p.r.gh.ListWorkflowRuns(c.p.ctx, c.v.ref, githubapp.WorkflowRunListOptions{
 			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, CreatedAtOrBefore: end,
@@ -553,11 +558,7 @@ func (c *lostScan) scanWindows() bool {
 			c.s.err = err
 			return false
 		}
-		pastLookback := len(runs.Runs) > 0
 		for _, run := range runs.Runs {
-			if !run.CreatedAt.Before(oldest) {
-				pastLookback = false
-			}
 			if !mayHoldLost(run, c.targets) {
 				continue
 			}
@@ -568,7 +569,7 @@ func (c *lostScan) scanWindows() bool {
 				return true
 			}
 		}
-		if !runs.HasNext || pastLookback {
+		if !runs.HasNext || len(runs.Runs) > 0 && runs.Runs[len(runs.Runs)-1].CreatedAt.Before(oldest) {
 			return true
 		}
 	}

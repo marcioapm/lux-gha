@@ -477,21 +477,39 @@ labels, any state; one Run per runner name). If the Run has ended:
   either way is not re-run: one in a workflow run longer than 6 hours, or
   in a re-run attempt of another workflow run created more than 6 hours
   before the window. Run listing pages and job
-  listing pages are capped separately, at 10 (1,000 runs) and 200, with
-  at most 10 job pages per run and 100 items per page. The search stops as
-  soon as every loss is resolved.
+  listing pages are capped separately, at 10 (1,000 runs, which is also
+  the most GitHub returns for a filtered listing) and 200, with
+  at most 10 job pages per run and 100 items per page. Runs are listed
+  newest first, so the listing stops after the first page whose last run
+  was created more than 6 hours before the earliest window's start. The
+  search stops as soon as every loss is resolved.
 
-  A search therefore makes at most 210 requests per repository per pass.
+  A search therefore makes at most 210 requests per repository per pass
+  that has an unresolved loss in that repository; the passes themselves
+  are not capped per hour, so the ceiling is 210 times the passes per hour
+  that see a new or still-unresolved loss.
   A loss whose job is found is not searched for again; a loss not found,
   or whose search failed or was truncated, is searched for in at most five
   passes, so it costs at most 1,050 search requests, shared with every other
   loss of its repository in those passes, plus at most 10 job reads, one
   workflow run read, one newer-run read, 10 sibling job pages and one
   re-run. On the first pilot repository (about 185 workflow runs in 3.5
-  hours, at most about 27 jobs each), a window of one 90-minute Run spans
-  about 400 listable runs (4 run pages) and about 130 candidates (one job
-  page each), well under the installation's 5,000 requests per hour; a
-  Run lost after minutes costs a handful of pages.
+  hours, at most about 27 jobs each), a window of one 90-minute Run plus
+  the 6-hour lookback spans about 400 listable runs, so the listing stops
+  on its 4th or 5th page, and has up to about 130 candidates (one job page
+  each): about 90 to 135 requests per search. Losses in one preemption
+  wave share one search. A wave of 20 losses staggered over 20 passes in
+  one hour costs about 20 × 135 = 2,700 requests in that hour, before the
+  bridge's other traffic, against the installation's 5,000 requests per
+  hour; a Run lost after minutes costs a handful of pages.
+  After a restart, every host loss of the last 24 hours is rediscovered
+  at once. A pass then resolves the newest losses whose candidates fit in
+  its 200 job pages, and each resolved loss leaves the window, so the
+  next pass reaches older ones: 20 losses spread over 20 hours at 50
+  workflow runs an hour (runs of 15 minutes) are all re-run within three
+  passes. A loss stays out of reach if its executing workflow run is more
+  than 1,000 runs below the latest end of the losses still unresolved in
+  the pass, or if it is not reached within its five tries.
   A listed candidate is verified by a direct job read: job ID, workflow run,
   attempt and runner must agree. The actual job's attempt controls the retry
   budget; its conclusion must be `failure` or `cancelled`. Pre-pickup loss
