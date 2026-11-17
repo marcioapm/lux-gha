@@ -22,6 +22,21 @@ const (
 	maxRerunTries = 5
 	// lostCursorSkew allows for Lux's clock running behind the bridge's.
 	lostCursorSkew = time.Minute
+	// maxWorkflowLookback is how long before a lost Run's creation a
+	// workflow run may have been created, or its latest attempt started
+	// (run_started_at), and still hold the job the Run's runner took; a
+	// longer workflow run is not searched.
+	maxWorkflowLookback = 6 * time.Hour
+	// lostWindowSkew widens the lost Runs' window for the skew between
+	// Lux's and GitHub's clocks.
+	lostWindowSkew = time.Minute
+	// maxSearchRunPages and maxSearchJobPages bound one lost-runner search:
+	// workflow-run listing pages (pageSize runs each) and job listing pages
+	// of the candidate runs, budgeted separately. GitHub returns at most
+	// 1,000 runs (10 pages of 100) for a filtered listing; further pages
+	// come back empty, so a higher run page bound would read nothing more.
+	maxSearchRunPages = 10
+	maxSearchJobPages = 200
 )
 
 // endedStates are the Lux Run states that are not live; succeeded is left
@@ -35,8 +50,12 @@ type lostJob struct {
 	// runner is the lost Run's runner name. verified: GitHub says the job
 	// ran on it and ended failed or cancelled; a Run lost before its runner
 	// took the job is never verified, as the job ran on a later gen.
+	// resolved: a direct job read confirmed the identity, so no search is
+	// needed while the job runs on.
 	runner   string
 	verified bool
+	resolved bool
+	created  time.Time // the Run's creation; set only on an unverified loss, whose search window it starts
 	since    time.Time // the Run's end
 	tries    int
 }
@@ -188,6 +207,7 @@ func (p *pass) considerEnded(run luxclient.Run, now time.Time) {
 		return
 	}
 	if l := lostFromLabels(run.Labels); l != nil && hostLost(run.StateReason) {
+		l.created = run.CreatedAt
 		p.r.queueLost(run.ID, finished, l)
 	}
 }
@@ -325,7 +345,7 @@ func (p *pass) checkLost(v *repoView, l *lostJob, log *slog.Logger) (rerunStep, 
 		if !p.r.attemptEligible(job.RunAttempt) {
 			return stepDrop, nil
 		}
-		l.jobID, l.runID, l.attempt = job.ID, job.RunID, job.RunAttempt
+		l.jobID, l.runID, l.attempt, l.resolved = job.ID, job.RunID, job.RunAttempt, true
 		switch {
 		case job.Status != "completed":
 			return stepWait, nil
@@ -409,8 +429,77 @@ type lostSearch struct {
 	err      error
 }
 
+// lostWindow is the lifetime of an unresolved loss's Run, widened by
+// lostWindowSkew: only a workflow run overlapping it can hold the job the
+// Run's runner took. runID is the workflow run of the Run's label job.
+type lostWindow struct {
+	start, end time.Time
+	runID      int64
+}
+
+// lostWindows maps the runner of each unresolved loss of repository repoID
+// to its window.
+func (r *Reconciler) lostWindows(repoID int64) map[string]lostWindow {
+	windows := map[string]lostWindow{}
+	for _, lost := range r.lost {
+		if lost.repoID != repoID || lost.verified || lost.resolved {
+			continue
+		}
+		created := lost.created
+		if created.IsZero() {
+			// No Run outlives its route's timeout.
+			created = lost.since.Add(-r.longestTimeout())
+		}
+		windows[lost.runner] = lostWindow{created.Add(-lostWindowSkew), lost.since.Add(lostWindowSkew), lost.runID}
+	}
+	return windows
+}
+
+// lostScan is one searchLost in progress: the losses not yet resolved and
+// the job pages left.
+type lostScan struct {
+	p       *pass
+	v       *repoView
+	s       *lostSearch
+	targets map[string]lostWindow
+	budget  int
+}
+
+// listJobs lists the latest jobs of workflow run runID, resolving the
+// targets whose runner took one. It is false, with s.err set, when the
+// search must end: a failed read or an exhausted job budget.
+func (c *lostScan) listJobs(runID int64) bool {
+	for jp := 1; jp <= maxRunPages && c.budget > 0; jp++ {
+		c.budget--
+		jobs, err := c.p.r.gh.ListWorkflowRunJobs(c.p.ctx, c.v.ref, runID, githubapp.WorkflowJobListOptions{
+			PageOptions: githubapp.PageOptions{Page: jp, PerPage: pageSize}, Filter: "latest",
+		})
+		if err != nil {
+			c.s.err = err
+			return false
+		}
+		for _, job := range jobs.Jobs {
+			if job.RunnerName != nil && job.RunID == runID && job.ID > 0 && job.RunAttempt > 0 {
+				c.s.jobs[*job.RunnerName] = job
+				delete(c.targets, *job.RunnerName)
+			}
+		}
+		if !jobs.HasNext {
+			c.s.complete[runID] = true
+			return true
+		}
+	}
+	c.s.err = errors.New("lost runner job search exceeded its page bound")
+	return false
+}
+
 // searchLost shares a bounded repository search across every lost runner in
 // the pass. Listings only nominate jobs; checkLost reads each nominee again.
+//
+// A re-run keeps its workflow run's created_at, so the listing reaches a
+// re-run of a run created before the lookback only through run_started_at
+// on a listed page. The label job's own workflow run, which the runner most
+// often took a sibling of, is therefore listed directly after the listing.
 func (p *pass) searchLost(v *repoView) *lostSearch {
 	if p.lostSearches == nil {
 		p.lostSearches = map[int64]*lostSearch{}
@@ -420,59 +509,96 @@ func (p *pass) searchLost(v *repoView) *lostSearch {
 	}
 	s := &lostSearch{jobs: map[string]githubapp.WorkflowJob{}, complete: map[int64]bool{}}
 	p.lostSearches[v.id] = s
-	budget := searchPageBudget
-	targets := map[string]bool{}
-	for _, lost := range p.r.lost {
-		if lost.repoID == v.id && !lost.verified {
-			targets[lost.runner] = true
+	c := &lostScan{p: p, v: v, s: s, targets: p.r.lostWindows(v.id), budget: maxSearchJobPages}
+	// With no target, a zero window end would list unfiltered.
+	if len(c.targets) == 0 || !c.scanWindows() {
+		return s
+	}
+	// Every run listed so far is complete: an incomplete listing ends the
+	// search.
+	for _, runner := range sortedKeys(c.targets) {
+		w, ok := c.targets[runner]
+		if ok && !s.complete[w.runID] && !c.listJobs(w.runID) {
+			break
 		}
 	}
-	for page := 1; page <= maxRunPages && budget > 0; page++ {
-		budget--
-		runs, err := p.r.gh.ListWorkflowRuns(p.ctx, v.ref, githubapp.WorkflowRunListOptions{
-			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize},
+	return s
+}
+
+// scanWindows lists, newest first, the workflow runs created by the latest
+// window end, and the jobs of those that may hold the job of a loss still
+// unresolved; each resolved loss narrows the rest of the scan. It is false
+// when the search must end.
+func (c *lostScan) scanWindows() bool {
+	var start, end time.Time
+	for _, w := range c.targets {
+		if start.IsZero() || w.start.Before(start) {
+			start = w.start
+		}
+		if w.end.After(end) {
+			end = w.end
+		}
+	}
+	oldest := start.Add(-maxWorkflowLookback)
+	// Newest first: once a page's last run is older than oldest, so is
+	// every run on a later page.
+	for page := 1; page <= maxSearchRunPages; page++ {
+		runs, err := c.p.r.gh.ListWorkflowRuns(c.p.ctx, c.v.ref, githubapp.WorkflowRunListOptions{
+			PageOptions: githubapp.PageOptions{Page: page, PerPage: pageSize}, CreatedAtOrBefore: end,
 		})
 		if err != nil {
-			s.err = err
-			return s
+			c.s.err = err
+			return false
 		}
 		for _, run := range runs.Runs {
-			complete := false
-			for jp := 1; jp <= maxRunPages && budget > 0; jp++ {
-				budget--
-				jobs, err := p.r.gh.ListWorkflowRunJobs(p.ctx, v.ref, run.ID, githubapp.WorkflowJobListOptions{
-					PageOptions: githubapp.PageOptions{Page: jp, PerPage: pageSize}, Filter: "latest",
-				})
-				if err != nil {
-					s.err = err
-					return s
-				}
-				for _, job := range jobs.Jobs {
-					if job.RunnerName != nil && job.RunID == run.ID && job.ID > 0 && job.RunAttempt > 0 {
-						s.jobs[*job.RunnerName] = job
-						delete(targets, *job.RunnerName)
-					}
-				}
-				if !jobs.HasNext {
-					complete = true
-					s.complete[run.ID] = true
-					break
-				}
+			if !mayHoldLost(run, c.targets) {
+				continue
 			}
-			if !complete {
-				s.err = errors.New("lost runner job search exceeded its page bound")
-				return s
+			if !c.listJobs(run.ID) {
+				return false
 			}
-			if len(targets) == 0 {
-				return s
+			if len(c.targets) == 0 {
+				return true
 			}
 		}
-		if !runs.HasNext {
-			return s
+		if !runs.HasNext || len(runs.Runs) > 0 && runs.Runs[len(runs.Runs)-1].CreatedAt.Before(oldest) {
+			return true
 		}
 	}
-	s.err = errors.New("lost runner workflow search exceeded its page bound")
-	return s
+	// The listing is truncated, but each target's own label workflow run can
+	// still be listed: a candidate found while err is set counts only from a
+	// completely listed workflow run.
+	c.s.err = errors.New("lost runner workflow search exceeded its page bound")
+	return true
+}
+
+// mayHoldLost reports whether workflow run may have run a job on the runner
+// of a loss in targets: created, or its latest attempt started, by the
+// window's end and at most maxWorkflowLookback before its start, with a
+// started job (not queued), and not completed before the window's start
+// (updated_at is its completion).
+func mayHoldLost(run githubapp.WorkflowRun, targets map[string]lostWindow) bool {
+	status := ""
+	if run.Status != nil {
+		status = *run.Status
+	}
+	if status == "queued" {
+		return false
+	}
+	for _, w := range targets {
+		if !within(run.CreatedAt, w) && !within(run.RunStartedAt, w) {
+			continue
+		}
+		if status == "completed" && run.UpdatedAt.Before(w.start) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func within(at time.Time, w lostWindow) bool {
+	return !at.IsZero() && !at.After(w.end) && !at.Before(w.start.Add(-maxWorkflowLookback))
 }
 
 // readFailed classifies a failed GitHub read; failed is false for a nil err.

@@ -82,6 +82,9 @@ type WorkflowRun struct {
 	WorkflowID int64     `json:"workflow_id"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// RunStartedAt is when the latest attempt started; a re-run keeps
+	// CreatedAt.
+	RunStartedAt time.Time `json:"run_started_at"`
 	// PullRequests lists the open pull requests whose head is this run's
 	// head, whatever their base: it can hold a pull request into a fork, and
 	// it is empty for a pull request from a fork.
@@ -116,6 +119,9 @@ type RunnerListOptions struct {
 type WorkflowRunListOptions struct {
 	PageOptions
 	Status string
+	// CreatedAtOrBefore, when set, sends created=<=<RFC 3339, UTC seconds>;
+	// GitHub's created_at has whole-second precision.
+	CreatedAtOrBefore time.Time
 }
 
 // Attempt selects the per-attempt endpoint; Filter ("latest" or "all") applies only without Attempt.
@@ -232,6 +238,9 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, repo Repository, opts Wor
 	}
 	if opts.Status != "" {
 		q.Set("status", opts.Status)
+	}
+	if !opts.CreatedAtOrBefore.IsZero() {
+		q.Set("created", "<="+opts.CreatedAtOrBefore.UTC().Format(time.RFC3339))
 	}
 	out.HasNext, err = c.list(ctx, repo, "/actions/runs", q, &out)
 	return out, err

@@ -454,10 +454,60 @@ labels, any state; one Run per runner name). If the Run has ended:
   `lux-gha/run-id`, `lux-gha/run-attempt` and `lux-gha/runner` labels is a
   candidate. The labels are hints, not execution identity. The bridge first
   reads the triggering job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`).
-  If its runner differs or the job is gone, it searches repository workflow
-  runs (all statuses) and their latest jobs for the exact runner name, even
-  across workflows. One search per repository per pass shares at most 20
-  run/job pages, with at most 10 pages per listing and 100 items per page.
+  If its runner differs or the job is gone, it searches the repository's
+  workflow runs (all statuses) and their latest jobs for the exact runner
+  name, even across workflows. One search per repository per pass serves
+  every unresolved loss of that repository. Each loss has its own window,
+  its Lux Run's `createdAt` to its `finishedAt`, widened by a minute of
+  clock skew; only a workflow run overlapping a window can hold that loss's
+  job. The search lists runs newest first created at or before the latest
+  window's end
+  (`GET /repos/{owner}/{repo}/actions/runs?created=<=<end>&per_page=100`)
+  and stops after the first page whose last run was created more than 6
+  hours before the earliest window's start. It lists the latest jobs only
+  of the runs that may hold the job of a loss not yet resolved: not
+  `queued`; created, or with their latest attempt started
+  (`run_started_at`), by the window's end and at most 6 hours before its
+  start; and, if `completed`, last updated (`updated_at`) after the
+  window's start. A re-run keeps its workflow run's `created_at`, so a run
+  created more than 6 hours before the window is reached only through
+  `run_started_at` and only if the listing reaches its page; past the
+  listing, including when the listing hits its page cap, the search lists
+  the latest jobs of each unresolved loss's own label workflow run
+  (`lux-gha/run-id`), within the same job page cap. A job not found either
+  way is not re-run: one in a workflow run longer than 6 hours, or in a
+  re-run attempt of another workflow run created more than 6 hours before
+  the window. Run listing pages and job listing pages are capped
+  separately, at 10 (1,000 runs, which is also the most GitHub returns for
+  a filtered listing) and 200, with at most 10 job pages per run and 100
+  items per page. The search stops as soon as every loss is resolved.
+
+  A search therefore makes at most 210 requests per repository per pass
+  that has an unresolved loss in that repository; the passes themselves
+  are not capped per hour, so the ceiling is 210 times the passes per hour
+  that see a new or still-unresolved loss.
+  A loss whose job is found is not searched for again; a loss not found,
+  or whose search failed or was truncated, is searched for in at most five
+  passes, so it costs at most 1,050 search requests, shared with every other
+  loss of its repository in those passes, plus at most 10 job reads, one
+  workflow run read, one newer-run read, 10 sibling job pages and one
+  re-run. On the first pilot repository (about 185 workflow runs in 3.5
+  hours, at most about 27 jobs each), a window of one 90-minute Run plus
+  the 6-hour lookback spans about 400 listable runs, so the listing stops
+  on its 4th or 5th page, and has up to about 130 candidates (one job page
+  each): about 90 to 135 requests per search. Losses in one preemption
+  wave share one search. A wave of 20 losses staggered over 20 passes in
+  one hour costs about 20 × 135 = 2,700 requests in that hour, before the
+  bridge's other traffic, against the installation's 5,000 requests per
+  hour; a Run lost after minutes costs a handful of pages.
+  After a restart, every host loss of the last 24 hours is rediscovered
+  at once. A pass then resolves the newest losses whose candidates fit in
+  its 200 job pages, and each resolved loss leaves the window, so the
+  next pass reaches older ones: 20 losses spread over 20 hours at 50
+  workflow runs an hour (runs of 15 minutes) are all re-run within three
+  passes. A loss stays out of reach if its executing workflow run is more
+  than 1,000 runs below the latest end of the losses still unresolved in
+  the pass, or if it is not reached within its five tries.
   A listed candidate is verified by a direct job read: job ID, workflow run,
   attempt and runner must agree. The actual job's attempt controls the retry
   budget; its conclusion must be `failure` or `cancelled`. Pre-pickup loss

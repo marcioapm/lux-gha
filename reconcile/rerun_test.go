@@ -1082,7 +1082,10 @@ func TestHostLossSwappedRepositorySearchIsPageBounded(t *testing.T) {
 	if st.Rerun != 0 || len(e.gh.rerunJobs()) != 0 {
 		t.Fatalf("re-ran a job outside the search window: %+v reruns %v", st, e.gh.rerunJobs())
 	}
-	if maxPage > maxRunPages || ops[opRuns] > maxRunPages+2 || ops[opJobs] > maxRunPages {
+	// At one run per page the listing surfaces at most maxSearchRunPages
+	// runs; past its cap the search adds one listing of the loss's own label
+	// workflow run.
+	if maxPage > maxRunPages || ops[opRuns] > maxRunPages+2 || ops[opJobs] > maxSearchRunPages+1 {
 		t.Fatalf("unbounded repository search: max page %d ops %v", maxPage, ops)
 	}
 	if ops[opJobs] == 0 {
